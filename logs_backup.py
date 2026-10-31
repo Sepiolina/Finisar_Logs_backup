@@ -91,6 +91,12 @@ def now():
     return f"epoch:{int(time.time())}"
 
 
+def quiet(step, message="", done=0, total=None):
+    """Default progress callback: does nothing. A front end (backup_ui.py) passes its own.
+
+    step is one of "resume", "query", "scan", "stage", "commit"; total None means unknown."""
+
+
 # ---------------------------------------------------------------- config
 
 class Config:
@@ -171,6 +177,9 @@ def query_candidates(date_from, date_to):
            " JOIN ForthUtilities.dbo.ShipmentFinisarTrace sft WITH (NOLOCK) ON sfs.trace_id = sft.trace_id"
            f" WHERE {where}")
     env = os.environ
+    missing = [k for k in ("DB_SERVER", "DB_NAME", "DB_USER", "DB_PASSWORD") if not env.get(k)]
+    if missing:
+        raise BackupError(f"missing environment variable(s): {', '.join(missing)}")
     retries, delay = int(env.get("DB_RETRY_ATTEMPTS", 3)), int(env.get("DB_RETRY_BASE_DELAY_MS", 2000)) / 1000
     for attempt in range(retries + 1):
         try:
@@ -200,33 +209,35 @@ def has_extension(name, extensions):
     return "." in name and name.rsplit(".", 1)[1].lower() in extensions
 
 
-def scan(cfg, dates):
+def scan(cfg, dates, report=quiet):
     """Matched files as manifest entries, plus error and scanned-file counts. Not recursive."""
-    entries, errors, seen = [], 0, 0
+    entries, errors, listings = [], 0, []
     for sub in cfg.subfolders:
         try:
-            listing = list(os.scandir(cfg.source_dir / sub))
+            listings += [(sub, item) for item in os.scandir(cfg.source_dir / sub)]
         except OSError as e:
             log.warning("skipping subfolder %s: %s", sub, e)
             errors += 1
+    seen = len(listings)
+    for i, (sub, item) in enumerate(listings):
+        if i % 2000 == 0:
+            report("scan", f"{len(entries)} matches", i, seen)
+        if not item.is_file(follow_symlinks=False) or not has_extension(item.name, cfg.extensions):
             continue
-        for item in listing:
-            seen += 1
-            if not item.is_file(follow_symlinks=False) or not has_extension(item.name, cfg.extensions):
-                continue
-            found = find_barcodes(item.name, dates)
-            if len(found) > 1:
-                errors += 1  # ambiguous
-                continue
-            if not found:
-                continue
-            barcode = found.pop()
-            month = dates[barcode][:7]
-            if not (len(month) == 7 and month[:4].isdigit() and month[4] == "-" and month[5:].isdigit()):
-                errors += 1
-                continue
-            entries.append({"relative_path": f"{sub}/{item.name}", "source_subfolder": sub,
-                            "barcode": barcode, "original_size": item.stat().st_size, "volume_name": month})
+        found = find_barcodes(item.name, dates)
+        if len(found) > 1:
+            errors += 1  # ambiguous
+            continue
+        if not found:
+            continue
+        barcode = found.pop()
+        month = dates[barcode][:7]
+        if not (len(month) == 7 and month[:4].isdigit() and month[4] == "-" and month[5:].isdigit()):
+            errors += 1
+            continue
+        entries.append({"relative_path": f"{sub}/{item.name}", "source_subfolder": sub,
+                        "barcode": barcode, "original_size": item.stat().st_size, "volume_name": month})
+    report("scan", f"{len(entries)} matches", seen, seen)
     log.info("scanned %d files, %d matches", seen, len(entries))
     return entries, errors, seen
 
@@ -237,7 +248,7 @@ def staged_path(cfg, entry):
 
 # ---------------------------------------------------------------- stage
 
-def stage(cfg, sid, entries):
+def stage(cfg, sid, entries, report=quiet):
     """Moves files into staging/<YYYY-MM>/<SUB>/; each manifest line is synced before its file moves."""
     errors = 0
     cfg.staging_dir.mkdir(parents=True, exist_ok=True)
@@ -259,6 +270,7 @@ def stage(cfg, sid, entries):
                 except OSError as err:  # stays in the source; a later run picks it up
                     log.warning("not staged %s: %s", src, err)
                     errors += 1
+            report("stage", "", i + len(batch), len(entries))
     return errors
 
 
@@ -356,7 +368,7 @@ def index_month(db, cfg, sid, month, entries, hashes, head):
                    " (SELECT COUNT(*) FROM scanned_log_entry WHERE file_storage_volume_id = ?) WHERE id = ?", (vid, vid))
 
 
-def finish_staged(db, cfg):
+def finish_staged(db, cfg, report=quiet):
     """Archives whatever the manifest lists in staging. Returns a summary dict, or None if nothing is staged."""
     manifest = read_manifest(cfg)
     if manifest is None:
@@ -371,6 +383,7 @@ def finish_staged(db, cfg):
             months[e["volume_name"]].append(e)
 
     archived, failures, breakdown = [], [], {}
+    report("commit", "", 0, len(months))
     with ThreadPoolExecutor(min(WORKERS, max(len(months), 1))) as pool:
         jobs = {m: pool.submit(commit_month, cfg, m, es) for m, es in months.items()}
         for month, job in sorted(jobs.items()):  # SQLite and deletes stay on this thread
@@ -386,6 +399,7 @@ def finish_staged(db, cfg):
             archived += months[month]
             breakdown[month] = (len(months[month]), sum(e["original_size"] for e in months[month]))
             log.info("%s: %d files committed (LOCAL_COMMITTED), verified and indexed", month, len(months[month]))
+            report("commit", month, len(breakdown), len(months))
     if failures:
         raise BackupError(f"{len(failures)} month(s) failed; staging kept for the next run: {failures[0]}")
 
@@ -404,22 +418,44 @@ def finish_staged(db, cfg):
 
 # ---------------------------------------------------------------- run
 
-def run(cfg, candidates_fn=query_candidates, dry_run=False):
+def plan(entries):
+    """{month: (files, bytes)} of matched files, sorted by month."""
+    volumes = defaultdict(lambda: (0, 0))
+    for e in entries:
+        n, size = volumes[e["volume_name"]]
+        volumes[e["volume_name"]] = (n + 1, size + e["original_size"])
+    return dict(sorted(volumes.items()))
+
+
+def run(cfg, candidates_fn=query_candidates, dry_run=False, report=quiet, confirm=None):
+    """One backup run. Returns a summary dict whose "status" is "done", "dry_run" or "cancelled".
+
+    confirm(volumes) -> bool, if given, is asked after the scan and before any file moves;
+    False stops the run with nothing moved and nothing recorded."""
     db = open_index(cfg.db_path)
-    if not dry_run and finish_staged(db, cfg):
-        log.info("finished the batch an earlier run left in staging")
+    resumed = 0
+    if not dry_run and cfg.manifest.exists():
+        report("resume", "finishing the batch an earlier run left in staging")
+        # The resumed batch's progress is shown on the "resume" row.
+        finished = finish_staged(db, cfg, lambda _step, *args: report("resume", *args))
+        resumed = finished["files_moved"] if finished else 0
+        report("resume", f"{resumed} files", 1, 1)
 
     date_from, date_to = query_window(db, cfg)
+    window = (date_from, date_to)
+    report("query", f"{date_from or '(start)'} .. {date_to}")
     log.info("querying candidates %s .. %s", date_from or "(start)", date_to)
     candidates = candidates_fn(date_from, date_to)
+    report("query", f"{len(candidates)} candidates", 1, 1)
     dates = dict(candidates)  # barcode -> last_update (the last row wins)
-    entries, errors, seen = scan(cfg, dates)
+    entries, errors, seen = scan(cfg, dates, report)
+    volumes = plan(entries)
+    info = {"window": window, "candidates": len(candidates), "scanned": seen, "volumes": volumes, "resumed": resumed}
     if dry_run:
-        per_month = defaultdict(int)
-        for e in entries:
-            per_month[e["volume_name"]] += 1
-        log.info("dry run: %d files would be archived: %s", len(entries), dict(sorted(per_month.items())))
-        return None
+        log.info("dry run: %d files would be archived: %s", len(entries), volumes)
+        return dict(info, status="dry_run", files_moved=0, errors=errors)
+    if entries and confirm and not confirm(volumes):
+        return dict(info, status="cancelled", files_moved=0, errors=errors)
 
     sid = start_session(db, date_from or "", date_to)
     try:
@@ -432,16 +468,15 @@ def run(cfg, candidates_fn=query_candidates, dry_run=False):
                            [(sid, b, d, "matched" if b in matched else "no_files_found") for b, d in fresh])
         result = {"files_moved": 0, "errors": 0, "volumes": {}}
         if entries:
-            errors += stage(cfg, sid, entries)
-            result = finish_staged(db, cfg)
+            errors += stage(cfg, sid, entries, report)
+            result = finish_staged(db, cfg, report)
         errors += result["errors"]
         complete_session(db, sid, "success", len(fresh), result["files_moved"], errors)
     except Exception:
         complete_session(db, sid, "failed", errors=errors + 1)
         raise
     unmatched = sorted({b for b, _ in fresh} - matched)
-    return dict(result, session_id=sid, errors=errors, scanned=seen, candidates=len(candidates),
-                unmatched=unmatched, window=(date_from, date_to))
+    return {**info, **result, "status": "done", "session_id": sid, "errors": errors, "unmatched": unmatched}
 
 
 def send_email(cfg, summary):
@@ -471,10 +506,9 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     cfg = Config(args.config)
     summary = run(cfg, dry_run=args.dry_run)
-    if summary:
-        log.info("done: %s", json.dumps({k: v for k, v in summary.items() if k != "unmatched"}))
-        if cfg.email:
-            send_email(cfg, summary)
+    log.info("%s: %s", summary["status"], json.dumps({k: v for k, v in summary.items() if k != "unmatched"}))
+    if summary["status"] == "done" and cfg.email:
+        send_email(cfg, summary)
 
 
 if __name__ == "__main__":

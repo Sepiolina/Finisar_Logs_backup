@@ -104,6 +104,21 @@ class Flow(unittest.TestCase):
         self.assertEqual(self.head("2026-08")[1], 0)
         self.assertEqual(db.execute("SELECT COUNT(*) FROM scanned_log_entry").fetchone()[0], 2)
 
+    def test_callbacks_report_steps_and_cancel_moves_nothing(self):
+        steps = []
+        summary = lb.run(self.cfg, lambda *_: self.CANDIDATES, report=lambda step, *_: steps.append(step),
+                         confirm=lambda volumes: False)
+        self.assertEqual(summary["status"], "cancelled")
+        self.assertEqual(summary["volumes"], {"2026-07": (1, 7), "2026-08": (1, 10)})
+        self.assertEqual(sorted(set(steps)), ["query", "scan"])
+        self.assertTrue((self.cfg.source_dir / "BURNIN/unit1_BC001_log.txt").exists())
+        self.assertEqual(sqlite3.connect(self.cfg.db_path).execute("SELECT COUNT(*) FROM scan_session").fetchone()[0], 0)
+
+        summary = lb.run(self.cfg, lambda *_: self.CANDIDATES, report=lambda step, *_: steps.append(step),
+                         confirm=lambda volumes: True)
+        self.assertEqual(summary["files_moved"], 2)
+        self.assertIn("commit", steps)
+
     def test_failed_commit_keeps_staging(self):
         self.cfg.mochi = str(self.tmp / "missing-mochi")
         with self.assertRaises(Exception):
