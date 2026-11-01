@@ -1,83 +1,79 @@
 # Finisar Logs Backup
 
-A small Python rewrite of [Finisar_move_log_files](https://github.com/Sepiolina/Finisar_move_log_files).
-It produces the same result: log files whose names contain a barcode from SQL Server are moved into
-monthly MOCHI archives and indexed in SQLite.
+Moves log files whose names contain a barcode from SQL Server into monthly
+[MOCHI](https://github.com/immerh8/MOCHI) archives, and indexes every file in
+SQLite so it can be found again by barcode. It is a small Python rewrite of
+[Finisar_move_log_files](https://github.com/Sepiolina/Finisar_move_log_files)
+and leaves the same result on disk.
 
-Two files, kept apart so the backup logic can be audited on its own:
+```
+resume leftovers -> query SQL Server -> scan -> stage -> commit -> verify -> index -> delete staged copy
+```
 
-| File | What it holds |
+A file is always in exactly one place: the source folder, staging, or a
+verified archive. A run can stop at any point. The next run continues where it
+stopped, without losing or duplicating anything.
+
+## Quick start
+
+```bash
+pip install -r requirements.txt
+```
+
+```bash
+cp config.example.json config.json
+```
+
+Edit the paths in `config.json`. Put the `mochi` program on PATH (or set
+`"mochi"` in the config), and set `DB_SERVER`, `DB_NAME`, `DB_USER` and
+`DB_PASSWORD`. Then:
+
+```bash
+python backup_ui.py config.json --dry-run
+```
+
+```bash
+python backup_ui.py config.json
+```
+
+On Windows, double-click `run_backup.bat`. Full steps are in [docs/operations.md](docs/operations.md).
+
+## Documentation
+
+| Page | For |
 |---|---|
-| `logs_backup.py` | All backup logic, about 510 lines (50 of them the SQL schema), read top to bottom in run order. No display code. It also runs on its own with plain log output. |
-| `backup_ui.py` | The terminal UI (`rich`), about 150 lines: progress rows, a confirm prompt, a summary table. It makes no backup decisions. |
+| [docs/how-it-works.md](docs/how-it-works.md) | The flow, the date window, matching rules, what is on disk (archives, index, manifest), and why a crash loses nothing |
+| [docs/code-walkthrough.md](docs/code-walkthrough.md) | Reviewing the code: every function in run order, the logic/UI contract, the tests |
+| [docs/operations.md](docs/operations.md) | Install, config reference, running, getting files back, moving to another PC, troubleshooting |
+| [docs/performance.md](docs/performance.md) | Benchmarks (300,000 files in about 2.5 minutes), where the time goes, tuning |
 
-The only link between them is two callbacks passed to `logs_backup.run()`:
-- `report(step, message, done, total)` for progress. `step` is `resume`, `query`, `scan`, `stage` or `commit`.
-- `confirm(volumes) -> bool`, asked after the scan and before any file moves. `False` stops the run with nothing moved and nothing recorded.
+## Files
 
-`run()` returns a summary dict that the UI draws.
+| File | Role |
+|---|---|
+| `logs_backup.py` | **All backup logic**, in run order, no display code. `python logs_backup.py config.json` runs it with plain log lines (for scheduled tasks). |
+| `backup_ui.py` | Terminal UI (`rich`): progress, a confirm prompt before files move, a summary. Makes no backup decisions. |
+| `test_logs_backup.py` | Tests: `MOCHI_BIN=/path/to/mochi python -m unittest -v` |
+| `bench.py` | Benchmark on generated files |
+| `config.example.json`, `run_backup.bat`, `requirements.txt` | Config template, Windows launcher, Python libraries (`blake3`, `pymssql`, `rich`) |
 
-## What it produces (same as Finisar_move_log_files)
+## Same result as Finisar_move_log_files
 
 | Output | Layout |
 |---|---|
-| Archives | `<output_dir>/<YYYY>/<YYYY-MM>.mochi`. The month comes from the barcode's `last_update`. |
-| Paths inside an archive | `<SUBFOLDER>/<filename>`, for example `BURNIN/unit1_BC001_log.txt` |
-| SQLite index | The same 4 tables and `user_version = 2` (`scan_session`, `session_barcode`, `file_storage_volume`, `scanned_log_entry`), with a BLAKE3 `content_hash` and a `commit_seq` for each file |
-| Staging | `<output_dir>/.staging` with `manifest.jsonl`, in the same line format. It is removed when the run finishes. |
+| Archives | `<output_dir>/<YYYY>/<YYYY-MM>.mochi`, month from the barcode's `last_update` |
+| Paths in an archive | `<SUBFOLDER>/<filename>`, for example `BURNIN/unit1_BC001_log.txt` |
+| SQLite index | Same 4 tables and `user_version = 2`, with a BLAKE3 `content_hash` and `commit_seq` per file |
+| Manifest | `manifest.jsonl` in the same line format |
 
-## Flow
+Deliberate differences:
 
-```
-resume leftover staging -> query SQL Server -> scan -> stage -> commit -> verify -> index -> delete staged copy
-```
+- **Terminal UI instead of a desktop app.** The SQL login comes from `DB_*` environment variables, not an encrypted settings file.
+- **MOCHI through its command line** (`mochi --json`), not the Rust library.
+- **One commit per month per run**, not commits split at 1 GiB or 20,000 files. The archive contents are the same.
+- **Verify checks the whole month each run**, not only the new commit. This makes appends to big months a few seconds slower (see [performance](docs/performance.md)).
+- **Staging defaults to `source_dir/.staging`**, not `output_dir/.staging`. Files move into staging by rename, which only works on the same drive.
+- **Added: a run lock**, so two runs started at once cannot share staging.
 
-1. **Resume**: if `staging/manifest.jsonl` exists, finish that batch first.
-2. **Query**: get `(barcode, last_update)` rows for the window. The window runs from the last successful run's to-date minus 1 day up to today minus `lookback_days`, unless `date_range` is set.
-3. **Scan**: list each subfolder (not recursive). A file matches when it has an allowed extension and its name contains exactly one barcode with `_ . -` or the start or end of the name on each side.
-4. **Stage**: write the manifest lines and fsync them, then move the files to `staging/<YYYY-MM>/<SUB>/`. A file that already exists in staging is never overwritten.
-5. **Commit**: run `mochi create` or `mochi append` once for each month, with that month's subfolder directories as input. If the archive head already holds every file with the same hash (a crash between commit and index), no new commit is made.
-6. **Verify**: compare the BLAKE3 hash of every staged file with the hash in the archive head, then run `mochi verify --level content`.
-7. **Index, then delete**: upsert the volume and entry rows in one transaction, then delete that month's staged copies.
-
-Months are committed and verified in parallel. SQLite writes and deletes stay on the main thread.
-A month that fails keeps its staged files, and the next run resumes it.
-A file is always in exactly one place: the source tree, staging, or a verified archive.
-
-## Setup and run
-
-```bash
-pip install -r requirements.txt          # blake3, pymssql, rich
-# put the mochi CLI (from immerh8/MOCHI, cargo build --release -p mochi-cli) on PATH, or set "mochi" in the config
-cp config.example.json config.json       # edit paths
-export DB_SERVER=... DB_NAME=... DB_USER=... DB_PASSWORD=...   # optional: DB_PORT, DB_RETRY_ATTEMPTS, DB_RETRY_BASE_DELAY_MS, DB_REQUEST_TIMEOUT_MS
-python backup_ui.py config.json --dry-run    # query and scan only, shows what would be archived
-python backup_ui.py config.json              # asks before moving files; --yes skips the question
-```
-
-On Windows you can double-click `run_backup.bat`, which runs `backup_ui.py config.json` and keeps the window open.
-Each run continues where the last one ended, so running it by hand now and then is fine.
-The UI writes the full run log to `backup.log` next to the config.
-
-`python logs_backup.py config.json` runs the same backup with plain log lines and no prompt, for a scheduled task.
-
-To get an HTML statistics email after each run, set `"email": {"api_base_url": "http://host:port", "to": "..."}`.
-The report is POSTed to the same `/api/email/send` relay. Sending is best effort and never fails the run.
-
-## Tests
-
-```bash
-MOCHI_BIN=/path/to/mochi python -m unittest -v
-```
-
-The tests cover barcode and extension matching, the full flow plus an append run, resuming after a crash after staging, resuming after a crash after commit but before index (no duplicate commit), a failed commit that keeps staging, and the progress and confirm callbacks (a declined confirm moves and records nothing).
-
-## Differences from Finisar_move_log_files (deliberate simplifications)
-
-- **No desktop UI.** It is a CLI meant for a scheduled task or cron job. SQL settings come from `DB_*` environment variables, not the encrypted settings file.
-- **MOCHI through its CLI** (`mochi --json`), not the Rust library.
-- **One commit per month per run**, not commits split at 1 GiB or 20,000 files. The CLI streams files, so memory is not the limit.
-- **Verification** runs `mochi verify --level content` over the whole archive each run, not only the new commits.
-- **Barcode matching** tries every delimiter-bounded substring of the name against a set. This gives the same matches as the original's Aho-Corasick search, with no extra dependency.
-
-A run ends **committed (LOCAL_COMMITTED)**. That is not a backup on its own: keep an independent copy of the output folder and of the SQLite index.
+A run ends **committed (LOCAL_COMMITTED)**. That is not a backup on its own:
+keep an independent copy of the output folder and of the SQLite index.

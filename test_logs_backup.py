@@ -119,6 +119,13 @@ class Flow(unittest.TestCase):
         self.assertEqual(summary["files_moved"], 2)
         self.assertIn("commit", steps)
 
+    def test_second_run_at_the_same_time_is_refused(self):
+        with lb.lock_run(self.cfg):
+            with self.assertRaisesRegex(lb.BackupError, "another backup run"):
+                self.run_backup()
+        self.assertTrue((self.cfg.source_dir / "BURNIN/unit1_BC001_log.txt").exists())
+        self.assertEqual(self.run_backup()["files_moved"], 2)
+
     def test_failed_commit_keeps_staging(self):
         self.cfg.mochi = str(self.tmp / "missing-mochi")
         with self.assertRaises(Exception):

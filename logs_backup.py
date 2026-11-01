@@ -14,6 +14,7 @@ next run resumes them first.
 import argparse
 import datetime as dt
 import html
+import itertools
 import json
 import logging
 import os
@@ -31,7 +32,7 @@ log = logging.getLogger("logs_backup")
 
 DELIMITERS = "_.-"  # characters allowed on each side of a barcode in a filename
 MANIFEST_BATCH = 2000  # manifest lines synced before the matching files are moved
-WORKERS = min(os.cpu_count() or 1, 8)
+WORKERS = min(os.cpu_count() or 1, 8)  # hashing threads, and months committed side by side
 
 SCHEMA_VERSION = 2
 SCHEMA = """
@@ -104,7 +105,8 @@ class Config:
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
         self.source_dir = Path(raw["source_dir"])
         self.output_dir = Path(raw["output_dir"])
-        self.staging_dir = Path(raw.get("staging_dir") or self.output_dir / ".staging")
+        # Staging must be on the source drive: files are moved there by rename.
+        self.staging_dir = Path(raw.get("staging_dir") or self.source_dir / ".staging")
         self.db_path = Path(raw["db_path"])
         self.subfolders = raw.get("subfolders", ["BURNIN", "ESS", "JTAG", "STM", "Xray"])
         self.extensions = {e.lstrip(".").lower() for e in raw.get("extensions", ["txt", "zip"])}
@@ -211,32 +213,32 @@ def has_extension(name, extensions):
 
 def scan(cfg, dates, report=quiet):
     """Matched files as manifest entries, plus error and scanned-file counts. Not recursive."""
-    entries, errors, listings = [], 0, []
+    entries, errors, seen = [], 0, 0
     for sub in cfg.subfolders:
         try:
-            listings += [(sub, item) for item in os.scandir(cfg.source_dir / sub)]
+            listing = os.scandir(cfg.source_dir / sub)  # read as it goes, never held whole in memory
         except OSError as e:
             log.warning("skipping subfolder %s: %s", sub, e)
             errors += 1
-    seen = len(listings)
-    for i, (sub, item) in enumerate(listings):
-        if i % 2000 == 0:
-            report("scan", f"{len(entries)} matches", i, seen)
-        if not item.is_file(follow_symlinks=False) or not has_extension(item.name, cfg.extensions):
             continue
-        found = find_barcodes(item.name, dates)
-        if len(found) > 1:
-            errors += 1  # ambiguous
-            continue
-        if not found:
-            continue
-        barcode = found.pop()
-        month = dates[barcode][:7]
-        if not (len(month) == 7 and month[:4].isdigit() and month[4] == "-" and month[5:].isdigit()):
-            errors += 1
-            continue
-        entries.append({"relative_path": f"{sub}/{item.name}", "source_subfolder": sub,
-                        "barcode": barcode, "original_size": item.stat().st_size, "volume_name": month})
+        with listing:
+            for item in listing:
+                seen += 1
+                if seen % 2000 == 0:
+                    report("scan", f"{len(entries)} matches", seen)
+                if not item.is_file(follow_symlinks=False) or not has_extension(item.name, cfg.extensions):
+                    continue
+                found = find_barcodes(item.name, dates)
+                if len(found) != 1:
+                    errors += len(found) > 1  # several barcodes: ambiguous
+                    continue
+                barcode = found.pop()
+                month = dates[barcode][:7]
+                if not (len(month) == 7 and month[:4].isdigit() and month[4] == "-" and month[5:].isdigit()):
+                    errors += 1
+                    continue
+                entries.append({"relative_path": f"{sub}/{item.name}", "source_subfolder": sub,
+                                "barcode": barcode, "original_size": item.stat().st_size, "volume_name": month})
     report("scan", f"{len(entries)} matches", seen, seen)
     log.info("scanned %d files, %d matches", seen, len(entries))
     return entries, errors, seen
@@ -249,9 +251,14 @@ def staged_path(cfg, entry):
 # ---------------------------------------------------------------- stage
 
 def stage(cfg, sid, entries, report=quiet):
-    """Moves files into staging/<YYYY-MM>/<SUB>/; each manifest line is synced before its file moves."""
+    """Moves files into staging/<YYYY-MM>/<SUB>/; each manifest line is synced before its file moves.
+
+    Returns the number of files that could not be moved (they stay in the source).
+    Renames run on one thread: measured, threads made them slower (they queue on the folder)."""
     errors = 0
     cfg.staging_dir.mkdir(parents=True, exist_ok=True)
+    if os.stat(cfg.staging_dir).st_dev != os.stat(cfg.source_dir).st_dev:
+        raise BackupError(f"staging_dir {cfg.staging_dir} must be on the same drive as source_dir (files move by rename)")
     for d in {staged_path(cfg, e).parent for e in entries}:
         d.mkdir(parents=True, exist_ok=True)
     with open(cfg.manifest, "w", encoding="utf-8") as manifest:
@@ -260,7 +267,7 @@ def stage(cfg, sid, entries, report=quiet):
             batch = entries[i:i + MANIFEST_BATCH]
             manifest.writelines(json.dumps(e) + "\n" for e in batch)
             manifest.flush()
-            os.fsync(manifest.fileno())
+            os.fsync(manifest.fileno())  # the batch is listed on disk before any of it moves
             for e in batch:
                 src, dst = cfg.source_dir / e["relative_path"], staged_path(cfg, e)
                 try:
@@ -318,22 +325,40 @@ def b3(path):
     return blake3.blake3(max_threads=blake3.blake3.AUTO).update_mmap(path).hexdigest()
 
 
-def commit_month(cfg, month, entries):
+def hash_all(pool, paths, chunk=500):
+    """BLAKE3 of every path on the pool's threads, in order. A lazy iterator, so it runs
+    while the caller does other work; chunks keep it to a few hundred tasks, not one per file."""
+    chunks = [paths[i:i + chunk] for i in range(0, len(paths), chunk)]
+    return itertools.chain.from_iterable(pool.map(lambda c: [b3(p) for p in c], chunks))
+
+
+def commit(cfg, month):
+    """One MOCHI commit of staging/<month>/: each <SUB> directory merges into the archive as <SUB>/<file>."""
+    archive = cfg.archive(month)
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    inputs = sorted(d for d in (cfg.staging_dir / month).iterdir() if d.is_dir())
+    out = mochi(cfg, "append" if archive.exists() else "create", archive, *inputs)
+    if out.get("durability") != "durable":
+        log.warning("%s: DEGRADED (not an error): %s", month, out.get("durability_note"))
+
+
+def commit_month(cfg, month, entries, resume=False):
     """Commits a month's staged files (one commit), then checks every file and the archive.
 
     Touches neither SQLite nor staging. Returns (hashes, head)."""
-    archive, month_dir = cfg.archive(month), cfg.staging_dir / month
+    archive, paths = cfg.archive(month), [e["relative_path"] for e in entries]
     with ThreadPoolExecutor(WORKERS) as pool:
-        hashes = dict(zip((e["relative_path"] for e in entries),
-                          pool.map(b3, (staged_path(cfg, e) for e in entries))))
-    head, _ = head_files(cfg, archive)
-    # Skip the commit when everything is already there (a resume after commit but before index).
-    if any(head.get(p) != h for p, h in hashes.items()):
-        archive.parent.mkdir(parents=True, exist_ok=True)
-        inputs = sorted(d for d in month_dir.iterdir() if d.is_dir())  # appended dirs merge, as <SUB>/<file>
-        out = mochi(cfg, "append" if archive.exists() else "create", archive, *inputs)
-        if out.get("durability") != "durable":
-            log.warning("%s: DEGRADED (not an error): %s", month, out.get("durability_note"))
+        hashing = hash_all(pool, [staged_path(cfg, e) for e in entries])  # runs while mochi commits
+        if resume:
+            # A crash between commit and index leaves the batch already committed:
+            # commit only if the head does not hold every file with the same hash.
+            hashes = dict(zip(paths, hashing))
+            head, _ = head_files(cfg, archive)
+            if any(head.get(p) != h for p, h in hashes.items()):
+                commit(cfg, month)
+        else:
+            commit(cfg, month)
+            hashes = dict(zip(paths, hashing))
     head, head_id = head_files(cfg, archive)
     bad = [p for p, h in hashes.items() if head.get(p) != h]
     if bad:
@@ -368,7 +393,7 @@ def index_month(db, cfg, sid, month, entries, hashes, head):
                    " (SELECT COUNT(*) FROM scanned_log_entry WHERE file_storage_volume_id = ?) WHERE id = ?", (vid, vid))
 
 
-def finish_staged(db, cfg, report=quiet):
+def finish_staged(db, cfg, report=quiet, resume=False):
     """Archives whatever the manifest lists in staging. Returns a summary dict, or None if nothing is staged."""
     manifest = read_manifest(cfg)
     if manifest is None:
@@ -385,7 +410,7 @@ def finish_staged(db, cfg, report=quiet):
     archived, failures, breakdown = [], [], {}
     report("commit", "", 0, len(months))
     with ThreadPoolExecutor(min(WORKERS, max(len(months), 1))) as pool:
-        jobs = {m: pool.submit(commit_month, cfg, m, es) for m, es in months.items()}
+        jobs = {m: pool.submit(commit_month, cfg, m, es, resume) for m, es in months.items()}
         for month, job in sorted(jobs.items()):  # SQLite and deletes stay on this thread
             try:
                 hashes, head = job.result()
@@ -418,6 +443,25 @@ def finish_staged(db, cfg, report=quiet):
 
 # ---------------------------------------------------------------- run
 
+def lock_run(cfg):
+    """Holds <output_dir>/.backup.lock so two runs never share staging. Returns the open lock file.
+
+    The OS releases the lock when the process ends, even after a crash, so it never goes stale."""
+    cfg.output_dir.mkdir(parents=True, exist_ok=True)
+    lock = open(cfg.output_dir / ".backup.lock", "a+b")
+    try:
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        lock.close()
+        raise BackupError("another backup run is in progress (lock held on .backup.lock); try again when it ends")
+    return lock
+
+
 def plan(entries):
     """{month: (files, bytes)} of matched files, sorted by month."""
     volumes = defaultdict(lambda: (0, 0))
@@ -432,12 +476,17 @@ def run(cfg, candidates_fn=query_candidates, dry_run=False, report=quiet, confir
 
     confirm(volumes) -> bool, if given, is asked after the scan and before any file moves;
     False stops the run with nothing moved and nothing recorded."""
+    with lock_run(cfg):
+        return _run(cfg, candidates_fn, dry_run, report, confirm)
+
+
+def _run(cfg, candidates_fn, dry_run, report, confirm):
     db = open_index(cfg.db_path)
     resumed = 0
     if not dry_run and cfg.manifest.exists():
         report("resume", "finishing the batch an earlier run left in staging")
         # The resumed batch's progress is shown on the "resume" row.
-        finished = finish_staged(db, cfg, lambda _step, *args: report("resume", *args))
+        finished = finish_staged(db, cfg, lambda _step, *args: report("resume", *args), resume=True)
         resumed = finished["files_moved"] if finished else 0
         report("resume", f"{resumed} files", 1, 1)
 
