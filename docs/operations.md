@@ -26,7 +26,15 @@ Install, configure, run, get files back, move to another PC, and fix problems.
    ```
 
    This gives you `target/release/mochi` (`mochi.exe` on Windows). Put its folder on
-   PATH, or set its full path as `"mochi"` in the config.
+   PATH, or set its full path in the config, for example
+   `"mochi": "D:/GitHub/MOCHI/target/release/mochi.exe"`. Check it starts:
+
+   ```bash
+   mochi --version
+   ```
+
+   Every real run checks this first and stops before moving any file if `mochi`
+   cannot be started. A dry run only warns.
 
 ## Configure
 
@@ -189,6 +197,8 @@ month is only updated the next time that month gets new files.
 | `SQL Server query failed: TDS server connection failed ... (error 20002)` | Something answered, but the SQL Server handshake failed | 1. Check `port`: a named instance is not on 1433, so write `HOST\\NAME` as `server`. 2. If the port is right, the server probably only offers old TLS. Ask for TLS 1.2 on the server, or set `"encryption": "off"` (see [SQL Server login](#sql-server-login)). Retry with `--check-sql`. |
 | `SQL Server query failed: Login failed ... (error 18456)` | Wrong user or password, or the login is disabled | Check them. |
 | `SQL Server query failed: ... (error 4060)` | The login cannot open `database` | Check `database` and the login's permissions |
+| `the mochi program was not found (...)` | `mochi` is not on PATH and `"mochi"` in the config is not its full path | See [Install](#install-once) step 3. Files already in staging stay there and are finished by the next run. |
+| `... kept in staging: [WinError 2] The system cannot find the file specified` (versions before this check) | Same as above | Same. Do not move staged files by hand. |
 | `another backup run is in progress` | Another run holds the lock | Wait for it. If no run is open, a process may still be alive. Check Task Manager. |
 | `not staged ...: [WinError 32] ...` | A file is open in another program | Nothing to do. It stays in the source and a later run takes it. |
 | `mochi append ...: exit 3 {'code': 'LOCK_CONFLICT'...}` | Something else is writing that archive (for example a `mochi` command you started) | Close it and run again |

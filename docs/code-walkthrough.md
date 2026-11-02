@@ -113,6 +113,7 @@ safe to resume. A broken last line (a crash mid-write) is skipped.
 
 | Function | What it does |
 |---|---|
+| `check_mochi(cfg)` | Runs `mochi --version`. Called first in every run, before resuming or moving anything. A real run stops if `mochi` cannot be started; a dry run logs a warning. |
 | `mochi(cfg, *args)` | Runs `mochi --json --no-local-history ARGS`. Exit 0 and 2 pass (2 = committed or checked, with a warning such as unconfirmed folder durability). Any other exit raises `BackupError` with MOCHI's error code. |
 | `head_files(cfg, archive)` | `mochi list`: returns `{path: BLAKE3}` of the archive head, plus `(seq, commit_id)`. |
 | `b3(path)` | BLAKE3 of a file, memory-mapped. BLAKE3 may use several threads for a big file. |

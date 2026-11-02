@@ -375,10 +375,30 @@ def read_manifest(cfg):
 
 # ---------------------------------------------------------------- MOCHI
 
+def mochi_not_found(cfg, err):
+    return BackupError(f"the mochi program was not found ({cfg.mochi!r}: {err}). Build it from the MOCHI"
+                       " repository (cargo build --release -p mochi-cli) and set \"mochi\" in config.json"
+                       " to the full path of mochi.exe, or put its folder on PATH")
+
+
+def check_mochi(cfg):
+    """The mochi version line. Raises BackupError if mochi cannot be started."""
+    try:
+        p = subprocess.run([cfg.mochi, "--version"], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise mochi_not_found(cfg, e) from e
+    if p.returncode != 0 or not p.stdout.startswith("mochi "):
+        raise mochi_not_found(cfg, f"'--version' gave exit {p.returncode}: {(p.stdout or p.stderr).strip()[:200]}")
+    return p.stdout.splitlines()[0]
+
+
 def mochi(cfg, *args):
     """Runs `mochi --json ARGS`. Exit 0 and 2 (degraded, data committed / checked) pass; others raise."""
-    p = subprocess.run([cfg.mochi, "--json", "--no-local-history", *map(str, args)],
-                       capture_output=True, text=True)
+    try:
+        p = subprocess.run([cfg.mochi, "--json", "--no-local-history", *map(str, args)],
+                           capture_output=True, text=True)
+    except OSError as e:
+        raise mochi_not_found(cfg, e) from e
     try:
         out = json.loads(p.stdout)
     except ValueError:
@@ -560,6 +580,13 @@ def run(cfg, candidates_fn=None, dry_run=False, report=quiet, confirm=None):
 
 
 def _run(cfg, candidates_fn, dry_run, report, confirm):
+    # Checked before anything moves: without mochi, staged files could not be committed.
+    try:
+        log.info("using %s", check_mochi(cfg))
+    except BackupError as e:
+        if not dry_run:
+            raise
+        log.warning("a real run would stop here: %s", e)
     db = open_index(cfg.db_path)
     resumed = 0
     if not dry_run and cfg.manifest.exists():

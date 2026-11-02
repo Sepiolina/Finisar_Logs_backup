@@ -182,9 +182,24 @@ class Flow(unittest.TestCase):
         self.assertTrue((self.cfg.source_dir / "BURNIN/unit1_BC001_log.txt").exists())
         self.assertEqual(self.run_backup()["files_moved"], 2)
 
-    def test_failed_commit_keeps_staging(self):
+    def test_missing_mochi_moves_nothing(self):
         self.cfg.mochi = str(self.tmp / "missing-mochi")
-        with self.assertRaises(Exception):
+        with self.assertRaisesRegex(lb.BackupError, "mochi program was not found"):
+            self.run_backup()
+        self.assertTrue((self.cfg.source_dir / "BURNIN/unit1_BC001_log.txt").is_file())
+        self.assertFalse(self.cfg.staging_dir.exists())
+        with self.assertLogs("logs_backup", "WARNING") as logs:  # a dry run only warns
+            self.assertEqual(lb.run(self.cfg, lambda *_: self.CANDIDATES, dry_run=True)["matched_files"], 2)
+        self.assertIn("a real run would stop here", logs.output[0])
+
+    @unittest.skipIf(os.name == "nt", "uses a shell script as a fake mochi")
+    def test_failed_commit_keeps_staging(self):
+        fake = self.tmp / "failing-mochi"  # starts, but every commit fails
+        fake.write_text('#!/bin/sh\n[ "$1" = --version ] && echo "mochi 0.0" && exit 0\n'
+                        'echo \'{"error":{"code":"IO_ERROR","message":"test"}}\'; exit 3\n')
+        fake.chmod(0o755)
+        self.cfg.mochi = str(fake)
+        with self.assertRaisesRegex(lb.BackupError, "IO_ERROR"):
             self.run_backup()
         self.assertTrue((self.cfg.staging_dir / "2026-08/BURNIN/unit1_BC001_log.txt").is_file())
         self.cfg.mochi = MOCHI
