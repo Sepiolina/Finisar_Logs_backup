@@ -72,10 +72,18 @@ Put it in `config.json`:
   | Value | Meaning |
   |---|---|
   | `null` or `"request"` | Default. Uses TLS when the server offers it. |
-  | `"require"` | Refuse to connect without TLS |
-  | `"off"` | **No encryption at all**, the same as Finisar_move_log_files. The login and data travel in clear text on the network, so use it only on a trusted factory network. Each run logs a warning. |
+  | `"require"` or `true` | Refuse to connect without TLS |
+  | `"off"` or `false` | **No encryption at all**, the same as Finisar_move_log_files. The login and data travel in clear text on the network, so use it only on a trusted factory network. Each run logs a warning. |
 
   Use `"off"` only if `--check-sql` fails with **error 20002** and the port is right. That usually means the server only offers old TLS versions (SQL Server 2008–2014 without updates), which this program's TLS library refuses. The better fix is to have the server updated for TLS 1.2. Ask your database administrator.
+
+If `"off"` is set, every run prints `SQL Server connection without encryption`.
+If you don't see that line, the setting was not applied.
+
+If a connection still fails, FreeTDS can write a protocol log to send to whoever
+supports the tool. On Windows (PowerShell): `$env:TDSDUMP="C:/temp/tds.log"`, then
+run `--check-sql`. The log does not contain the password, but it does contain the
+server name and user.
 
 Test the connection on its own, without scanning or moving anything:
 

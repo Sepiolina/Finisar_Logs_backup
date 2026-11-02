@@ -212,10 +212,14 @@ def sql_error(e):
 def set_encryption(mode):
     """Chooses FreeTDS's login encryption: "request" (FreeTDS's default), "require" or "off".
 
+    false/true (JSON) or "false"/"true", "0"/"1", "no"/"yes" (DB_ENCRYPTION) mean "off"/"require".
     FreeTDS reads this only from a freetds.conf, so one is written to the temp folder and used."""
-    mode = mode or "request"
+    given = mode
+    mode = str(mode).strip().lower()  # None -> "none", False -> "false"
+    mode = {"none": "request", "": "request", "false": "off", "no": "off", "0": "off",
+            "true": "require", "yes": "require", "1": "require"}.get(mode, mode)
     if mode not in ("request", "require", "off"):
-        raise BackupError(f'sql_server "encryption" must be "request", "require" or "off", not {mode!r}')
+        raise BackupError(f'sql_server "encryption" must be "request", "require" or "off", not {given!r}')
     if mode == "off":
         log.warning("SQL Server connection without encryption (\"encryption\": \"off\" in config.json)")
     conf = Path(tempfile.gettempdir()) / f"logs_backup_freetds_{mode}.conf"

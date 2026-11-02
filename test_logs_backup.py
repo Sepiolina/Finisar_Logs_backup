@@ -69,6 +69,13 @@ class ConfigFile(unittest.TestCase):
         with self.assertRaisesRegex(lb.BackupError, '"encryption" must be'):
             lb.set_encryption("maybe")
 
+    def test_encryption_values(self):
+        for given, mode in [(None, "request"), ("request", "request"), (False, "off"), ("off", "off"),
+                            ("false", "off"), ("0", "off"), (True, "require"), ("require", "require"), ("1", "require")]:
+            lb.set_encryption(given)
+            conf = Path(os.environ["FREETDSCONF"]).read_text()
+            self.assertIn(f"encryption = {mode}", conf, given)
+
     def test_index_folder_is_created(self):
         tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, tmp)
