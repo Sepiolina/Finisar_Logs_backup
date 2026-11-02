@@ -114,6 +114,15 @@ class Config:
         self.date_range = raw.get("date_range")  # optional ["YYYY-MM-DD", "YYYY-MM-DD"]
         self.mochi = raw.get("mochi", "mochi")
         self.email = raw.get("email")  # optional {"api_base_url": ..., "to": ...}
+        # SQL Server login: "sql_server" in config.json, each value overridden by its DB_* variable.
+        # A missing password is asked for by backup_ui.py (hidden) instead of being stored.
+        sql, env = raw.get("sql_server") or {}, os.environ
+        self.sql = {key: env.get(var) or sql.get(key) for key, var in (
+            ("server", "DB_SERVER"), ("port", "DB_PORT"), ("database", "DB_NAME"),
+            ("user", "DB_USER"), ("password", "DB_PASSWORD"))}
+        for name in ("source_dir", "output_dir", "staging_dir", "db_path"):
+            if any(ord(c) < 32 for c in str(getattr(self, name))):  # "E:\backup" in JSON is E: + backspace + ackup
+                raise BackupError(f"{name} in config.json has a broken path: write Windows paths with / (E:/backup)")
         for sub in self.subfolders:
             if not sub or sub in (".", "..") or any(c in sub for c in "/\\:"):
                 raise BackupError(f"subfolder {sub!r} must be a single plain folder name")
@@ -129,7 +138,12 @@ class Config:
 # ---------------------------------------------------------------- SQLite index
 
 def open_index(path):
-    db = sqlite3.connect(path)
+    path.parent.mkdir(parents=True, exist_ok=True)  # SQLite creates the file, not its folder
+    try:
+        db = sqlite3.connect(path)
+        db.execute("PRAGMA user_version")
+    except sqlite3.Error as e:
+        raise BackupError(f"cannot open the index {path}: {e}") from e
     version = db.execute("PRAGMA user_version").fetchone()[0]
     columns = {r[1] for t in ("file_storage_volume", "scanned_log_entry")
                for r in db.execute(f"PRAGMA table_info({t})")}
@@ -167,8 +181,8 @@ def query_window(db, cfg):
 
 # ---------------------------------------------------------------- SQL Server
 
-def query_candidates(date_from, date_to):
-    """[(barcode, 'YYYY-MM-DD HH:MM:SS')] for the window. Connection settings come from DB_* env vars."""
+def query_candidates(sql_login, date_from, date_to):
+    """[(barcode, 'YYYY-MM-DD HH:MM:SS')] for the window. sql_login is Config.sql."""
     import pymssql  # imported here so the rest of the module works without it
 
     where, params = "sft.last_update < %s", [date_to]
@@ -178,15 +192,17 @@ def query_candidates(date_from, date_to):
            " FROM ForthUtilities.dbo.ShipmentFinisarSerial sfs WITH (NOLOCK)"
            " JOIN ForthUtilities.dbo.ShipmentFinisarTrace sft WITH (NOLOCK) ON sfs.trace_id = sft.trace_id"
            f" WHERE {where}")
-    env = os.environ
-    missing = [k for k in ("DB_SERVER", "DB_NAME", "DB_USER", "DB_PASSWORD") if not env.get(k)]
+    missing = [k for k in ("server", "database", "user", "password") if not sql_login.get(k)]
     if missing:
-        raise BackupError(f"missing environment variable(s): {', '.join(missing)}")
+        raise BackupError(f"SQL Server login incomplete, missing: {', '.join(missing)}. Add it to"
+                          " \"sql_server\" in config.json, or set the DB_* environment variables")
+    env = os.environ
     retries, delay = int(env.get("DB_RETRY_ATTEMPTS", 3)), int(env.get("DB_RETRY_BASE_DELAY_MS", 2000)) / 1000
     for attempt in range(retries + 1):
         try:
-            with pymssql.connect(server=env["DB_SERVER"], port=env.get("DB_PORT", "1433"),
-                                 database=env["DB_NAME"], user=env["DB_USER"], password=env["DB_PASSWORD"],
+            with pymssql.connect(server=sql_login["server"], port=str(sql_login.get("port") or 1433),
+                                 database=sql_login["database"], user=sql_login["user"],
+                                 password=sql_login["password"],
                                  timeout=int(env.get("DB_REQUEST_TIMEOUT_MS", 30000)) // 1000) as conn:
                 cur = conn.cursor()
                 cur.execute(sql, tuple(params))
@@ -471,11 +487,13 @@ def plan(entries):
     return dict(sorted(volumes.items()))
 
 
-def run(cfg, candidates_fn=query_candidates, dry_run=False, report=quiet, confirm=None):
+def run(cfg, candidates_fn=None, dry_run=False, report=quiet, confirm=None):
     """One backup run. Returns a summary dict whose "status" is "done", "dry_run" or "cancelled".
 
     confirm(volumes) -> bool, if given, is asked after the scan and before any file moves;
-    False stops the run with nothing moved and nothing recorded."""
+    False stops the run with nothing moved and nothing recorded.
+    candidates_fn(date_from, date_to) defaults to querying SQL Server (tests pass their own)."""
+    candidates_fn = candidates_fn or (lambda date_from, date_to: query_candidates(cfg.sql, date_from, date_to))
     with lock_run(cfg):
         return _run(cfg, candidates_fn, dry_run, report, confirm)
 

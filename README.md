@@ -24,9 +24,9 @@ pip install -r requirements.txt
 cp config.example.json config.json
 ```
 
-Edit the paths in `config.json`. Put the `mochi` program on PATH (or set
-`"mochi"` in the config), and set `DB_SERVER`, `DB_NAME`, `DB_USER` and
-`DB_PASSWORD`. Then:
+Edit `config.json`: the paths (write them with `/`, like `E:/archive`) and the
+`sql_server` login. Leave the password `null` and the UI asks for it each run.
+Put the `mochi` program on PATH, or set `"mochi"` in the config. Then:
 
 ```bash
 python backup_ui.py config.json --dry-run
@@ -68,7 +68,7 @@ On Windows, double-click `run_backup.bat`. Full steps are in [docs/operations.md
 
 Deliberate differences:
 
-- **Terminal UI instead of a desktop app.** The SQL login comes from `DB_*` environment variables, not an encrypted settings file.
+- **Terminal UI instead of a desktop app.** The SQL login is in `config.json` (the password can be asked each run) or `DB_*` environment variables, not an encrypted settings file.
 - **MOCHI through its command line** (`mochi --json`), not the Rust library.
 - **One commit per month per run**, not commits split at 1 GiB or 20,000 files. The archive contents are the same.
 - **Verify checks the whole month each run**, not only the new commit. This makes appends to big months a few seconds slower (see [performance](docs/performance.md)).

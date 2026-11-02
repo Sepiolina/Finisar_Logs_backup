@@ -7,9 +7,9 @@ for the overall flow.
 
 | File | Lines | Role |
 |---|---|---|
-| `logs_backup.py` | ~550 | **All backup logic.** No display code. Also runs alone: `python logs_backup.py config.json`. |
-| `backup_ui.py` | ~150 | Terminal UI with `rich`. Draws progress and asks before moving files. **Makes no backup decisions.** |
-| `test_logs_backup.py` | ~140 | Tests: matching rules, full flow, crash recovery, cancel, the run lock. |
+| `logs_backup.py` | ~580 | **All backup logic.** No display code. Also runs alone: `python logs_backup.py config.json`. |
+| `backup_ui.py` | ~160 | Terminal UI with `rich`. Draws progress and asks before moving files. **Makes no backup decisions.** |
+| `test_logs_backup.py` | ~170 | Tests: matching rules, config, full flow, crash recovery, cancel, the run lock. |
 | `bench.py` | ~75 | Times a full run over generated files. See [performance.md](performance.md). |
 
 For a safety audit, read `logs_backup.py` only. `backup_ui.py` cannot move,
@@ -57,24 +57,28 @@ The file is laid out in run order and split by `# ----` section comments.
 
 `Config(path)` reads `config.json`, fills defaults (staging defaults to
 `source_dir/.staging`, the same drive as the source) and checks every subfolder
-is a single plain folder name (no `/`, `\`, `:`, `..`). `cfg.manifest` and
+is a single plain folder name (no `/`, `\`, `:`, `..`). It refuses a path that
+contains a control character (what `"E:\backup"` turns into in JSON). `cfg.sql`
+holds the SQL Server login: each value comes from the `DB_*` environment
+variable if set, otherwise from `sql_server` in the file. `cfg.manifest` and
 `cfg.archive(month)` build the two paths used everywhere else.
 
 ### SQLite index
 
 | Function | What it does |
 |---|---|
-| `open_index(path)` | Opens or creates the database. Refuses a legacy or other-version index without changing it. |
+| `open_index(path)` | Creates the folder if needed, then opens or creates the database. Refuses a legacy or other-version index without changing it. |
 | `start_session` / `complete_session` | Insert a `scan_session` row as `running`, then update it with status and totals. |
 | `query_window(db, cfg)` | Works out the dates to query (see [how-it-works.md](how-it-works.md#the-date-window)). It ignores recovery sessions whose dates are the word `resumed`. |
 
 ### SQL Server
 
-`query_candidates(date_from, date_to)` runs the same query as the original
-(`ShipmentFinisarSerial` joined to `ShipmentFinisarTrace`) with `pymssql`. Dates
-are passed as query parameters, not pasted into the SQL. It retries with
-exponential backoff and raises `BackupError` naming any missing `DB_*`
-variable.
+`query_candidates(sql_login, date_from, date_to)` runs the same query as the
+original (`ShipmentFinisarSerial` joined to `ShipmentFinisarTrace`) with `pymssql`,
+using `cfg.sql`. Dates are passed as query parameters, not pasted into the SQL.
+It retries with exponential backoff and raises `BackupError` naming any missing
+part of the login. `run()` uses it unless the caller passes its own
+`candidates_fn` (the tests do).
 
 ### Scan
 
@@ -136,7 +140,7 @@ safe to resume. A broken last line (a crash mid-write) is skipped.
 | `Mark` | The status column: spinner while running, ✓ when done, ✗ when failed. |
 | `ask_confirm(progress, yes)` | The `confirm` callback. Pauses the progress display, shows a table of months, asks `y/n` (default no). `--yes` skips it. |
 | `print_summary(summary)` | Summary table and panel. Uses the words "committed (LOCAL_COMMITTED)" and the reminder that this is not a backup on its own. |
-| `main()` | Logging (warnings on screen, everything in `backup.log`), runs, catches failures and shows a red panel that says nothing is lost and running again continues. |
+| `main()` | Loads the config (a broken config shows a "Config problem" panel, not a traceback), asks for the SQL password hidden if `sql_server` has a user but no password, sets up logging (warnings on screen, everything in `backup.log`), runs, catches failures and shows a red panel that says nothing is lost and running again continues. |
 
 ## Tests
 
@@ -154,6 +158,9 @@ MOCHI_BIN=/path/to/mochi python -m unittest -v
 | `test_callbacks_report_steps_and_cancel_moves_nothing` | Progress steps, and a declined confirm moves and records nothing |
 | `test_second_run_at_the_same_time_is_refused` | Run lock |
 | `test_failed_commit_keeps_staging` | A failing `mochi` keeps staging, and the next run completes it |
+| `test_sql_login_from_config_with_env_override` | Login read from `config.json`, `DB_*` variables win, a missing part is named |
+| `test_backspace_in_a_path_is_refused` | `"E:\backup"` in JSON is caught |
+| `test_index_folder_is_created` | `db_path` in a folder that does not exist yet |
 
 The flow tests need the `mochi` program. Without it they are skipped, and only
 the matching tests run.

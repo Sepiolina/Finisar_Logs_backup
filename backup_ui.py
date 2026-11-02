@@ -15,7 +15,7 @@ from rich.console import Console
 from rich.logging import RichHandler
 from rich.panel import Panel
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
-from rich.prompt import Confirm
+from rich.prompt import Confirm, Prompt
 from rich.table import Table
 from rich.text import Text
 
@@ -127,7 +127,17 @@ def main():
     logfile.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     logging.basicConfig(level=logging.INFO, handlers=[screen, logfile])
 
-    cfg = lb.Config(args.config)
+    try:
+        cfg = lb.Config(args.config)
+    except (OSError, ValueError, KeyError, lb.BackupError) as e:  # ValueError: invalid JSON
+        detail = f"missing setting {e}" if isinstance(e, KeyError) else str(e)
+        if "escape" in detail:
+            detail += "\nWrite Windows paths with / (E:/archive) or \\\\ (E:\\\\archive)."
+        console.print(Panel(f"{args.config}: {detail}", title="Config problem", border_style="red"))
+        sys.exit(2)
+    if cfg.sql["user"] and not cfg.sql["password"]:  # asked each run, never stored
+        cfg.sql["password"] = Prompt.ask(f"SQL Server password for {cfg.sql['user']}", password=True)
+
     columns = (Mark(finished_text="[green]✓"), TextColumn("{task.description}"),
                BarColumn(), MofNCompleteColumn(), TimeElapsedColumn())
     with Progress(*columns, console=console) as progress:

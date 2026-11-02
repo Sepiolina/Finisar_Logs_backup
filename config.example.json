@@ -3,6 +3,13 @@
   "output_dir": "E:/archive",
   "staging_dir": null,
   "db_path": "E:/archive/index.db",
+  "sql_server": {
+    "server": "sqlhost",
+    "port": 1433,
+    "database": "ForthUtilities",
+    "user": "backup_reader",
+    "password": null
+  },
   "subfolders": ["BURNIN", "ESS", "JTAG", "STM", "Xray"],
   "extensions": ["txt", "zip"],
   "lookback_days": 2,
