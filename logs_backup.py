@@ -102,6 +102,18 @@ def quiet(step, message="", done=0, total=None):
 
 # ---------------------------------------------------------------- config
 
+def find_config(given=None):
+    """The config file: `given` if passed, else config.json in the current folder, else next to this program."""
+    if given:
+        return Path(given)
+    places = [Path.cwd() / "config.json", Path(__file__).resolve().parent / "config.json"]
+    found = next((p for p in places if p.is_file()), None)
+    if not found:
+        raise BackupError("no config.json found in " + " or ".join(str(p.parent) for p in places)
+                          + ": copy config.example.json to config.json there, or pass the config's path")
+    return found
+
+
 class Config:
     def __init__(self, path):
         self.path = Path(path)
@@ -653,7 +665,7 @@ To restore on another PC
   2. Edit config.json: output_dir = <this folder>/archives, db_path = <this folder>/index.db
      (or copy them where you want and point there), and set source_dir and mochi.
   3. If staging/ exists: copy its contents into <source_dir>/.staging before the first run.
-  4. python backup_ui.py config.json --check-sql, then --dry-run, then a real run.
+  4. python backup_ui.py --check-sql, then --dry-run, then a real run.
 """
 
 
@@ -761,12 +773,12 @@ def send_email(cfg, summary):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("config", help="path to config.json")
+    parser.add_argument("config", nargs="?", help="config file (default: config.json in the current folder, else next to this program)")
     parser.add_argument("--dry-run", action="store_true", help="query and scan only; move nothing")
     parser.add_argument("--export", metavar="DIR", help="copy archives, index and config to DIR, then stop")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    cfg = Config(args.config)
+    cfg = Config(find_config(args.config))
     if args.export:
         export(cfg, args.export)
         return

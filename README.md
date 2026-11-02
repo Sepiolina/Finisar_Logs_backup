@@ -29,21 +29,21 @@ Edit `config.json`: the paths (write them with `/`, like `E:/archive`) and the
 Put the `mochi` program on PATH, or set `"mochi"` in the config. Then:
 
 ```bash
-python backup_ui.py config.json --check-sql
+python backup_ui.py --check-sql
 ```
 
 ```bash
-python backup_ui.py config.json --dry-run
+python backup_ui.py --dry-run
 ```
 
 ```bash
-python backup_ui.py config.json
+python backup_ui.py
 ```
 
 To copy everything needed to restore (archives, index, config) to another drive:
 
 ```bash
-python backup_ui.py config.json --export E:/finisar_export
+python backup_ui.py --export E:/finisar_export
 ```
 
 On Windows, double-click `run_backup.bat`. Full steps are in [docs/operations.md](docs/operations.md).
@@ -61,7 +61,7 @@ On Windows, double-click `run_backup.bat`. Full steps are in [docs/operations.md
 
 | File | Role |
 |---|---|
-| `logs_backup.py` | **All backup logic**, in run order, no display code. `python logs_backup.py config.json` runs it with plain log lines (for scheduled tasks). |
+| `logs_backup.py` | **All backup logic**, in run order, no display code. `python logs_backup.py` runs it with plain log lines (for scheduled tasks). |
 | `backup_ui.py` | Terminal UI (`rich`): progress, a confirm prompt before files move, a summary. Makes no backup decisions. |
 | `test_logs_backup.py` | Tests: `MOCHI_BIN=/path/to/mochi python -m unittest -v` |
 | `bench.py` | Benchmark on generated files |

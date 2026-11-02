@@ -7,7 +7,7 @@ for the overall flow.
 
 | File | Lines | Role |
 |---|---|---|
-| `logs_backup.py` | ~640 | **All backup logic.** No display code. Also runs alone: `python logs_backup.py config.json`. |
+| `logs_backup.py` | ~640 | **All backup logic.** No display code. Also runs alone: `python logs_backup.py`. |
 | `backup_ui.py` | ~180 | Terminal UI with `rich`. Draws progress and asks before moving files. **Makes no backup decisions.** |
 | `test_logs_backup.py` | ~190 | Tests: matching rules, config, full flow, crash recovery, cancel, the run lock. |
 | `bench.py` | ~75 | Times a full run over generated files. See [performance.md](performance.md). |
@@ -58,7 +58,9 @@ The file is laid out in run order and split by `# ----` section comments.
 
 ### Config
 
-`Config(path)` reads `config.json`, fills defaults (staging defaults to
+`find_config(given)` picks the file: the path passed on the command line if
+any, else `config.json` in the current folder, else the one next to the program.
+`Config(path)` reads it, fills defaults (staging defaults to
 `source_dir/.staging`, the same drive as the source) and checks every subfolder
 is a single plain folder name (no `/`, `\`, `:`, `..`). It refuses a path that
 contains a control character (what `"E:\backup"` turns into in JSON). `cfg.sql`
@@ -170,6 +172,7 @@ MOCHI_BIN=/path/to/mochi python -m unittest -v
 | `test_sql_errors_are_one_readable_line_with_a_hint` | Your error 20002, a stale code from `pymssql`, login failure, a bad `encryption` value |
 | `test_export_copies_checked_and_skips_unchanged` | Export layout and hashes, password removed, a second export copies no archive, a target inside `output_dir` is refused |
 | `test_missing_mochi_moves_nothing` | No `mochi`: a real run stops before staging, a dry run warns |
+| `test_config_is_found_without_an_argument` | Current folder first, then next to the program, a given path wins, a clear error when none exists |
 | `test_index_folder_is_created` | `db_path` in a folder that does not exist yet |
 
 The flow tests need the `mochi` program. Without it they are skipped, and only

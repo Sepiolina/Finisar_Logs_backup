@@ -38,7 +38,11 @@ Install, configure, run, get files back, move to another PC, and fix problems.
 
 ## Configure
 
-Copy `config.example.json` to `config.json`.
+Copy `config.example.json` to `config.json`, next to the program.
+
+The commands find the config on their own: `config.json` in the folder you run
+them from, else the one next to `backup_ui.py`. To use another file, pass its
+path last, for example `python backup_ui.py --dry-run D:/configs/line2.json`.
 
 > **Windows paths:** write them with `/` (`E:/archive`) or doubled `\\`
 > (`E:\\archive`). A single `\` breaks JSON: `"E:\backup"` reads as `E:` +
@@ -96,7 +100,7 @@ server name and user.
 Test the connection on its own, without scanning or moving anything:
 
 ```bash
-python backup_ui.py config.json --check-sql
+python backup_ui.py --check-sql
 ```
 
 It prints the server's version, or one line saying what failed with a hint.
@@ -125,12 +129,12 @@ the double-click launcher and scheduled tasks see them.
 
 | Want | Do |
 |---|---|
-| Test the SQL Server login only | `python backup_ui.py config.json --check-sql` |
-| Copy everything needed to restore, to another drive | `python backup_ui.py config.json --export E:/finisar_export` (see [Export](#export-a-copy-of-everything-to-restore-from)) |
-| See what would happen | `python backup_ui.py config.json --dry-run` |
-| Run by hand | Double-click `run_backup.bat`, or `python backup_ui.py config.json` |
-| Run without the question | `python backup_ui.py config.json --yes` |
-| Plain log output (scheduled task) | `python logs_backup.py config.json` |
+| Test the SQL Server login only | `python backup_ui.py --check-sql` |
+| Copy everything needed to restore, to another drive | `python backup_ui.py --export E:/finisar_export` (see [Export](#export-a-copy-of-everything-to-restore-from)) |
+| See what would happen | `python backup_ui.py --dry-run` |
+| Run by hand | Double-click `run_backup.bat`, or `python backup_ui.py` |
+| Run without the question | `python backup_ui.py --yes` |
+| Plain log output (scheduled task) | `python logs_backup.py` |
 
 Every run continues where the last successful one ended, so running by hand
 every few days or weeks is fine. If a run is stopped (window closed, power cut),
@@ -176,7 +180,7 @@ One command copies what you need to move this setup to another PC, or to keep
 as an independent copy:
 
 ```bash
-python backup_ui.py config.json --export E:/finisar_export
+python backup_ui.py --export E:/finisar_export
 ```
 
 | In the target folder | From | Notes |

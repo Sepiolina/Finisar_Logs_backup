@@ -76,6 +76,23 @@ class ConfigFile(unittest.TestCase):
             conf = Path(os.environ["FREETDSCONF"]).read_text()
             self.assertIn(f"encryption = {mode}", conf, given)
 
+    def test_config_is_found_without_an_argument(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp)
+        here, program = tmp / "here", tmp / "program"
+        here.mkdir(), program.mkdir()
+        old_cwd = os.getcwd()
+        self.addCleanup(os.chdir, old_cwd)
+        os.chdir(here)
+        with unittest.mock.patch.object(lb, "__file__", str(program / "logs_backup.py")):
+            with self.assertRaisesRegex(lb.BackupError, "no config.json found"):
+                lb.find_config()
+            (program / "config.json").write_text("{}")
+            self.assertEqual(lb.find_config().resolve(), (program / "config.json").resolve())  # next to the program
+            (here / "config.json").write_text("{}")
+            self.assertEqual(lb.find_config().resolve(), (here / "config.json").resolve())  # current folder first
+            self.assertEqual(lb.find_config("x/other.json"), Path("x/other.json"))  # a given path wins
+
     def test_index_folder_is_created(self):
         tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, tmp)

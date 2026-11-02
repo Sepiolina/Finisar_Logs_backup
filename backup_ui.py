@@ -4,7 +4,7 @@ Display only: every backup decision is made in logs_backup.py. This file passes
 two callbacks to logs_backup.run() (report for progress, confirm before files
 move) and draws what it gets back.
 
-    python backup_ui.py config.json [--dry-run] [--yes]
+    python backup_ui.py [--dry-run] [--yes] [--check-sql] [--export DIR] [CONFIG]
 """
 import argparse
 import logging
@@ -171,28 +171,34 @@ def check_sql(cfg):
 
 def main():
     parser = argparse.ArgumentParser(description="Finisar log backup (terminal UI)")
-    parser.add_argument("config", help="path to config.json")
+    parser.add_argument("config", nargs="?", help="config file (default: config.json in the current folder, else next to this program)")
     parser.add_argument("--dry-run", action="store_true", help="query and scan only; move nothing")
     parser.add_argument("--yes", action="store_true", help="do not ask before moving files")
     parser.add_argument("--check-sql", action="store_true", help="only test the SQL Server connection")
     parser.add_argument("--export", metavar="DIR", help="copy archives, index and config to DIR, then stop")
     args = parser.parse_args()
 
+    try:
+        config_path = lb.find_config(args.config)
+    except lb.BackupError as e:
+        console.print(Panel(str(e), title="Config problem", border_style="red"))
+        sys.exit(2)
+
     # Warnings on screen; the full run log in backup.log next to the config, for audit.
     screen = RichHandler(console=console, show_path=False, level=logging.WARNING)
     screen.addFilter(lambda record: not record.exc_info)  # tracebacks go to backup.log only
     screen.setFormatter(logging.Formatter("%(message)s"))
-    logfile = logging.FileHandler(Path(args.config).with_name("backup.log"), encoding="utf-8")
+    logfile = logging.FileHandler(config_path.with_name("backup.log"), encoding="utf-8")
     logfile.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     logging.basicConfig(level=logging.INFO, handlers=[screen, logfile])
 
     try:
-        cfg = lb.Config(args.config)
+        cfg = lb.Config(config_path)
     except (OSError, ValueError, KeyError, lb.BackupError) as e:  # ValueError: invalid JSON
         detail = f"missing setting {e}" if isinstance(e, KeyError) else str(e)
         if "escape" in detail:
             detail += "\nWrite Windows paths with / (E:/archive) or \\\\ (E:\\\\archive)."
-        console.print(Panel(f"{args.config}: {detail}", title="Config problem", border_style="red"))
+        console.print(Panel(f"{config_path}: {detail}", title="Config problem", border_style="red"))
         sys.exit(2)
     if args.export:
         export(cfg, args.export)
