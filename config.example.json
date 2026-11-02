@@ -15,6 +15,6 @@
   "extensions": ["txt", "zip"],
   "lookback_days": 2,
   "date_range": null,
-  "mochi": "mochi",
+  "mochi": null,
   "email": null
 }

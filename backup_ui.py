@@ -156,8 +156,21 @@ def export(cfg, target):
     console.print(Panel(note, border_style="green"))
 
 
+def check_setup(cfg):
+    """--check-sql: finds mochi, then makes one SQL Server connection. Changes nothing."""
+    try:
+        console.print(Panel(lb.check_mochi(cfg), title="mochi: found", border_style="green"))
+        mochi_ok = True
+    except lb.BackupError as e:
+        console.print(Panel(str(e), title="mochi: not found", border_style="red"))
+        mochi_ok = False
+    check_sql(cfg)
+    if not mochi_ok:
+        sys.exit(1)
+
+
 def check_sql(cfg):
-    """--check-sql: one connection with the configured login, nothing else."""
+    """One connection with the configured login, nothing else."""
     sql = cfg.sql
     where = f"{sql['server']}" + ("" if "\\" in str(sql["server"]) else f":{sql['port'] or 1433}")
     with console.status(f"Connecting to {where} as {sql['user']} (encryption: {sql['encryption'] or 'request'})..."):
@@ -174,7 +187,7 @@ def main():
     parser.add_argument("config", nargs="?", help="config file (default: config.json in the current folder, else next to this program)")
     parser.add_argument("--dry-run", action="store_true", help="query and scan only; move nothing")
     parser.add_argument("--yes", action="store_true", help="do not ask before moving files")
-    parser.add_argument("--check-sql", action="store_true", help="only test the SQL Server connection")
+    parser.add_argument("--check-sql", action="store_true", help="only check that mochi and SQL Server are reachable")
     parser.add_argument("--export", metavar="DIR", help="copy archives, index and config to DIR, then stop")
     args = parser.parse_args()
 
@@ -206,7 +219,7 @@ def main():
     if cfg.sql["user"] and not cfg.sql["password"]:  # asked each run, never stored
         cfg.sql["password"] = Prompt.ask(f"SQL Server password for {cfg.sql['user']}", password=True)
     if args.check_sql:
-        check_sql(cfg)
+        check_setup(cfg)
         return
 
     with Progress(*COLUMNS, console=console) as progress:

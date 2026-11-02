@@ -115,7 +115,8 @@ safe to resume. A broken last line (a crash mid-write) is skipped.
 
 | Function | What it does |
 |---|---|
-| `check_mochi(cfg)` | Runs `mochi --version`. Called first in every run, before resuming or moving anything. A real run stops if `mochi` cannot be started; a dry run logs a warning. |
+| `mochi_places(configured)` | Where to look for `mochi`: only the configured path if one is set (`"mochi"` alone counts as unset), else PATH, cargo's bin folder, next to the program, and a `MOCHI` checkout beside it. |
+| `check_mochi(cfg)` | Tries each place with `mochi --version` and sets `cfg.mochi` to the full path of the first that works. Called first in every run, before resuming or moving anything. A real run stops if none works, listing every place tried (and noting if only the desktop app is installed); a dry run logs a warning. Also shown by `--check-sql`. |
 | `mochi(cfg, *args)` | Runs `mochi --json --no-local-history ARGS`. Exit 0 and 2 pass (2 = committed or checked, with a warning such as unconfirmed folder durability). Any other exit raises `BackupError` with MOCHI's error code. |
 | `head_files(cfg, archive)` | `mochi list`: returns `{path: BLAKE3}` of the archive head, plus `(seq, commit_id)`. |
 | `b3(path)` | BLAKE3 of a file, memory-mapped. BLAKE3 may use several threads for a big file. |
@@ -171,6 +172,7 @@ MOCHI_BIN=/path/to/mochi python -m unittest -v
 | `test_backspace_in_a_path_is_refused` | `"E:\backup"` in JSON is caught |
 | `test_sql_errors_are_one_readable_line_with_a_hint` | Your error 20002, a stale code from `pymssql`, login failure, a bad `encryption` value |
 | `test_export_copies_checked_and_skips_unchanged` | Export layout and hashes, password removed, a second export copies no archive, a target inside `output_dir` is refused |
+| `test_mochi_is_found_without_a_config_path` | Finds `mochi` in a MOCHI checkout beside the program and in cargo's bin folder; lists the places when missing; notes a desktop-only install |
 | `test_missing_mochi_moves_nothing` | No `mochi`: a real run stops before staging, a dry run warns |
 | `test_config_is_found_without_an_argument` | Current folder first, then next to the program, a given path wins, a clear error when none exists |
 | `test_index_folder_is_created` | `db_path` in a folder that does not exist yet |

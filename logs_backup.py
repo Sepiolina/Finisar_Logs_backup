@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import tempfile
@@ -127,7 +128,7 @@ class Config:
         self.extensions = {e.lstrip(".").lower() for e in raw.get("extensions", ["txt", "zip"])}
         self.lookback_days = raw.get("lookback_days", 2)
         self.date_range = raw.get("date_range")  # optional ["YYYY-MM-DD", "YYYY-MM-DD"]
-        self.mochi = raw.get("mochi", "mochi")
+        self.mochi = raw.get("mochi")  # None: found by check_mochi() (PATH, cargo's bin, a MOCHI checkout)
         self.email = raw.get("email")  # optional {"api_base_url": ..., "to": ...}
         # SQL Server login: "sql_server" in config.json, each value overridden by its DB_* variable.
         # A missing password is asked for by backup_ui.py (hidden) instead of being stored.
@@ -388,30 +389,61 @@ def read_manifest(cfg):
 
 # ---------------------------------------------------------------- MOCHI
 
-def mochi_not_found(cfg, err):
-    return BackupError(f"the mochi program was not found ({cfg.mochi!r}: {err}). Build it from the MOCHI"
-                       " repository (cargo build --release -p mochi-cli) and set \"mochi\" in config.json"
-                       " to the full path of mochi.exe, or put its folder on PATH")
+MOCHI_EXE = "mochi.exe" if os.name == "nt" else "mochi"
+
+
+def mochi_places(configured):
+    """Where to look for the mochi command-line program, in order. A path set in config.json is the
+    only place used; otherwise PATH, cargo's bin folder, next to this program, and a MOCHI checkout
+    beside this one (D:/GitHub/MOCHI/target/release/mochi.exe next to D:/GitHub/Finisar_Logs_backup)."""
+    if configured and configured != "mochi":  # "mochi" (the old example config) also means: find it
+        return [str(configured)]
+    here = Path(__file__).resolve().parent
+    places = [shutil.which("mochi"), Path.home() / ".cargo" / "bin" / MOCHI_EXE, here / MOCHI_EXE,
+              here.parent / "MOCHI" / "target" / "release" / MOCHI_EXE,
+              here.parent / "mochi" / "target" / "release" / MOCHI_EXE]
+    return list(dict.fromkeys(str(p) for p in places if p))  # in order, without repeats
+
+
+def desktop_app_hint():
+    """A note if only the MOCHI desktop app is installed: it does not include the mochi command."""
+    roots = [os.environ.get(v) for v in ("LOCALAPPDATA", "ProgramFiles")]
+    apps = [Path(r) / sub / "MOCHI" / "mochi-desktop.exe" for r in roots if r for sub in ("Programs", "")]
+    if any(a.is_file() for a in apps) or shutil.which("mochi-desktop"):
+        return (" The MOCHI desktop app is installed, but it does not include the mochi command-line"
+                " program this backup needs.")
+    return ""
 
 
 def check_mochi(cfg):
-    """The mochi version line. Raises BackupError if mochi cannot be started."""
-    try:
-        p = subprocess.run([cfg.mochi, "--version"], capture_output=True, text=True, timeout=60)
-    except (OSError, subprocess.TimeoutExpired) as e:
-        raise mochi_not_found(cfg, e) from e
-    if p.returncode != 0 or not p.stdout.startswith("mochi "):
-        raise mochi_not_found(cfg, f"'--version' gave exit {p.returncode}: {(p.stdout or p.stderr).strip()[:200]}")
-    return p.stdout.splitlines()[0]
+    """Finds mochi (see mochi_places), sets cfg.mochi to it and returns its version line.
+
+    Raises BackupError naming every place it looked if none starts."""
+    tried = []
+    for exe in mochi_places(cfg.mochi):
+        try:
+            p = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            tried.append(f"{exe}: {e.strerror if isinstance(e, OSError) and e.strerror else e}")
+            continue
+        if p.returncode == 0 and p.stdout.startswith("mochi "):
+            cfg.mochi = shutil.which(exe) or str(Path(exe).resolve())  # full path: not searched again
+            return f"{p.stdout.splitlines()[0]} ({exe})"
+        tried.append(f"{exe}: '--version' gave exit {p.returncode}")
+    raise BackupError("the mochi program was not found. Looked at:\n  " + "\n  ".join(tried)
+                      + "\nBuild it in the MOCHI repository (cargo build --release -p mochi-cli), then set"
+                      " \"mochi\" in config.json to the full path of mochi.exe (with /)." + desktop_app_hint())
 
 
 def mochi(cfg, *args):
     """Runs `mochi --json ARGS`. Exit 0 and 2 (degraded, data committed / checked) pass; others raise."""
+    if not cfg.mochi or not Path(cfg.mochi).is_absolute():
+        check_mochi(cfg)  # finds it and sets cfg.mochi to its full path
     try:
         p = subprocess.run([cfg.mochi, "--json", "--no-local-history", *map(str, args)],
                            capture_output=True, text=True)
     except OSError as e:
-        raise mochi_not_found(cfg, e) from e
+        raise BackupError(f"the mochi program could not be started ({cfg.mochi}): {e}") from e
     try:
         out = json.loads(p.stdout)
     except ValueError:

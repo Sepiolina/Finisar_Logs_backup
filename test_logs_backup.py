@@ -217,6 +217,39 @@ class Flow(unittest.TestCase):
         with self.assertRaisesRegex(lb.BackupError, "must not be inside"):
             lb.export(self.cfg, self.cfg.output_dir / "export")
 
+    def test_mochi_is_found_without_a_config_path(self):
+        github, home = self.tmp / "GitHub", self.tmp / "home"
+        program = github / "Finisar_Logs_backup"
+        program.mkdir(parents=True)
+        checkout = github / "MOCHI" / "target" / "release"
+        checkout.mkdir(parents=True)
+        cfg = lb.Config(self.cfg.path)
+        env = {"PATH": str(self.tmp / "empty"), "HOME": str(home), "USERPROFILE": str(home),
+               "LOCALAPPDATA": str(home / "AppData"), "ProgramFiles": str(home / "Program Files")}
+        with unittest.mock.patch.object(lb, "__file__", str(program / "logs_backup.py")), \
+                unittest.mock.patch.dict(os.environ, env):
+            for configured in (None, "mochi"):  # "mochi" was the old example config's value
+                cfg.mochi = configured
+                with self.assertRaisesRegex(lb.BackupError, "(?s)not found. Looked at:.*GitHub.MOCHI.target.release") as e:
+                    lb.check_mochi(cfg)
+                self.assertNotIn("desktop app", str(e.exception))
+            shutil.copy(MOCHI, checkout / lb.MOCHI_EXE)  # a MOCHI checkout beside this program
+            cfg.mochi = None
+            self.assertIn(str(checkout), lb.check_mochi(cfg))
+            self.assertEqual(cfg.mochi, str(checkout / lb.MOCHI_EXE))
+            (checkout / lb.MOCHI_EXE).unlink()
+            (home / ".cargo" / "bin").mkdir(parents=True)  # cargo install puts it here
+            shutil.copy(MOCHI, home / ".cargo" / "bin" / lb.MOCHI_EXE)
+            cfg.mochi = None
+            self.assertIn(".cargo", lb.check_mochi(cfg))
+            (home / ".cargo" / "bin" / lb.MOCHI_EXE).unlink()
+            desktop = home / "AppData" / "Programs" / "MOCHI"  # only the desktop app installed
+            desktop.mkdir(parents=True)
+            (desktop / "mochi-desktop.exe").write_text("")
+            cfg.mochi = None
+            with self.assertRaisesRegex(lb.BackupError, "desktop app is installed, but it does not include"):
+                lb.check_mochi(cfg)
+
     def test_missing_mochi_moves_nothing(self):
         self.cfg.mochi = str(self.tmp / "missing-mochi")
         with self.assertRaisesRegex(lb.BackupError, "mochi program was not found"):
