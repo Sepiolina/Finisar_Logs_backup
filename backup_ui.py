@@ -107,17 +107,17 @@ def print_summary(summary):
     if summary["volumes"]:
         console.print(volume_table(summary["volumes"], label))
     date_from, date_to = summary["window"]
-    matched, candidates = summary["matched_barcodes"], summary["candidates"]
     lines = [f"Window      {date_from or '(start)'} .. {date_to}",
-             f"Candidates  {candidates:,} barcodes from SQL Server",
-             f"With files  {matched:,} barcodes, {summary['matched_files']:,} files"
-             f" ({candidates - matched:,} have no files in the source folders)",
+             f"Candidates  {summary['candidates']:,} barcodes",
              f"Scanned     {summary['scanned']:,} files",
-             f"Committed   {summary['barcodes']:,} barcodes, {summary['files_moved']:,} files"
-             if status == "done" else "Dry run: nothing moved",
-             f"Errors      {summary['errors']:,}"]
+             f"To archive  {summary['matched_files']:,} files ({summary['matched_barcodes']:,} barcodes)"]
     if summary["resumed"]:
-        lines.insert(5, f"Resumed     {summary['resumed']:,} files left in staging by an earlier run")
+        lines.append(f"Resumed     {summary['resumed']:,} files left in staging by an earlier run")
+    if status == "done":
+        lines.append(f"Committed   {summary['files_moved']:,} files ({summary['barcodes']:,} barcodes)")
+    else:
+        lines.append("Dry run: nothing moved")
+    lines.append(f"Errors      {summary['errors']:,}")
     if status == "done":
         lines.append("[dim]Committed is not a backup: keep an independent copy of the output folder and index.db.")
     style = "yellow" if summary["errors"] else ("green" if status == "done" else "cyan")
