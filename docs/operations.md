@@ -25,16 +25,30 @@ Install, configure, run, get files back, move to another PC, and fix problems.
    cargo build --release -p mochi-cli
    ```
 
-   This gives you `target/release/mochi` (`mochi.exe` on Windows). Put its folder on
-   PATH, or set its full path in the config, for example
-   `"mochi": "D:/GitHub/MOCHI/target/release/mochi.exe"`. Check it starts:
+   This gives you `target/release/mochi` (`mochi.exe` on Windows). The MOCHI
+   **desktop app installer does not include it**: the backup needs this
+   command-line program.
+
+   With `"mochi": null` in the config (the default), the tool finds it on its own.
+   It looks in this order:
+   1. PATH
+   2. `%USERPROFILE%\.cargo\bin` (where `cargo install --path crates/mochi-cli` puts it)
+   3. next to `backup_ui.py`
+   4. a MOCHI checkout beside this one, such as `D:/GitHub/MOCHI/target/release/mochi.exe`
+      next to `D:/GitHub/Finisar_Logs_backup`
+
+   Anywhere else, set the full path, for example
+   `"mochi": "C:/tools/mochi.exe"`. Then that path is the only one used.
+
+   Check what it finds (this also tests the SQL Server login):
 
    ```bash
-   mochi --version
+   python backup_ui.py --check-sql
    ```
 
    Every real run checks this first and stops before moving any file if `mochi`
-   cannot be started. A dry run only warns.
+   cannot be found. A dry run only warns. A Python venv makes no difference: it
+   changes which Python runs, not where programs are found.
 
 ## Configure
 
@@ -59,7 +73,7 @@ path last, for example `python backup_ui.py --dry-run D:/configs/line2.json`.
 | `extensions` | `txt, zip` | Allowed file extensions |
 | `lookback_days` | `2` | The newest `N` days are left for the next run |
 | `date_range` | none | `["YYYY-MM-DD", "YYYY-MM-DD"]` to back-fill a fixed window instead |
-| `mochi` | `mochi` | Path to the `mochi` program |
+| `mochi` | `null`: found automatically | Full path to `mochi.exe`, only needed if it is not in one of the places [Install](#install-once) step 3 lists |
 | `email` | none | `{"api_base_url": "http://host:port", "to": "a@b.c"}` for a report after each run |
 
 ### SQL Server login
@@ -129,7 +143,7 @@ the double-click launcher and scheduled tasks see them.
 
 | Want | Do |
 |---|---|
-| Test the SQL Server login only | `python backup_ui.py --check-sql` |
+| Check that `mochi` is found and SQL Server answers | `python backup_ui.py --check-sql` |
 | Copy everything needed to restore, to another drive | `python backup_ui.py --export E:/finisar_export` (see [Export](#export-a-copy-of-everything-to-restore-from)) |
 | See what would happen | `python backup_ui.py --dry-run` |
 | Run by hand | Double-click `run_backup.bat`, or `python backup_ui.py` |
@@ -237,7 +251,7 @@ month is only updated the next time that month gets new files.
 | `SQL Server query failed: TDS server connection failed ... (error 20002)` | Something answered, but the SQL Server handshake failed | 1. Check `port`: a named instance is not on 1433, so write `HOST\\NAME` as `server`. 2. If the port is right, the server probably only offers old TLS. Ask for TLS 1.2 on the server, or set `"encryption": "off"` (see [SQL Server login](#sql-server-login)). Retry with `--check-sql`. |
 | `SQL Server query failed: Login failed ... (error 18456)` | Wrong user or password, or the login is disabled | Check them. |
 | `SQL Server query failed: ... (error 4060)` | The login cannot open `database` | Check `database` and the login's permissions |
-| `the mochi program was not found (...)` | `mochi` is not on PATH and `"mochi"` in the config is not its full path | See [Install](#install-once) step 3. Files already in staging stay there and are finished by the next run. |
+| `the mochi program was not found. Looked at: ...` | `mochi.exe` is in none of the listed places | See [Install](#install-once) step 3. If it says only the desktop app is installed, build the command-line program. Files already in staging stay there and are finished by the next run. |
 | `... kept in staging: [WinError 2] The system cannot find the file specified` (versions before this check) | Same as above | Same. Do not move staged files by hand. |
 | `another backup run is in progress` | Another run holds the lock | Wait for it. If no run is open, a process may still be alive. Check Task Manager. |
 | `not staged ...: [WinError 32] ...` | A file is open in another program | Nothing to do. It stays in the source and a later run takes it. |
