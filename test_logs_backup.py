@@ -243,11 +243,16 @@ class Flow(unittest.TestCase):
             cfg.mochi = None
             self.assertIn(".cargo", lb.check_mochi(cfg))
             (home / ".cargo" / "bin" / lb.MOCHI_EXE).unlink()
-            desktop = home / "AppData" / "Programs" / "MOCHI"  # only the desktop app installed
-            desktop.mkdir(parents=True)
+            setup_bin = home / "AppData" / "MOCHI" / "bin"  # the MOCHI setup that includes the CLI
+            setup_bin.mkdir(parents=True)
+            shutil.copy(MOCHI, setup_bin / lb.MOCHI_EXE)
+            cfg.mochi = None
+            self.assertIn(str(setup_bin), lb.check_mochi(cfg))
+            (setup_bin / lb.MOCHI_EXE).unlink()
+            desktop = home / "AppData" / "MOCHI"  # an older setup: only the desktop app installed
             (desktop / "mochi-desktop.exe").write_text("")
             cfg.mochi = None
-            with self.assertRaisesRegex(lb.BackupError, "desktop app is installed, but it does not include"):
+            with self.assertRaisesRegex(lb.BackupError, "desktop app is installed, but this version of its setup does not include"):
                 lb.check_mochi(cfg)
 
     def test_missing_mochi_moves_nothing(self):
