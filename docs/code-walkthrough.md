@@ -7,7 +7,7 @@ for the overall flow.
 
 | File | Lines | Role |
 |---|---|---|
-| `logs_backup.py` | ~640 | **All backup logic.** No display code. Also runs alone: `python logs_backup.py config.json`. |
+| `logs_backup.py` | ~640 | **All backup logic.** No display code. Also runs alone: `python logs_backup.py`. |
 | `backup_ui.py` | ~180 | Terminal UI with `rich`. Draws progress and asks before moving files. **Makes no backup decisions.** |
 | `test_logs_backup.py` | ~190 | Tests: matching rules, config, full flow, crash recovery, cancel, the run lock. |
 | `bench.py` | ~75 | Times a full run over generated files. See [performance.md](performance.md). |
@@ -58,7 +58,9 @@ The file is laid out in run order and split by `# ----` section comments.
 
 ### Config
 
-`Config(path)` reads `config.json`, fills defaults (staging defaults to
+`find_config(given)` picks the file: the path passed on the command line if
+any, else `config.json` in the current folder, else the one next to the program.
+`Config(path)` reads it, fills defaults (staging defaults to
 `source_dir/.staging`, the same drive as the source) and checks every subfolder
 is a single plain folder name (no `/`, `\`, `:`, `..`). It refuses a path that
 contains a control character (what `"E:\backup"` turns into in JSON). `cfg.sql`
@@ -113,6 +115,7 @@ safe to resume. A broken last line (a crash mid-write) is skipped.
 
 | Function | What it does |
 |---|---|
+| `check_mochi(cfg)` | Runs `mochi --version`. Called first in every run, before resuming or moving anything. A real run stops if `mochi` cannot be started; a dry run logs a warning. |
 | `mochi(cfg, *args)` | Runs `mochi --json --no-local-history ARGS`. Exit 0 and 2 pass (2 = committed or checked, with a warning such as unconfirmed folder durability). Any other exit raises `BackupError` with MOCHI's error code. |
 | `head_files(cfg, archive)` | `mochi list`: returns `{path: BLAKE3}` of the archive head, plus `(seq, commit_id)`. |
 | `b3(path)` | BLAKE3 of a file, memory-mapped. BLAKE3 may use several threads for a big file. |
@@ -132,6 +135,8 @@ safe to resume. A broken last line (a crash mid-write) is skipped.
 |---|---|
 | `lock_run(cfg)` | Takes an OS file lock on `output_dir/.backup.lock` (`msvcrt` on Windows, `fcntl` elsewhere). A second run at the same time gets a clear `BackupError`. |
 | `plan(entries)` | `{month: (barcodes, files, bytes)}`. One helper for both what a run would archive (confirm, dry run) and what it did archive (summary), so the two always count the same way. |
+| `export(cfg, target, report)` | `--export`: under the run lock, copies the archives (skipping ones unchanged since the last export, per `export-manifest.json`), the index via SQLite's backup API, the config without its password, and staging if present. Writes `RESTORE.txt`. Refuses a target inside `source_dir` or `output_dir`. |
+| `copy_checked(src, dst)` | Copies through a `.partial` file, hashing while reading. The copy is hashed again and must match before it replaces `dst`. |
 | `run(...)` / `_run(...)` | The whole run under the lock: resume leftovers, query, scan, then dry run / confirm, then record barcodes, stage, finish. Marks the session `failed` if anything raises after it started. |
 | `send_email(cfg, summary)` | Optional HTML summary POSTed to `{api_base_url}/api/email/send`. Barcodes are HTML-escaped and the body is capped at 95,000 characters. Failure only logs a warning. |
 | `main()` | Plain command line with log lines, no prompt. For scheduled tasks. |
@@ -165,6 +170,9 @@ MOCHI_BIN=/path/to/mochi python -m unittest -v
 | `test_sql_login_from_config_with_env_override` | Login read from `config.json`, `DB_*` variables win, a missing part is named |
 | `test_backspace_in_a_path_is_refused` | `"E:\backup"` in JSON is caught |
 | `test_sql_errors_are_one_readable_line_with_a_hint` | Your error 20002, a stale code from `pymssql`, login failure, a bad `encryption` value |
+| `test_export_copies_checked_and_skips_unchanged` | Export layout and hashes, password removed, a second export copies no archive, a target inside `output_dir` is refused |
+| `test_missing_mochi_moves_nothing` | No `mochi`: a real run stops before staging, a dry run warns |
+| `test_config_is_found_without_an_argument` | Current folder first, then next to the program, a given path wins, a clear error when none exists |
 | `test_index_folder_is_created` | `db_path` in a folder that does not exist yet |
 
 The flow tests need the `mochi` program. Without it they are skipped, and only

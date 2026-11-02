@@ -102,9 +102,22 @@ def quiet(step, message="", done=0, total=None):
 
 # ---------------------------------------------------------------- config
 
+def find_config(given=None):
+    """The config file: `given` if passed, else config.json in the current folder, else next to this program."""
+    if given:
+        return Path(given)
+    places = [Path.cwd() / "config.json", Path(__file__).resolve().parent / "config.json"]
+    found = next((p for p in places if p.is_file()), None)
+    if not found:
+        raise BackupError("no config.json found in " + " or ".join(str(p.parent) for p in places)
+                          + ": copy config.example.json to config.json there, or pass the config's path")
+    return found
+
+
 class Config:
     def __init__(self, path):
-        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+        self.path = Path(path)
+        raw = json.loads(self.path.read_text(encoding="utf-8"))
         self.source_dir = Path(raw["source_dir"])
         self.output_dir = Path(raw["output_dir"])
         # Staging must be on the source drive: files are moved there by rename.
@@ -375,10 +388,30 @@ def read_manifest(cfg):
 
 # ---------------------------------------------------------------- MOCHI
 
+def mochi_not_found(cfg, err):
+    return BackupError(f"the mochi program was not found ({cfg.mochi!r}: {err}). Build it from the MOCHI"
+                       " repository (cargo build --release -p mochi-cli) and set \"mochi\" in config.json"
+                       " to the full path of mochi.exe, or put its folder on PATH")
+
+
+def check_mochi(cfg):
+    """The mochi version line. Raises BackupError if mochi cannot be started."""
+    try:
+        p = subprocess.run([cfg.mochi, "--version"], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise mochi_not_found(cfg, e) from e
+    if p.returncode != 0 or not p.stdout.startswith("mochi "):
+        raise mochi_not_found(cfg, f"'--version' gave exit {p.returncode}: {(p.stdout or p.stderr).strip()[:200]}")
+    return p.stdout.splitlines()[0]
+
+
 def mochi(cfg, *args):
     """Runs `mochi --json ARGS`. Exit 0 and 2 (degraded, data committed / checked) pass; others raise."""
-    p = subprocess.run([cfg.mochi, "--json", "--no-local-history", *map(str, args)],
-                       capture_output=True, text=True)
+    try:
+        p = subprocess.run([cfg.mochi, "--json", "--no-local-history", *map(str, args)],
+                           capture_output=True, text=True)
+    except OSError as e:
+        raise mochi_not_found(cfg, e) from e
     try:
         out = json.loads(p.stdout)
     except ValueError:
@@ -560,6 +593,13 @@ def run(cfg, candidates_fn=None, dry_run=False, report=quiet, confirm=None):
 
 
 def _run(cfg, candidates_fn, dry_run, report, confirm):
+    # Checked before anything moves: without mochi, staged files could not be committed.
+    try:
+        log.info("using %s", check_mochi(cfg))
+    except BackupError as e:
+        if not dry_run:
+            raise
+        log.warning("a real run would stop here: %s", e)
     db = open_index(cfg.db_path)
     resumed = 0
     if not dry_run and cfg.manifest.exists():
@@ -609,6 +649,107 @@ def _run(cfg, candidates_fn, dry_run, report, confirm):
     return {**info, **result, "status": "done", "session_id": sid, "errors": errors, "unmatched": unmatched}
 
 
+# ---------------------------------------------------------------- export
+
+RESTORE_TEXT = """Finisar log backup export, {when}
+
+What is here
+  archives/        the monthly .mochi archives (output_dir)
+  index.db         the SQLite index (db_path)
+  config.json      the config, with the SQL Server password removed
+  staging/         only after an interrupted run: files in no archive yet (their only copy)
+  export-manifest.json   size and BLAKE3 of every file, checked when it was copied
+
+To restore on another PC
+  1. Copy this folder there.
+  2. Edit config.json: output_dir = <this folder>/archives, db_path = <this folder>/index.db
+     (or copy them where you want and point there), and set source_dir and mochi.
+  3. If staging/ exists: copy its contents into <source_dir>/.staging before the first run.
+  4. python backup_ui.py --check-sql, then --dry-run, then a real run.
+"""
+
+
+def copy_checked(src, dst):
+    """Copies src to dst via a .partial file; the copy's BLAKE3 must equal the source's. Returns it."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_name(dst.name + ".partial")
+    digest = blake3.blake3(max_threads=blake3.blake3.AUTO)
+    with open(src, "rb") as f, open(tmp, "wb") as out:
+        for chunk in iter(lambda: f.read(8 << 20), b""):
+            digest.update(chunk)
+            out.write(chunk)
+        out.flush()
+        os.fsync(out.fileno())
+    if b3(tmp) != digest.hexdigest():
+        tmp.unlink()
+        raise BackupError(f"copy of {src} does not match the original")
+    os.utime(tmp, ns=(src.stat().st_atime_ns, src.stat().st_mtime_ns))
+    os.replace(tmp, dst)
+    return digest.hexdigest()
+
+
+def export(cfg, target, report=quiet):
+    """Copies what is needed to restore this setup into `target` (see RESTORE_TEXT), every file checked
+    by BLAKE3. Archives unchanged since the last export to the same target are not copied again.
+    Holds the run lock, so no run changes an archive meanwhile. Returns {item: (files, bytes, copied)}."""
+    target = Path(target).resolve()
+    for name, folder in (("source_dir", cfg.source_dir), ("output_dir", cfg.output_dir)):
+        folder = folder.resolve()
+        if target == folder or folder in target.parents or target in folder.parents:
+            raise BackupError(f"export target {target} must not be inside or contain {name} {folder}")
+    with lock_run(cfg):
+        listing = target / "export-manifest.json"
+        try:
+            previous = json.loads(listing.read_text(encoding="utf-8"))["files"]
+        except (OSError, ValueError, KeyError):
+            previous = {}
+        archives = sorted(cfg.output_dir.glob("*/*.mochi"))
+        staged = sorted(p for p in cfg.staging_dir.rglob("*") if p.is_file()) if cfg.staging_dir.exists() else []
+        jobs = [(p, f"archives/{p.relative_to(cfg.output_dir).as_posix()}", "archives") for p in archives]
+        jobs += [(p, f"staging/{p.relative_to(cfg.staging_dir).as_posix()}", "staging") for p in staged]
+        files, items = {}, defaultdict(lambda: [0, 0, 0])  # item -> [files, bytes, copied]
+        total = len(jobs) + 2
+        for i, (src, rel, item) in enumerate(jobs):
+            report("export", rel, i, total)
+            st, old, dst = src.stat(), previous.get(rel), target / rel
+            unchanged = (old and old["size"] == st.st_size and old["mtime_ns"] == st.st_mtime_ns
+                         and dst.is_file() and dst.stat().st_size == st.st_size)
+            files[rel] = old if unchanged else {"size": st.st_size, "mtime_ns": st.st_mtime_ns,
+                                                "blake3": copy_checked(src, dst)}
+            items[item][0] += 1
+            items[item][1] += st.st_size
+            items[item][2] += not unchanged
+
+        report("export", "index.db", len(jobs), total)
+        if cfg.db_path.is_file():  # SQLite's backup API gives a consistent copy, unlike a file copy
+            target.mkdir(parents=True, exist_ok=True)
+            tmp = target / "index.db.partial"
+            tmp.unlink(missing_ok=True)
+            source, copy = sqlite3.connect(cfg.db_path), sqlite3.connect(tmp)
+            try:
+                source.backup(copy)
+            finally:
+                copy.close()
+                source.close()
+            os.replace(tmp, target / "index.db")
+            files["index.db"] = {"size": (target / "index.db").stat().st_size, "blake3": b3(target / "index.db")}
+            items["index.db"] = [1, files["index.db"]["size"], 1]
+
+        target.mkdir(parents=True, exist_ok=True)
+        raw = json.loads(cfg.path.read_text(encoding="utf-8"))
+        if isinstance(raw.get("sql_server"), dict) and raw["sql_server"].get("password"):
+            raw["sql_server"]["password"] = None  # never exported: asked again on the next run
+        (target / "config.json").write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
+        items["config.json"] = [1, (target / "config.json").stat().st_size, 1]
+
+        when = dt.datetime.now().isoformat(timespec="seconds")
+        (target / "RESTORE.txt").write_text(RESTORE_TEXT.format(when=when), encoding="utf-8")
+        listing.write_text(json.dumps({"exported_at": when, "files": files}, indent=1), encoding="utf-8")
+        report("export", "done", total, total)
+        log.info("exported to %s: %s", target, dict(items))
+        return {item: tuple(v) for item, v in items.items()}
+
+
 def send_email(cfg, summary):
     """Best effort: POSTs an HTML summary to {api_base_url}/api/email/send."""
     rows = "".join(f"<tr><td>{m}</td><td>{bc}</td><td>{n}</td><td>{b}</td></tr>"
@@ -632,11 +773,15 @@ def send_email(cfg, summary):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("config", help="path to config.json")
+    parser.add_argument("config", nargs="?", help="config file (default: config.json in the current folder, else next to this program)")
     parser.add_argument("--dry-run", action="store_true", help="query and scan only; move nothing")
+    parser.add_argument("--export", metavar="DIR", help="copy archives, index and config to DIR, then stop")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    cfg = Config(args.config)
+    cfg = Config(find_config(args.config))
+    if args.export:
+        export(cfg, args.export)
+        return
     summary = run(cfg, dry_run=args.dry_run)
     log.info("%s: %s", summary["status"], json.dumps({k: v for k, v in summary.items() if k != "unmatched"}))
     if summary["status"] == "done" and cfg.email:

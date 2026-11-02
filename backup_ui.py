@@ -4,7 +4,7 @@ Display only: every backup decision is made in logs_backup.py. This file passes
 two callbacks to logs_backup.run() (report for progress, confirm before files
 move) and draws what it gets back.
 
-    python backup_ui.py config.json [--dry-run] [--yes]
+    python backup_ui.py [--dry-run] [--yes] [--check-sql] [--export DIR] [CONFIG]
 """
 import argparse
 import logging
@@ -27,6 +27,7 @@ STEPS = {
     "scan": "Scan folders",
     "stage": "Stage files",
     "commit": "Commit, verify, index",
+    "export": "Export",
 }
 
 console = Console()
@@ -119,9 +120,40 @@ def print_summary(summary):
         lines.append("Dry run: nothing moved")
     lines.append(f"Errors      {summary['errors']:,}")
     if status == "done":
-        lines.append("[dim]Committed is not a backup: keep an independent copy of the output folder and index.db.")
+        lines.append("[dim]Committed is not a backup: keep an independent copy (--export DIR to another drive).")
     style = "yellow" if summary["errors"] else ("green" if status == "done" else "cyan")
     console.print(Panel("\n".join(lines), title="Finisar log backup", border_style=style))
+
+
+COLUMNS = (Mark(finished_text="[green]✓"), TextColumn("{task.description}"),
+           BarColumn(), MofNCompleteColumn(), TimeElapsedColumn())
+
+
+def export(cfg, target):
+    """--export: copies archives, index and config to `target`, and shows what was copied."""
+    with Progress(*COLUMNS, console=console) as progress:
+        steps = Steps(progress)
+        try:
+            items = lb.export(cfg, target, report=steps)
+        except Exception as e:
+            steps.fail_running()
+            progress.stop()
+            logging.getLogger("logs_backup").exception("export failed")
+            console.print(Panel(f"{e}\n\nNothing in the backup itself was changed. Details: backup.log",
+                                title="Export failed", border_style="red"))
+            sys.exit(1)
+    table = Table(title="Exported", title_justify="left")
+    for name, justify in (("Item", "left"), ("Files", "right"), ("Size", "right"), ("Copied now", "right")):
+        table.add_column(name, justify=justify)
+    for item, (files, nbytes, copied) in items.items():
+        table.add_row(item, f"{files:,}", size(nbytes), f"{copied:,}" if copied else "[dim]unchanged")
+    console.print(table)
+    note = (f"Exported to {Path(target).resolve()}\nEvery copied file was checked against the original (BLAKE3)."
+            " How to restore: RESTORE.txt in that folder.")
+    if "staging" in items:
+        note += ("\n[yellow]staging/ holds files from an interrupted run that are in no archive yet."
+                 " Finish them with a normal run when you can.")
+    console.print(Panel(note, border_style="green"))
 
 
 def check_sql(cfg):
@@ -139,37 +171,45 @@ def check_sql(cfg):
 
 def main():
     parser = argparse.ArgumentParser(description="Finisar log backup (terminal UI)")
-    parser.add_argument("config", help="path to config.json")
+    parser.add_argument("config", nargs="?", help="config file (default: config.json in the current folder, else next to this program)")
     parser.add_argument("--dry-run", action="store_true", help="query and scan only; move nothing")
     parser.add_argument("--yes", action="store_true", help="do not ask before moving files")
     parser.add_argument("--check-sql", action="store_true", help="only test the SQL Server connection")
+    parser.add_argument("--export", metavar="DIR", help="copy archives, index and config to DIR, then stop")
     args = parser.parse_args()
+
+    try:
+        config_path = lb.find_config(args.config)
+    except lb.BackupError as e:
+        console.print(Panel(str(e), title="Config problem", border_style="red"))
+        sys.exit(2)
 
     # Warnings on screen; the full run log in backup.log next to the config, for audit.
     screen = RichHandler(console=console, show_path=False, level=logging.WARNING)
     screen.addFilter(lambda record: not record.exc_info)  # tracebacks go to backup.log only
     screen.setFormatter(logging.Formatter("%(message)s"))
-    logfile = logging.FileHandler(Path(args.config).with_name("backup.log"), encoding="utf-8")
+    logfile = logging.FileHandler(config_path.with_name("backup.log"), encoding="utf-8")
     logfile.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     logging.basicConfig(level=logging.INFO, handlers=[screen, logfile])
 
     try:
-        cfg = lb.Config(args.config)
+        cfg = lb.Config(config_path)
     except (OSError, ValueError, KeyError, lb.BackupError) as e:  # ValueError: invalid JSON
         detail = f"missing setting {e}" if isinstance(e, KeyError) else str(e)
         if "escape" in detail:
             detail += "\nWrite Windows paths with / (E:/archive) or \\\\ (E:\\\\archive)."
-        console.print(Panel(f"{args.config}: {detail}", title="Config problem", border_style="red"))
+        console.print(Panel(f"{config_path}: {detail}", title="Config problem", border_style="red"))
         sys.exit(2)
+    if args.export:
+        export(cfg, args.export)
+        return
     if cfg.sql["user"] and not cfg.sql["password"]:  # asked each run, never stored
         cfg.sql["password"] = Prompt.ask(f"SQL Server password for {cfg.sql['user']}", password=True)
     if args.check_sql:
         check_sql(cfg)
         return
 
-    columns = (Mark(finished_text="[green]✓"), TextColumn("{task.description}"),
-               BarColumn(), MofNCompleteColumn(), TimeElapsedColumn())
-    with Progress(*columns, console=console) as progress:
+    with Progress(*COLUMNS, console=console) as progress:
         steps = Steps(progress)
         try:
             summary = lb.run(cfg, dry_run=args.dry_run, report=steps, confirm=ask_confirm(progress, args.yes))

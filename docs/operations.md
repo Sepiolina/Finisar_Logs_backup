@@ -26,11 +26,23 @@ Install, configure, run, get files back, move to another PC, and fix problems.
    ```
 
    This gives you `target/release/mochi` (`mochi.exe` on Windows). Put its folder on
-   PATH, or set its full path as `"mochi"` in the config.
+   PATH, or set its full path in the config, for example
+   `"mochi": "D:/GitHub/MOCHI/target/release/mochi.exe"`. Check it starts:
+
+   ```bash
+   mochi --version
+   ```
+
+   Every real run checks this first and stops before moving any file if `mochi`
+   cannot be started. A dry run only warns.
 
 ## Configure
 
-Copy `config.example.json` to `config.json`.
+Copy `config.example.json` to `config.json`, next to the program.
+
+The commands find the config on their own: `config.json` in the folder you run
+them from, else the one next to `backup_ui.py`. To use another file, pass its
+path last, for example `python backup_ui.py --dry-run D:/configs/line2.json`.
 
 > **Windows paths:** write them with `/` (`E:/archive`) or doubled `\\`
 > (`E:\\archive`). A single `\` breaks JSON: `"E:\backup"` reads as `E:` +
@@ -88,7 +100,7 @@ server name and user.
 Test the connection on its own, without scanning or moving anything:
 
 ```bash
-python backup_ui.py config.json --check-sql
+python backup_ui.py --check-sql
 ```
 
 It prints the server's version, or one line saying what failed with a hint.
@@ -117,11 +129,12 @@ the double-click launcher and scheduled tasks see them.
 
 | Want | Do |
 |---|---|
-| Test the SQL Server login only | `python backup_ui.py config.json --check-sql` |
-| See what would happen | `python backup_ui.py config.json --dry-run` |
-| Run by hand | Double-click `run_backup.bat`, or `python backup_ui.py config.json` |
-| Run without the question | `python backup_ui.py config.json --yes` |
-| Plain log output (scheduled task) | `python logs_backup.py config.json` |
+| Test the SQL Server login only | `python backup_ui.py --check-sql` |
+| Copy everything needed to restore, to another drive | `python backup_ui.py --export E:/finisar_export` (see [Export](#export-a-copy-of-everything-to-restore-from)) |
+| See what would happen | `python backup_ui.py --dry-run` |
+| Run by hand | Double-click `run_backup.bat`, or `python backup_ui.py` |
+| Run without the question | `python backup_ui.py --yes` |
+| Plain log output (scheduled task) | `python logs_backup.py` |
 
 Every run continues where the last successful one ended, so running by hand
 every few days or weeks is fine. If a run is stopped (window closed, power cut),
@@ -161,7 +174,42 @@ mochi verify E:/archive/2026/2026-01.mochi
 Exit code 0 or 2 is fine. Exit code 1 means a problem: keep your independent
 copy and see MOCHI's repair docs.
 
-## Moving to another PC: what to copy
+## Export: a copy of everything to restore from
+
+One command copies what you need to move this setup to another PC, or to keep
+as an independent copy:
+
+```bash
+python backup_ui.py --export E:/finisar_export
+```
+
+| In the target folder | From | Notes |
+|---|---|---|
+| `archives/YYYY/YYYY-MM.mochi` | `output_dir` | Every copy is checked against the original (BLAKE3) before it replaces anything. Archives unchanged since the last export to the same folder are skipped, so exporting again is quick. |
+| `index.db` | `db_path` | Copied with SQLite's backup method, so the copy is consistent |
+| `config.json` | your config | The SQL Server password is removed. It is asked again on the first run. |
+| `staging/` | `staging_dir` | Only after an interrupted run. Those files are in no archive yet, so this is their only other copy. |
+| `RESTORE.txt` | | The restore steps below |
+| `export-manifest.json` | | Size and BLAKE3 of every exported file |
+
+Export holds the same lock as a backup run, so a run cannot change an archive
+while it is copied. It never deletes or moves anything in the backup itself.
+The target must not be inside `source_dir` or `output_dir`. Use another drive,
+ideally one you can unplug and keep elsewhere.
+
+**To restore on another PC:**
+
+1. Copy the export folder there.
+2. Edit its `config.json`: `output_dir` = `<export folder>/archives`, `db_path` =
+   `<export folder>/index.db` (or copy them where you want them and point there).
+   Also set `source_dir` and `mochi`.
+3. If `staging/` exists, copy its contents into `<source_dir>/.staging` before the first run.
+4. Run `--check-sql`, then `--dry-run`, then a real run. The first real run
+   finishes the staged files.
+
+## Moving to another PC by hand: what to copy
+
+`--export` does all of this. By hand:
 
 | Copy | Why |
 |---|---|
@@ -189,6 +237,8 @@ month is only updated the next time that month gets new files.
 | `SQL Server query failed: TDS server connection failed ... (error 20002)` | Something answered, but the SQL Server handshake failed | 1. Check `port`: a named instance is not on 1433, so write `HOST\\NAME` as `server`. 2. If the port is right, the server probably only offers old TLS. Ask for TLS 1.2 on the server, or set `"encryption": "off"` (see [SQL Server login](#sql-server-login)). Retry with `--check-sql`. |
 | `SQL Server query failed: Login failed ... (error 18456)` | Wrong user or password, or the login is disabled | Check them. |
 | `SQL Server query failed: ... (error 4060)` | The login cannot open `database` | Check `database` and the login's permissions |
+| `the mochi program was not found (...)` | `mochi` is not on PATH and `"mochi"` in the config is not its full path | See [Install](#install-once) step 3. Files already in staging stay there and are finished by the next run. |
+| `... kept in staging: [WinError 2] The system cannot find the file specified` (versions before this check) | Same as above | Same. Do not move staged files by hand. |
 | `another backup run is in progress` | Another run holds the lock | Wait for it. If no run is open, a process may still be alive. Check Task Manager. |
 | `not staged ...: [WinError 32] ...` | A file is open in another program | Nothing to do. It stays in the source and a later run takes it. |
 | `mochi append ...: exit 3 {'code': 'LOCK_CONFLICT'...}` | Something else is writing that archive (for example a `mochi` command you started) | Close it and run again |
