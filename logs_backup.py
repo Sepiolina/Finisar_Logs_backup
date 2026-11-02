@@ -483,7 +483,7 @@ def finish_staged(db, cfg, report=quiet, resume=False):
         if staged_path(cfg, e).is_file():  # listed but never moved: still in the source
             months[e["volume_name"]].append(e)
 
-    archived, failures, breakdown = [], [], {}
+    archived, failures = [], []
     report("commit", "", 0, len(months))
     with ThreadPoolExecutor(min(WORKERS, max(len(months), 1))) as pool:
         jobs = {m: pool.submit(commit_month, cfg, m, es, resume) for m, es in months.items()}
@@ -498,9 +498,8 @@ def finish_staged(db, cfg, report=quiet, resume=False):
             for e in months[month]:
                 staged_path(cfg, e).unlink()
             archived += months[month]
-            breakdown[month] = (len(months[month]), sum(e["original_size"] for e in months[month]))
             log.info("%s: %d files committed (LOCAL_COMMITTED), verified and indexed", month, len(months[month]))
-            report("commit", month, len(breakdown), len(months))
+            report("commit", month, len(plan(archived)), len(months))
     if failures:
         raise BackupError(f"{len(failures)} month(s) failed; staging kept for the next run: {failures[0]}")
 
@@ -514,7 +513,7 @@ def finish_staged(db, cfg, report=quiet, resume=False):
             os.rmdir(d)
     barcodes = len({e["barcode"] for e in archived})
     complete_session(db, sid, "success", barcodes, len(archived), leftovers)
-    return {"files_moved": len(archived), "errors": leftovers, "volumes": breakdown}
+    return {"files_moved": len(archived), "barcodes": barcodes, "errors": leftovers, "volumes": plan(archived)}
 
 
 # ---------------------------------------------------------------- run
@@ -539,12 +538,14 @@ def lock_run(cfg):
 
 
 def plan(entries):
-    """{month: (files, bytes)} of matched files, sorted by month."""
-    volumes = defaultdict(lambda: (0, 0))
+    """{month: (barcodes, files, bytes)} of matched files, sorted by month.
+
+    Used for what a run would archive (confirm, dry run) and what it did archive (summary)."""
+    months = defaultdict(list)
     for e in entries:
-        n, size = volumes[e["volume_name"]]
-        volumes[e["volume_name"]] = (n + 1, size + e["original_size"])
-    return dict(sorted(volumes.items()))
+        months[e["volume_name"]].append(e)
+    return {month: (len({e["barcode"] for e in es}), len(es), sum(e["original_size"] for e in es))
+            for month, es in sorted(months.items())}
 
 
 def run(cfg, candidates_fn=None, dry_run=False, report=quiet, confirm=None):
@@ -573,27 +574,29 @@ def _run(cfg, candidates_fn, dry_run, report, confirm):
     report("query", f"{date_from or '(start)'} .. {date_to}")
     log.info("querying candidates %s .. %s", date_from or "(start)", date_to)
     candidates = candidates_fn(date_from, date_to)
-    report("query", f"{len(candidates)} candidates", 1, 1)
     dates = dict(candidates)  # barcode -> last_update (the last row wins)
+    report("query", f"{len(dates):,} candidate barcodes", 1, 1)
     entries, errors, seen = scan(cfg, dates, report)
     volumes = plan(entries)
-    info = {"window": window, "candidates": len(candidates), "scanned": seen, "volumes": volumes, "resumed": resumed}
+    matched = {e["barcode"] for e in entries}
+    info = {"window": window, "candidates": len(dates), "scanned": seen, "volumes": volumes, "resumed": resumed,
+            "matched_barcodes": len(matched), "matched_files": len(entries)}
     if dry_run:
-        log.info("dry run: %d files would be archived: %s", len(entries), volumes)
-        return dict(info, status="dry_run", files_moved=0, errors=errors)
+        log.info("dry run: %d of %d candidate barcodes would be archived (%d files): %s",
+                 len(matched), len(dates), len(entries), volumes)
+        return dict(info, status="dry_run", files_moved=0, barcodes=0, errors=errors)
     if entries and confirm and not confirm(volumes):
-        return dict(info, status="cancelled", files_moved=0, errors=errors)
+        return dict(info, status="cancelled", files_moved=0, barcodes=0, errors=errors)
 
     sid = start_session(db, date_from or "", date_to)
     try:
-        matched = {e["barcode"] for e in entries}
         fresh = [(b, d) for b, d in candidates if not db.execute(
             "SELECT 1 FROM session_barcode WHERE barcode = ? AND last_update = ?", (b, d)).fetchone()]
         with db:
             db.executemany("INSERT OR IGNORE INTO session_barcode (scan_session_id, barcode, last_update, status)"
                            " VALUES (?, ?, ?, ?)",
                            [(sid, b, d, "matched" if b in matched else "no_files_found") for b, d in fresh])
-        result = {"files_moved": 0, "errors": 0, "volumes": {}}
+        result = {"files_moved": 0, "barcodes": 0, "errors": 0, "volumes": {}}
         if entries:
             errors += stage(cfg, sid, entries, report)
             result = finish_staged(db, cfg, report)
@@ -608,13 +611,15 @@ def _run(cfg, candidates_fn, dry_run, report, confirm):
 
 def send_email(cfg, summary):
     """Best effort: POSTs an HTML summary to {api_base_url}/api/email/send."""
-    rows = "".join(f"<tr><td>{m}</td><td>{n}</td><td>{b}</td></tr>" for m, (n, b) in summary["volumes"].items())
+    rows = "".join(f"<tr><td>{m}</td><td>{bc}</td><td>{n}</td><td>{b}</td></tr>"
+                   for m, (bc, n, b) in summary["volumes"].items())
     unmatched = ", ".join(html.escape(b) for b in summary["unmatched"][:2000])
     body = (f"<h3>Finisar log backup, session {summary['session_id']}</h3>"
             f"<p>Window {summary['window'][0] or '(start)'} .. {summary['window'][1]}<br>"
-            f"Candidates {summary['candidates']}, files scanned {summary['scanned']}, "
+            f"Candidates {summary['candidates']}, barcodes archived {summary['barcodes']}, "
+            f"files scanned {summary['scanned']}, "
             f"files committed (LOCAL_COMMITTED) {summary['files_moved']}, errors {summary['errors']}</p>"
-            f"<table border=1><tr><th>Archive</th><th>Files</th><th>Bytes</th></tr>{rows}</table>"
+            f"<table border=1><tr><th>Archive</th><th>Barcodes</th><th>Files</th><th>Bytes</th></tr>{rows}</table>"
             f"<p>Unmatched barcodes ({len(summary['unmatched'])}): {unmatched}</p>")[:95_000]
     payload = {"to": cfg.email["to"], "subject": "Finisar log backup report", "body": body}
     try:

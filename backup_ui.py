@@ -65,14 +65,21 @@ class Steps:
                 self.progress.update(task.id, description=f"[red]{task.description}", failed=True)
 
 
+def totals(volumes):
+    """(barcodes, files, bytes) over all months. A barcode's files all go to one month."""
+    return tuple(sum(v[i] for v in volumes.values()) for i in range(3))
+
+
 def volume_table(volumes, status):
-    table = Table(title="Archives", title_justify="left")
-    table.add_column("Month")
-    table.add_column("Files", justify="right")
-    table.add_column("Size", justify="right")
+    table = Table(title="Archives", title_justify="left", show_footer=len(volumes) > 1)
+    barcodes, files, nbytes = totals(volumes)
+    table.add_column("Month", footer="Total")
+    table.add_column("Barcodes", justify="right", footer=f"{barcodes:,}")
+    table.add_column("Files", justify="right", footer=f"{files:,}")
+    table.add_column("Size", justify="right", footer=size(nbytes))
     table.add_column("Status")
-    for month, (files, nbytes) in volumes.items():
-        table.add_row(month, f"{files:,}", size(nbytes), status)
+    for month, (barcodes, files, nbytes) in volumes.items():
+        table.add_row(month, f"{barcodes:,}", f"{files:,}", size(nbytes), status)
     return table
 
 
@@ -83,8 +90,9 @@ def ask_confirm(progress, yes):
             return True
         progress.stop()
         console.print(volume_table(volumes, "[yellow]to archive"))
-        total = sum(files for files, _ in volumes.values())
-        answer = Confirm.ask(f"Move {total:,} files into {len(volumes)} archive(s)?", default=False)
+        barcodes, files, nbytes = totals(volumes)
+        answer = Confirm.ask(f"Archive {barcodes:,} barcodes ({files:,} files, {size(nbytes)})"
+                             f" into {len(volumes)} monthly archive(s)?", default=False)
         progress.start()
         return answer
     return confirm
@@ -99,13 +107,17 @@ def print_summary(summary):
     if summary["volumes"]:
         console.print(volume_table(summary["volumes"], label))
     date_from, date_to = summary["window"]
+    matched, candidates = summary["matched_barcodes"], summary["candidates"]
     lines = [f"Window      {date_from or '(start)'} .. {date_to}",
-             f"Candidates  {summary['candidates']:,}",
+             f"Candidates  {candidates:,} barcodes from SQL Server",
+             f"With files  {matched:,} barcodes, {summary['matched_files']:,} files"
+             f" ({candidates - matched:,} have no files in the source folders)",
              f"Scanned     {summary['scanned']:,} files",
-             f"Committed   {summary['files_moved']:,} files" if status == "done" else "Dry run: nothing moved",
+             f"Committed   {summary['barcodes']:,} barcodes, {summary['files_moved']:,} files"
+             if status == "done" else "Dry run: nothing moved",
              f"Errors      {summary['errors']:,}"]
     if summary["resumed"]:
-        lines.insert(4, f"Resumed     {summary['resumed']:,} files left in staging by an earlier run")
+        lines.insert(5, f"Resumed     {summary['resumed']:,} files left in staging by an earlier run")
     if status == "done":
         lines.append("[dim]Committed is not a backup: keep an independent copy of the output folder and index.db.")
     style = "yellow" if summary["errors"] else ("green" if status == "done" else "cyan")
