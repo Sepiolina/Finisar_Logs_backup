@@ -5,6 +5,7 @@ import shutil
 import sqlite3
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 import logs_backup as lb
@@ -26,6 +27,36 @@ class Matching(unittest.TestCase):
         self.assertTrue(lb.has_extension("a.b.TXT", exts))
         self.assertFalse(lb.has_extension("noext", exts))
         self.assertFalse(lb.has_extension("a.txt.bak", exts))
+
+
+class ConfigFile(unittest.TestCase):
+    def config(self, text, **env):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp)
+        (tmp / "config.json").write_text(text)
+        with unittest.mock.patch.dict(os.environ, env, clear=False):
+            for var in ("DB_SERVER", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD"):
+                if var not in env:
+                    os.environ.pop(var, None)
+            return lb.Config(tmp / "config.json"), tmp
+
+    def test_sql_login_from_config_with_env_override(self):
+        cfg, _ = self.config(json.dumps({"source_dir": "s", "output_dir": "o", "db_path": "i.db",
+                                         "sql_server": {"server": "h", "database": "d", "user": "u"}}),
+                             DB_PASSWORD="pw", DB_USER="env_user")
+        self.assertEqual(cfg.sql, {"server": "h", "port": None, "database": "d", "user": "env_user", "password": "pw"})
+        with self.assertRaisesRegex(lb.BackupError, "missing: server, database, user, password"):
+            lb.query_candidates({}, None, "2026-01-01")
+
+    def test_backspace_in_a_path_is_refused(self):
+        with self.assertRaisesRegex(lb.BackupError, "db_path .* broken path"):
+            self.config(r'{"source_dir": "s", "output_dir": "o", "db_path": "E:\backup.db"}')  # JSON \b = backspace
+
+    def test_index_folder_is_created(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp)
+        lb.open_index(tmp / "new" / "folder" / "index.db").close()
+        self.assertTrue((tmp / "new" / "folder" / "index.db").is_file())
 
 
 @unittest.skipUnless(MOCHI, "mochi CLI not found (set MOCHI_BIN)")

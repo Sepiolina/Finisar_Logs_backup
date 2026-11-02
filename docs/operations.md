@@ -30,13 +30,18 @@ Install, configure, run, get files back, move to another PC, and fix problems.
 
 ## Configure
 
-Copy `config.example.json` to `config.json`:
+Copy `config.example.json` to `config.json`.
+
+> **Windows paths:** write them with `/` (`E:/archive`) or doubled `\\`
+> (`E:\\archive`). A single `\` breaks JSON: `"E:\backup"` reads as `E:` +
+> backspace + `ackup`. The run stops with a "Config problem" message if this happens.
 
 | Key | Default | Meaning |
 |---|---|---|
 | `source_dir` | required | Folder that holds the subfolders below |
 | `output_dir` | required | Where `YYYY/YYYY-MM.mochi` archives go |
-| `db_path` | required | SQLite index file |
+| `db_path` | required | SQLite index file. Its folder is created if missing. |
+| `sql_server` | none | SQL Server login, see below |
 | `staging_dir` | `source_dir/.staging` | Must be on the **same drive** as `source_dir`: files are moved there by rename. A run refuses to start staging otherwise. Not scanned, because only the subfolders are. |
 | `subfolders` | `BURNIN, ESS, JTAG, STM, Xray` | Scanned one level deep |
 | `extensions` | `txt, zip` | Allowed file extensions |
@@ -45,16 +50,37 @@ Copy `config.example.json` to `config.json`:
 | `mochi` | `mochi` | Path to the `mochi` program |
 | `email` | none | `{"api_base_url": "http://host:port", "to": "a@b.c"}` for a report after each run |
 
-The SQL Server login comes from environment variables, so it is never stored in a file:
+### SQL Server login
 
-| Variable | Required | Default |
+Put it in `config.json`:
+
+```json
+"sql_server": {
+  "server": "sqlhost",
+  "port": 1433,
+  "database": "ForthUtilities",
+  "user": "backup_reader",
+  "password": null
+}
+```
+
+Leave `"password": null` and `backup_ui.py` asks for it each run, hidden as you
+type, so it is never saved anywhere. That suits manual runs. For a scheduled task
+(`logs_backup.py`, which never asks), give the password through `DB_PASSWORD`
+instead. You can also write it in the file, but then anyone who can read
+`config.json` can read the password. `config.json` is already in `.gitignore`.
+
+Each value can also come from an environment variable, which **wins** over the
+file:
+
+| Variable | Overrides | Default |
 |---|---|---|
-| `DB_SERVER`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` | yes | |
-| `DB_PORT` | no | 1433 |
-| `DB_RETRY_ATTEMPTS` / `DB_RETRY_BASE_DELAY_MS` | no | 3 / 2000 |
-| `DB_REQUEST_TIMEOUT_MS` | no | 30000 |
+| `DB_SERVER`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` | `server`, `database`, `user`, `password` | |
+| `DB_PORT` | `port` | 1433 |
+| `DB_RETRY_ATTEMPTS` / `DB_RETRY_BASE_DELAY_MS` | (env only) | 3 / 2000 |
+| `DB_REQUEST_TIMEOUT_MS` | (env only) | 30000 |
 
-On Windows, set them once under System Properties → Environment Variables, so
+On Windows, set variables under System Properties → Environment Variables, so
 the double-click launcher and scheduled tasks see them.
 
 ## Run
@@ -112,7 +138,7 @@ copy and see MOCHI's repair docs.
 | `db_path` (the index) | Lookup by barcode, and where the next run should start |
 | `staging_dir` (default `source_dir/.staging`), **if it exists** | Only after an interrupted run. It holds files that are in no archive yet and no longer in the source. Copy as is. |
 | `config.json` | Paths and settings |
-| Your `DB_*` values | They are environment variables, not files |
+| Your SQL password, and any `DB_*` values | They are not in any file (unless you wrote the password in `config.json`) |
 
 Not needed: the code, `mochi` (rebuild it), `.backup.lock`, `backup.log`.
 
@@ -124,7 +150,10 @@ month is only updated the next time that month gets new files.
 
 | Message | Meaning | What to do |
 |---|---|---|
-| `missing environment variable(s): DB_...` | SQL login not set | Set the variables (see Configure) |
+| `SQL Server login incomplete, missing: ...` | Part of the login is not set | Add it to `sql_server` in `config.json`, or set the `DB_*` variable (see [SQL Server login](#sql-server-login)) |
+| `Config problem: Invalid \escape` | A single `\` in a path in `config.json` | Write paths with `/` (`E:/archive`) |
+| `... has a broken path: write Windows paths with /` | A `\b`, `\t`, `\n`, ... in a path turned into a control character | Same fix |
+| `cannot open the index ...` | `db_path` is on a drive that does not exist, or you lack permission | Fix `db_path` |
 | `SQL Server query failed` | Server unreachable or login wrong, after retries | Check network and login. Nothing was moved. |
 | `another backup run is in progress` | Another run holds the lock | Wait for it. If no run is open, a process may still be alive. Check Task Manager. |
 | `not staged ...: [WinError 32] ...` | A file is open in another program | Nothing to do. It stays in the source and a later run takes it. |
