@@ -29,6 +29,10 @@ Edit `config.json`: the paths (write them with `/`, like `E:/archive`) and the
 Put the `mochi` program on PATH, or set `"mochi"` in the config. Then:
 
 ```bash
+python backup_ui.py config.json --check-sql
+```
+
+```bash
 python backup_ui.py config.json --dry-run
 ```
 

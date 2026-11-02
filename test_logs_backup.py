@@ -44,13 +44,30 @@ class ConfigFile(unittest.TestCase):
         cfg, _ = self.config(json.dumps({"source_dir": "s", "output_dir": "o", "db_path": "i.db",
                                          "sql_server": {"server": "h", "database": "d", "user": "u"}}),
                              DB_PASSWORD="pw", DB_USER="env_user")
-        self.assertEqual(cfg.sql, {"server": "h", "port": None, "database": "d", "user": "env_user", "password": "pw"})
+        self.assertEqual(cfg.sql, {"server": "h", "port": None, "database": "d", "user": "env_user", "password": "pw",
+                                   "encryption": None})
         with self.assertRaisesRegex(lb.BackupError, "missing: server, database, user, password"):
             lb.query_candidates({}, None, "2026-01-01")
 
     def test_backspace_in_a_path_is_refused(self):
         with self.assertRaisesRegex(lb.BackupError, "db_path .* broken path"):
             self.config(r'{"source_dir": "s", "output_dir": "o", "db_path": "E:\backup.db"}')  # JSON \b = backspace
+
+    def test_sql_errors_are_one_readable_line_with_a_hint(self):
+        handshake = Exception((20002, b"DB-Lib error message 20002, severity 9:\nTDS server connection failed"
+                                      b" (192.168.31.244)\nDB-Lib error message 20002, severity 9:\nTDS server"
+                                      b" connection failed (192.168.31.244)\n"))
+        self.assertTrue(lb.sql_error(handshake).startswith(
+            "TDS server connection failed (192.168.31.244) (error 20002): the server answered but"))
+        # pymssql can keep the previous server error's code (18456): the text's code wins.
+        stale = Exception((18456, b"DB-Lib error message 20009, severity 9:\nUnable to connect: TDS server is"
+                                  b" unavailable or does not exist (h)\n"))
+        self.assertIn("(error 20009): the server cannot be reached", lb.sql_error(stale))
+        login = Exception((18456, b"Login failed for user 'u'.DB-Lib error message 20018, severity 14:\n"))
+        self.assertEqual(lb.sql_error(login), "Login failed for user 'u'. (error 18456): login failed."
+                                              " Check the user and password")
+        with self.assertRaisesRegex(lb.BackupError, '"encryption" must be'):
+            lb.set_encryption("maybe")
 
     def test_index_folder_is_created(self):
         tmp = Path(tempfile.mkdtemp())

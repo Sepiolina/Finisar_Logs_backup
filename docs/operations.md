@@ -60,9 +60,30 @@ Put it in `config.json`:
   "port": 1433,
   "database": "ForthUtilities",
   "user": "backup_reader",
-  "password": null
+  "password": null,
+  "encryption": null
 }
 ```
+
+- `server`: a host name or IP. For a **named instance** write `HOST\\NAME` (two
+  backslashes in JSON). The port is then found by name and `port` is ignored.
+- `encryption`: how the login is protected:
+
+  | Value | Meaning |
+  |---|---|
+  | `null` or `"request"` | Default. Uses TLS when the server offers it. |
+  | `"require"` | Refuse to connect without TLS |
+  | `"off"` | **No encryption at all**, the same as Finisar_move_log_files. The login and data travel in clear text on the network, so use it only on a trusted factory network. Each run logs a warning. |
+
+  Use `"off"` only if `--check-sql` fails with **error 20002** and the port is right. That usually means the server only offers old TLS versions (SQL Server 2008–2014 without updates), which this program's TLS library refuses. The better fix is to have the server updated for TLS 1.2. Ask your database administrator.
+
+Test the connection on its own, without scanning or moving anything:
+
+```bash
+python backup_ui.py config.json --check-sql
+```
+
+It prints the server's version, or one line saying what failed with a hint.
 
 Leave `"password": null` and `backup_ui.py` asks for it each run, hidden as you
 type, so it is never saved anywhere. That suits manual runs. For a scheduled task
@@ -77,6 +98,7 @@ file:
 |---|---|---|
 | `DB_SERVER`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` | `server`, `database`, `user`, `password` | |
 | `DB_PORT` | `port` | 1433 |
+| `DB_ENCRYPTION` | `encryption` | `request` |
 | `DB_RETRY_ATTEMPTS` / `DB_RETRY_BASE_DELAY_MS` | (env only) | 3 / 2000 |
 | `DB_REQUEST_TIMEOUT_MS` | (env only) | 30000 |
 
@@ -87,6 +109,7 @@ the double-click launcher and scheduled tasks see them.
 
 | Want | Do |
 |---|---|
+| Test the SQL Server login only | `python backup_ui.py config.json --check-sql` |
 | See what would happen | `python backup_ui.py config.json --dry-run` |
 | Run by hand | Double-click `run_backup.bat`, or `python backup_ui.py config.json` |
 | Run without the question | `python backup_ui.py config.json --yes` |
@@ -154,7 +177,10 @@ month is only updated the next time that month gets new files.
 | `Config problem: Invalid \escape` | A single `\` in a path in `config.json` | Write paths with `/` (`E:/archive`) |
 | `... has a broken path: write Windows paths with /` | A `\b`, `\t`, `\n`, ... in a path turned into a control character | Same fix |
 | `cannot open the index ...` | `db_path` is on a drive that does not exist, or you lack permission | Fix `db_path` |
-| `SQL Server query failed` | Server unreachable or login wrong, after retries | Check network and login. Nothing was moved. |
+| `SQL Server query failed: ... (error 20009)` | Nothing answers at that address and port | Check `server`, `port`, the network and the firewall. Nothing was moved. |
+| `SQL Server query failed: TDS server connection failed ... (error 20002)` | Something answered, but the SQL Server handshake failed | 1. Check `port`: a named instance is not on 1433, so write `HOST\\NAME` as `server`. 2. If the port is right, the server probably only offers old TLS. Ask for TLS 1.2 on the server, or set `"encryption": "off"` (see [SQL Server login](#sql-server-login)). Retry with `--check-sql`. |
+| `SQL Server query failed: Login failed ... (error 18456)` | Wrong user or password, or the login is disabled | Check them. |
+| `SQL Server query failed: ... (error 4060)` | The login cannot open `database` | Check `database` and the login's permissions |
 | `another backup run is in progress` | Another run holds the lock | Wait for it. If no run is open, a process may still be alive. Check Task Manager. |
 | `not staged ...: [WinError 32] ...` | A file is open in another program | Nothing to do. It stays in the source and a later run takes it. |
 | `mochi append ...: exit 3 {'code': 'LOCK_CONFLICT'...}` | Something else is writing that archive (for example a `mochi` command you started) | Close it and run again |

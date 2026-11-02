@@ -112,11 +112,25 @@ def print_summary(summary):
     console.print(Panel("\n".join(lines), title="Finisar log backup", border_style=style))
 
 
+def check_sql(cfg):
+    """--check-sql: one connection with the configured login, nothing else."""
+    sql = cfg.sql
+    where = f"{sql['server']}" + ("" if "\\" in str(sql["server"]) else f":{sql['port'] or 1433}")
+    with console.status(f"Connecting to {where} as {sql['user']} (encryption: {sql['encryption'] or 'request'})..."):
+        try:
+            version = lb.check_sql(sql)
+        except lb.BackupError as e:
+            console.print(Panel(str(e), title="SQL Server: no connection", border_style="red"))
+            sys.exit(1)
+    console.print(Panel(version, title="SQL Server: connected", border_style="green"))
+
+
 def main():
     parser = argparse.ArgumentParser(description="Finisar log backup (terminal UI)")
     parser.add_argument("config", help="path to config.json")
     parser.add_argument("--dry-run", action="store_true", help="query and scan only; move nothing")
     parser.add_argument("--yes", action="store_true", help="do not ask before moving files")
+    parser.add_argument("--check-sql", action="store_true", help="only test the SQL Server connection")
     args = parser.parse_args()
 
     # Warnings on screen; the full run log in backup.log next to the config, for audit.
@@ -137,6 +151,9 @@ def main():
         sys.exit(2)
     if cfg.sql["user"] and not cfg.sql["password"]:  # asked each run, never stored
         cfg.sql["password"] = Prompt.ask(f"SQL Server password for {cfg.sql['user']}", password=True)
+    if args.check_sql:
+        check_sql(cfg)
+        return
 
     columns = (Mark(finished_text="[green]✓"), TextColumn("{task.description}"),
                BarColumn(), MofNCompleteColumn(), TimeElapsedColumn())

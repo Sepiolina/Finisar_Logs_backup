@@ -8,7 +8,8 @@
     "port": 1433,
     "database": "ForthUtilities",
     "user": "backup_reader",
-    "password": null
+    "password": null,
+    "encryption": null
   },
   "subfolders": ["BURNIN", "ESS", "JTAG", "STM", "Xray"],
   "extensions": ["txt", "zip"],
