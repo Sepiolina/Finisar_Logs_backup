@@ -24,7 +24,7 @@ entry point the UI uses.
 | Callback | Called with | Purpose |
 |---|---|---|
 | `report(step, message, done, total)` | `step` is `resume`, `query`, `scan`, `stage` or `commit`. `total=None` means not known yet. | Progress only. The default, `quiet`, does nothing. |
-| `confirm(volumes) -> bool` | `{"2026-08": (files, bytes), ...}` | Asked once, after the scan and **before any file moves**. `False` returns `status="cancelled"` with nothing moved and nothing written to the index. |
+| `confirm(volumes) -> bool` | `{"2026-08": (barcodes, files, bytes), ...}` | Asked once, after the scan and **before any file moves**. `False` returns `status="cancelled"` with nothing moved and nothing written to the index. |
 
 `run()` returns a summary dict:
 
@@ -32,8 +32,11 @@ entry point the UI uses.
 |---|---|
 | `status` | `done`, `dry_run` or `cancelled` |
 | `window` | `(from, to)` dates queried. `from` is `None` on the first run. |
-| `candidates`, `scanned`, `files_moved`, `errors`, `resumed` | Counts |
-| `volumes` | `{month: (files, bytes)}`: committed months when `done`, otherwise what was found |
+| `candidates` | Distinct barcodes returned by SQL Server |
+| `matched_barcodes`, `matched_files` | Barcodes that have files in the source folders, and those files: what the run would archive |
+| `barcodes`, `files_moved` | What was committed (0 for a dry run or a cancel) |
+| `scanned`, `errors`, `resumed` | Counts |
+| `volumes` | `{month: (barcodes, files, bytes)}`: committed months when `done`, otherwise what was found |
 | `session_id`, `unmatched` | Only when `done` |
 
 On failure `run()` raises (`BackupError` for expected failures). Nothing is
@@ -128,7 +131,7 @@ safe to resume. A broken last line (a crash mid-write) is skipped.
 | Function | What it does |
 |---|---|
 | `lock_run(cfg)` | Takes an OS file lock on `output_dir/.backup.lock` (`msvcrt` on Windows, `fcntl` elsewhere). A second run at the same time gets a clear `BackupError`. |
-| `plan(entries)` | `{month: (files, bytes)}` for the confirm prompt and the summary. |
+| `plan(entries)` | `{month: (barcodes, files, bytes)}`. One helper for both what a run would archive (confirm, dry run) and what it did archive (summary), so the two always count the same way. |
 | `run(...)` / `_run(...)` | The whole run under the lock: resume leftovers, query, scan, then dry run / confirm, then record barcodes, stage, finish. Marks the session `failed` if anything raises after it started. |
 | `send_email(cfg, summary)` | Optional HTML summary POSTed to `{api_base_url}/api/email/send`. Barcodes are HTML-escaped and the body is capped at 95,000 characters. Failure only logs a warning. |
 | `main()` | Plain command line with log lines, no prompt. For scheduled tasks. |

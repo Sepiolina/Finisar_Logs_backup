@@ -164,14 +164,15 @@ class Flow(unittest.TestCase):
         summary = lb.run(self.cfg, lambda *_: self.CANDIDATES, report=lambda step, *_: steps.append(step),
                          confirm=lambda volumes: False)
         self.assertEqual(summary["status"], "cancelled")
-        self.assertEqual(summary["volumes"], {"2026-07": (1, 7), "2026-08": (1, 10)})
+        self.assertEqual(summary["volumes"], {"2026-07": (1, 1, 7), "2026-08": (1, 1, 10)})  # barcodes, files, bytes
+        self.assertEqual((summary["candidates"], summary["matched_barcodes"], summary["matched_files"]), (3, 2, 2))
         self.assertEqual(sorted(set(steps)), ["query", "scan"])
         self.assertTrue((self.cfg.source_dir / "BURNIN/unit1_BC001_log.txt").exists())
         self.assertEqual(sqlite3.connect(self.cfg.db_path).execute("SELECT COUNT(*) FROM scan_session").fetchone()[0], 0)
 
         summary = lb.run(self.cfg, lambda *_: self.CANDIDATES, report=lambda step, *_: steps.append(step),
                          confirm=lambda volumes: True)
-        self.assertEqual(summary["files_moved"], 2)
+        self.assertEqual((summary["files_moved"], summary["barcodes"]), (2, 2))
         self.assertIn("commit", steps)
 
     def test_second_run_at_the_same_time_is_refused(self):
