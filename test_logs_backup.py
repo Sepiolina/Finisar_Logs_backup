@@ -182,6 +182,24 @@ class Flow(unittest.TestCase):
         self.assertTrue((self.cfg.source_dir / "BURNIN/unit1_BC001_log.txt").exists())
         self.assertEqual(self.run_backup()["files_moved"], 2)
 
+    def test_export_copies_checked_and_skips_unchanged(self):
+        raw = json.loads(self.cfg.path.read_text())
+        raw["sql_server"] = {"server": "h", "database": "d", "user": "u", "password": "SECRET"}
+        self.cfg.path.write_text(json.dumps(raw))
+        self.run_backup()
+        target = self.tmp / "export"
+        items = lb.export(lb.Config(self.cfg.path), target)
+        self.assertEqual(items["archives"], (2, items["archives"][1], 2))
+        manifest = json.loads((target / "export-manifest.json").read_text())["files"]
+        for rel in ("archives/2026/2026-08.mochi", "archives/2026/2026-07.mochi", "index.db"):
+            self.assertEqual(manifest[rel]["blake3"], lb.b3(target / rel))
+        self.assertEqual(lb.b3(target / "archives/2026/2026-08.mochi"), lb.b3(self.cfg.archive("2026-08")))
+        self.assertIsNone(json.loads((target / "config.json").read_text())["sql_server"]["password"])
+        self.assertTrue((target / "RESTORE.txt").is_file())
+        self.assertEqual(lb.export(lb.Config(self.cfg.path), target)["archives"][2], 0)  # nothing copied again
+        with self.assertRaisesRegex(lb.BackupError, "must not be inside"):
+            lb.export(self.cfg, self.cfg.output_dir / "export")
+
     def test_missing_mochi_moves_nothing(self):
         self.cfg.mochi = str(self.tmp / "missing-mochi")
         with self.assertRaisesRegex(lb.BackupError, "mochi program was not found"):

@@ -126,6 +126,7 @@ the double-click launcher and scheduled tasks see them.
 | Want | Do |
 |---|---|
 | Test the SQL Server login only | `python backup_ui.py config.json --check-sql` |
+| Copy everything needed to restore, to another drive | `python backup_ui.py config.json --export E:/finisar_export` (see [Export](#export-a-copy-of-everything-to-restore-from)) |
 | See what would happen | `python backup_ui.py config.json --dry-run` |
 | Run by hand | Double-click `run_backup.bat`, or `python backup_ui.py config.json` |
 | Run without the question | `python backup_ui.py config.json --yes` |
@@ -169,7 +170,42 @@ mochi verify E:/archive/2026/2026-01.mochi
 Exit code 0 or 2 is fine. Exit code 1 means a problem: keep your independent
 copy and see MOCHI's repair docs.
 
-## Moving to another PC: what to copy
+## Export: a copy of everything to restore from
+
+One command copies what you need to move this setup to another PC, or to keep
+as an independent copy:
+
+```bash
+python backup_ui.py config.json --export E:/finisar_export
+```
+
+| In the target folder | From | Notes |
+|---|---|---|
+| `archives/YYYY/YYYY-MM.mochi` | `output_dir` | Every copy is checked against the original (BLAKE3) before it replaces anything. Archives unchanged since the last export to the same folder are skipped, so exporting again is quick. |
+| `index.db` | `db_path` | Copied with SQLite's backup method, so the copy is consistent |
+| `config.json` | your config | The SQL Server password is removed. It is asked again on the first run. |
+| `staging/` | `staging_dir` | Only after an interrupted run. Those files are in no archive yet, so this is their only other copy. |
+| `RESTORE.txt` | | The restore steps below |
+| `export-manifest.json` | | Size and BLAKE3 of every exported file |
+
+Export holds the same lock as a backup run, so a run cannot change an archive
+while it is copied. It never deletes or moves anything in the backup itself.
+The target must not be inside `source_dir` or `output_dir`. Use another drive,
+ideally one you can unplug and keep elsewhere.
+
+**To restore on another PC:**
+
+1. Copy the export folder there.
+2. Edit its `config.json`: `output_dir` = `<export folder>/archives`, `db_path` =
+   `<export folder>/index.db` (or copy them where you want them and point there).
+   Also set `source_dir` and `mochi`.
+3. If `staging/` exists, copy its contents into `<source_dir>/.staging` before the first run.
+4. Run `--check-sql`, then `--dry-run`, then a real run. The first real run
+   finishes the staged files.
+
+## Moving to another PC by hand: what to copy
+
+`--export` does all of this. By hand:
 
 | Copy | Why |
 |---|---|

@@ -40,6 +40,12 @@ python backup_ui.py config.json --dry-run
 python backup_ui.py config.json
 ```
 
+To copy everything needed to restore (archives, index, config) to another drive:
+
+```bash
+python backup_ui.py config.json --export E:/finisar_export
+```
+
 On Windows, double-click `run_backup.bat`. Full steps are in [docs/operations.md](docs/operations.md).
 
 ## Documentation
