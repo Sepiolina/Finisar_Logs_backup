@@ -1,0 +1,12 @@
+{
+  "source_dir": "D:/logs",
+  "output_dir": "E:/archive",
+  "staging_dir": null,
+  "db_path": "E:/archive/index.db",
+  "subfolders": ["BURNIN", "ESS", "JTAG", "STM", "Xray"],
+  "extensions": ["txt", "zip"],
+  "lookback_days": 2,
+  "date_range": null,
+  "mochi": "mochi",
+  "email": null
+}
