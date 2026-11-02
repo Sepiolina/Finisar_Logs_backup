@@ -7,9 +7,9 @@ for the overall flow.
 
 | File | Lines | Role |
 |---|---|---|
-| `logs_backup.py` | ~580 | **All backup logic.** No display code. Also runs alone: `python logs_backup.py config.json`. |
-| `backup_ui.py` | ~160 | Terminal UI with `rich`. Draws progress and asks before moving files. **Makes no backup decisions.** |
-| `test_logs_backup.py` | ~170 | Tests: matching rules, config, full flow, crash recovery, cancel, the run lock. |
+| `logs_backup.py` | ~640 | **All backup logic.** No display code. Also runs alone: `python logs_backup.py config.json`. |
+| `backup_ui.py` | ~180 | Terminal UI with `rich`. Draws progress and asks before moving files. **Makes no backup decisions.** |
+| `test_logs_backup.py` | ~190 | Tests: matching rules, config, full flow, crash recovery, cancel, the run lock. |
 | `bench.py` | ~75 | Times a full run over generated files. See [performance.md](performance.md). |
 
 For a safety audit, read `logs_backup.py` only. `backup_ui.py` cannot move,
@@ -73,12 +73,13 @@ variable if set, otherwise from `sql_server` in the file. `cfg.manifest` and
 
 ### SQL Server
 
-`query_candidates(sql_login, date_from, date_to)` runs the same query as the
-original (`ShipmentFinisarSerial` joined to `ShipmentFinisarTrace`) with `pymssql`,
-using `cfg.sql`. Dates are passed as query parameters, not pasted into the SQL.
-It retries with exponential backoff and raises `BackupError` naming any missing
-part of the login. `run()` uses it unless the caller passes its own
-`candidates_fn` (the tests do).
+| Function | What it does |
+|---|---|
+| `query_candidates(sql_login, date_from, date_to)` | The same query as the original (`ShipmentFinisarSerial` joined to `ShipmentFinisarTrace`), with dates passed as query parameters, not pasted into the SQL. Strips spaces from barcodes. `run()` uses it unless the caller passes its own `candidates_fn` (the tests do). |
+| `check_sql(sql_login)` | One connection, no retries, returns the server's version line. For `backup_ui.py --check-sql`. |
+| `run_sql(sql_login, sql, params)` | Connects with `pymssql` using `cfg.sql` and runs one query, retrying with exponential backoff. Names any missing part of the login. A `HOST\NAME` server is connected by instance name, without a port. |
+| `set_encryption(mode)` | FreeTDS (inside `pymssql`) takes the login encryption setting only from a `freetds.conf`, so this writes one to the temp folder and points `FREETDSCONF` at it: `request` (default), `require` or `off`. `off` logs a warning on every run. |
+| `sql_error(e)` | Turns a `pymssql` error (a code plus a multi-line byte string) into one line with a hint for codes 20002, 20009, 18456 and 4060. The code is read from the text when it starts with `DB-Lib error message N`, because `pymssql` can keep the previous error's code. |
 
 ### Scan
 
@@ -160,6 +161,7 @@ MOCHI_BIN=/path/to/mochi python -m unittest -v
 | `test_failed_commit_keeps_staging` | A failing `mochi` keeps staging, and the next run completes it |
 | `test_sql_login_from_config_with_env_override` | Login read from `config.json`, `DB_*` variables win, a missing part is named |
 | `test_backspace_in_a_path_is_refused` | `"E:\backup"` in JSON is caught |
+| `test_sql_errors_are_one_readable_line_with_a_hint` | Your error 20002, a stale code from `pymssql`, login failure, a bad `encryption` value |
 | `test_index_folder_is_created` | `db_path` in a folder that does not exist yet |
 
 The flow tests need the `mochi` program. Without it they are skipped, and only

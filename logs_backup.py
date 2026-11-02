@@ -18,8 +18,10 @@ import itertools
 import json
 import logging
 import os
+import re
 import sqlite3
 import subprocess
+import tempfile
 import time
 import urllib.request
 from collections import defaultdict
@@ -119,7 +121,7 @@ class Config:
         sql, env = raw.get("sql_server") or {}, os.environ
         self.sql = {key: env.get(var) or sql.get(key) for key, var in (
             ("server", "DB_SERVER"), ("port", "DB_PORT"), ("database", "DB_NAME"),
-            ("user", "DB_USER"), ("password", "DB_PASSWORD"))}
+            ("user", "DB_USER"), ("password", "DB_PASSWORD"), ("encryption", "DB_ENCRYPTION"))}
         for name in ("source_dir", "output_dir", "staging_dir", "db_path"):
             if any(ord(c) < 32 for c in str(getattr(self, name))):  # "E:\backup" in JSON is E: + backspace + ackup
                 raise BackupError(f"{name} in config.json has a broken path: write Windows paths with / (E:/backup)")
@@ -181,10 +183,48 @@ def query_window(db, cfg):
 
 # ---------------------------------------------------------------- SQL Server
 
+SQL_HINTS = {
+    20002: "the server answered but the connection handshake failed. Check the port (a named instance"
+           " HOST\\NAME uses its own port), then the \"encryption\" setting (docs/operations.md)",
+    20009: "the server cannot be reached. Check the server name or IP, the port and the firewall",
+    18456: "login failed. Check the user and password",
+    4060: "cannot open the database. Check the database name and the user's permissions",
+}
+
+
+def sql_error(e):
+    """One readable line from a pymssql error, plus a hint for the usual failures."""
+    parts = e.args[0] if e.args and isinstance(e.args[0], tuple) else e.args
+    code = parts[0] if parts and isinstance(parts[0], int) else None
+    text = " ".join(p.decode(errors="replace") if isinstance(p, bytes) else str(p) for p in parts[1:] or parts)
+    # Text starting with "DB-Lib error message N" is a client-side error: its code is N (pymssql can
+    # keep reporting the previous server error's code). Otherwise the server's message comes first.
+    client = re.match(r"DB-Lib error message (\d+)", text)
+    if client:
+        code = int(client.group(1))
+    lines = [ln.strip() for ln in re.split(r"DB-Lib error message \d+, severity \d+:|\n", text) if ln.strip()]
+    message = lines[0] if lines else text
+    if code:
+        message += f" (error {code})"
+    return f"{message}: {SQL_HINTS[code]}" if code in SQL_HINTS else message
+
+
+def set_encryption(mode):
+    """Chooses FreeTDS's login encryption: "request" (FreeTDS's default), "require" or "off".
+
+    FreeTDS reads this only from a freetds.conf, so one is written to the temp folder and used."""
+    mode = mode or "request"
+    if mode not in ("request", "require", "off"):
+        raise BackupError(f'sql_server "encryption" must be "request", "require" or "off", not {mode!r}')
+    if mode == "off":
+        log.warning("SQL Server connection without encryption (\"encryption\": \"off\" in config.json)")
+    conf = Path(tempfile.gettempdir()) / f"logs_backup_freetds_{mode}.conf"
+    conf.write_text(f"[global]\n    encryption = {mode}\n", encoding="utf-8")
+    os.environ["FREETDSCONF"] = str(conf)
+
+
 def query_candidates(sql_login, date_from, date_to):
     """[(barcode, 'YYYY-MM-DD HH:MM:SS')] for the window. sql_login is Config.sql."""
-    import pymssql  # imported here so the rest of the module works without it
-
     where, params = "sft.last_update < %s", [date_to]
     if date_from:
         where, params = "sft.last_update >= %s AND " + where, [date_from, date_to]
@@ -192,25 +232,41 @@ def query_candidates(sql_login, date_from, date_to):
            " FROM ForthUtilities.dbo.ShipmentFinisarSerial sfs WITH (NOLOCK)"
            " JOIN ForthUtilities.dbo.ShipmentFinisarTrace sft WITH (NOLOCK) ON sfs.trace_id = sft.trace_id"
            f" WHERE {where}")
+    return [(str(b).strip(), str(d)) for b, d in run_sql(sql_login, sql, params)]
+
+
+def check_sql(sql_login):
+    """Connects once and returns the server's version line (backup_ui.py --check-sql)."""
+    return str(run_sql(sql_login, "SELECT @@VERSION", [], retries=0)[0][0]).splitlines()[0]
+
+
+def run_sql(sql_login, sql, params, retries=None):
+    """Rows of one query, retried with exponential backoff (DB_RETRY_ATTEMPTS, default 3)."""
+    import pymssql  # imported here so the rest of the module works without it
+
     missing = [k for k in ("server", "database", "user", "password") if not sql_login.get(k)]
     if missing:
         raise BackupError(f"SQL Server login incomplete, missing: {', '.join(missing)}. Add it to"
                           " \"sql_server\" in config.json, or set the DB_* environment variables")
+    set_encryption(sql_login.get("encryption"))
+    server = sql_login["server"]
+    port = None if "\\" in server else str(sql_login.get("port") or 1433)  # HOST\NAME: port found by name
     env = os.environ
-    retries, delay = int(env.get("DB_RETRY_ATTEMPTS", 3)), int(env.get("DB_RETRY_BASE_DELAY_MS", 2000)) / 1000
+    retries = int(env.get("DB_RETRY_ATTEMPTS", 3)) if retries is None else retries
+    delay = int(env.get("DB_RETRY_BASE_DELAY_MS", 2000)) / 1000
     for attempt in range(retries + 1):
         try:
-            with pymssql.connect(server=sql_login["server"], port=str(sql_login.get("port") or 1433),
+            with pymssql.connect(server=server, port=port,
                                  database=sql_login["database"], user=sql_login["user"],
                                  password=sql_login["password"],
                                  timeout=int(env.get("DB_REQUEST_TIMEOUT_MS", 30000)) // 1000) as conn:
                 cur = conn.cursor()
                 cur.execute(sql, tuple(params))
-                return [(str(b).strip(), str(d)) for b, d in cur.fetchall()]
+                return cur.fetchall()
         except pymssql.Error as e:
             if attempt == retries:
-                raise BackupError(f"SQL Server query failed: {e}") from e
-            log.warning("SQL Server query failed (%s), retrying in %.0fs", e, delay * 2 ** attempt)
+                raise BackupError(f"SQL Server query failed: {sql_error(e)}") from e
+            log.warning("SQL Server query failed (%s), retrying in %.0fs", sql_error(e), delay * 2 ** attempt)
             time.sleep(delay * 2 ** attempt)
 
 
