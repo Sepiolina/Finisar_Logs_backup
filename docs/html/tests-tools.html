@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tests and Tools</title>
+<meta name="description" content="What each automated test proves, how the tests reach the real mochi engine, and how build_exe.bat, run_backup.bat and bench.py work.">
+<link rel="stylesheet" href="assets/site.css">
+<script src="assets/site.js"></script>
+</head>
+<body>
+<div class="layout">
+<aside class="side"><a class="brand" href="index.html">Finisar Logs Backup<small>Developer guide</small></a><nav></nav></aside>
+<main class="main">
+<div class="topbar"><button class="menu-btn">☰ Menu</button><span class="crumbs">File by file › Tests, build &amp; tools</span><button class="theme-btn">Theme</button></div>
+
+<h1>Tests, build &amp; tools</h1>
+<p class="lead"><code>test_logs_backup.py</code>, <code>build_exe.bat</code>, <code>run_backup.bat</code>, <code>bench.py</code>, <code>config.example.json</code> and <code>requirements.txt</code>: what each does and how they fit together.</p>
+
+<h2 id="test-logs-backup-py"><code>test_logs_backup.py</code></h2>
+<p>21 tests in three groups, using Python's built-in <code>unittest</code>. Run them with:</p>
+<pre><code>MOCHI_BIN=/path/to/mochi python -m unittest -v test_logs_backup</code></pre>
+<div class="grid">
+<div class="card"><h3>Matching <span class="badge py">2</span></h3><p class="small">Pure functions: the barcode and extension rules. No disk.</p></div>
+<div class="card"><h3>ConfigFile <span class="badge py">7</span></h3><p class="small">Config, SQL error text, encryption, finding config.json, the registry, the index folder. Temp folders only.</p></div>
+<div class="card"><h3>Flow <span class="badge rs">12</span></h3><p class="small">Full runs with the <b>real mochi</b> on real temp folders. Skipped when mochi is not found.</p></div>
+</div>
+<div class="callout junior"><span class="label">How the tests reach the Rust engine</span>
+<p>At the top: <code>MOCHI = os.environ.get("MOCHI_BIN") or shutil.which("mochi")</code>. If neither gives a path, the whole <code>Flow</code> class is skipped (<code>@unittest.skipUnless(MOCHI, …)</code>) and the run says <code>skipped=12</code>. So "all tests pass" without mochi proves much less: check the skipped count. <code>build_exe.bat</code> prints a reminder about <code>MOCHI_BIN</code> when tests fail.</p></div>
+<div class="callout senior"><span class="label">Patterns used</span>
+<ul>
+<li><b>No mocks of MOCHI.</b> Flow tests run the real binary, so they catch contract changes between the two repos (a renamed JSON field, a new exit code).</li>
+<li><b>SQL Server is replaced, not mocked</b>: <code>lb.run(cfg, lambda *_: self.CANDIDATES)</code> passes a fixed list through the <code>candidates_fn</code> door.</li>
+<li><b>Crash = calling the inner steps by hand.</b> A "crash after staging" test calls <code>scan</code> and <code>stage</code> itself, stops, then calls <code>run</code> as the next run would.</li>
+<li><b>Every resource is released</b> with <code>addCleanup</code>: temp folders, SQLite connections (Windows locks open files), the logger level.</li>
+<li>Temp folders are <code>.resolve()</code>d, because Windows may hand out short 8.3 names (<code>IT_113~1</code>) while the code reports long ones.</li>
+</ul></div>
+
+<h3>Every test, and what it proves</h3>
+<div class="tools"><button data-expand="open" data-target="#tests">Open all</button><button data-expand="close" data-target="#tests">Close all</button></div>
+<div id="tests">
+<details class="fn"><summary><code>test_barcode_needs_delimiters_on_both_sides</code> <span class="badge py">Matching</span></summary><div class="body"><p><code>é123ü</code> no; <code>é_123-ü</code> yes; <code>123_12345</code> finds both; <code>x12345</code> no; <code>AB-7</code> containing a delimiter still matches. Non-ASCII letters are not delimiters.</p></div></details>
+<details class="fn"><summary><code>test_extension</code> <span class="badge py">Matching</span></summary><div class="body"><p><code>a.b.TXT</code> yes (last part, any case); <code>noext</code> no; <code>a.txt.bak</code> no.</p></div></details>
+<details class="fn"><summary><code>test_sql_login_from_config_with_env_override</code> <span class="badge py">Config</span></summary><div class="body"><p><code>DB_USER</code> and <code>DB_PASSWORD</code> win over the file; an empty login names every missing part.</p></div></details>
+<details class="fn"><summary><code>test_backspace_in_a_path_is_refused</code> <span class="badge py">Config</span></summary><div class="body"><p><code>"E:\backup.db"</code> in JSON contains a backspace; the config is refused with a message about <code>/</code>.</p></div></details>
+<details class="fn"><summary><code>test_sql_errors_are_one_readable_line_with_a_hint</code> <span class="badge py">Config</span></summary><div class="body"><p>Real <code>pymssql</code> error shapes (20002 handshake, a stale 18456 code with a 20009 text, a login failure) become one line with the right hint; an unknown encryption value is refused.</p></div></details>
+<details class="fn"><summary><code>test_encryption_values</code> <span class="badge py">Config</span></summary><div class="body"><p>Nine spellings map to <code>request</code>/<code>off</code>/<code>require</code> in the written freetds.conf; the "without encryption" warning is checked (not printed) for <code>off</code>.</p></div></details>
+<details class="fn"><summary><code>test_config_is_found_without_an_argument</code> <span class="badge py">Config</span></summary><div class="body"><p>Current folder first, then next to the program, a given path always wins, and in a frozen .exe "next to the program" is the .exe's folder.</p></div></details>
+<details class="fn"><summary><code>test_mochi_path_from_the_registry</code> <span class="badge py">Config</span></summary><div class="body"><p>A fake registry: App Paths first, install key + bin second, nothing when empty, nothing off Windows; registry places come before PATH; a configured path is the only place.</p></div></details>
+<details class="fn"><summary><code>test_index_folder_is_created</code> <span class="badge py">Config</span></summary><div class="body"><p><code>open_index</code> creates missing folders for <code>db_path</code>.</p></div></details>
+<details class="fn"><summary><code>test_full_flow_then_append</code> <span class="badge rs">Flow</span></summary><div class="body"><p>The <a href="run-flow.html">example run</a>: 2 files archived into 2 months, BC404 unmatched, non-matching files untouched, staging gone, index rows with the archive's BLAKE3 and <code>commit_seq 0</code>, <code>user_version 2</code>. Then a late file: the second run makes commit 1 and the head shows both files.</p></div></details>
+<details class="fn"><summary><code>test_crash_after_staging_is_resumed</code> <span class="badge rs">Flow</span></summary><div class="body"><p>Stage by hand, stop, run again with <b>no candidates</b>: the leftover batch is still archived and staging removed.</p></div></details>
+<details class="fn"><summary><code>test_crash_after_commit_before_index_makes_no_new_commit</code> <span class="badge rs">Flow</span></summary><div class="body"><p>Stage and commit by hand, stop before indexing: the next run leaves the head at <code>seq 0</code> (no duplicate commit) and indexes both files.</p></div></details>
+<details class="fn"><summary><code>test_callbacks_report_steps_and_cancel_moves_nothing</code> <span class="badge rs">Flow</span></summary><div class="body"><p><code>confirm</code> returns False: status <code>cancelled</code>, the plan's numbers are right, only <code>query</code>/<code>scan</code> reported, files untouched, <b>no session row</b>. Then True: 2 files moved and <code>commit</code> reported.</p></div></details>
+<details class="fn"><summary><code>test_second_run_at_the_same_time_is_refused</code> <span class="badge rs">Flow</span></summary><div class="body"><p>While the lock is held, <code>run</code> raises "another backup run" and moves nothing; afterwards it works.</p></div></details>
+<details class="fn"><summary><code>test_export_copies_checked_and_skips_unchanged</code> <span class="badge rs">Flow</span></summary><div class="body"><p>Export copies 2 archives and the index with matching BLAKE3, removes the SQL password, writes RESTORE.txt; a second export copies nothing; a target inside <code>output_dir</code> is refused.</p></div></details>
+<details class="fn"><summary><code>test_mochi_is_found_without_a_config_path</code> <span class="badge rs">Flow</span></summary><div class="body"><p>With the registry switched off and PATH empty: not found (error lists the checkout path, no desktop hint); then found in a <code>MOCHI/target/release</code> checkout, in <code>~/.cargo/bin</code>, in the setup's <code>bin</code>; and the desktop-app hint when only <code>mochi-desktop.exe</code> exists.</p></div></details>
+<details class="fn"><summary><code>test_recursive_scan_keeps_folders_and_appends_into_them</code> <span class="badge rs">Flow</span></summary><div class="body"><p>Deep files keep their folders in the archive; the same file name in two folders stays two entries; a later file in an existing folder is added and the earlier one stays.</p></div></details>
+<details class="fn"><summary><code>test_recursive_off_and_staging_inside_a_subfolder</code> <span class="badge rs">Flow</span></summary><div class="body"><p><code>recursive: false</code> scans only the top of each subfolder; a staging folder inside a subfolder is never scanned; a non-boolean <code>recursive</code> is refused.</p></div></details>
+<details class="fn"><summary><code>test_missing_output_staging_and_index_folders_are_created</code> <span class="badge rs">Flow</span></summary><div class="body"><p>New output, staging and index folders are created; an output path blocked by a file gives "cannot create output_dir".</p></div></details>
+<details class="fn"><summary><code>test_missing_mochi_moves_nothing</code> <span class="badge rs">Flow</span></summary><div class="body"><p>A bad mochi path stops a real run before anything is staged; a dry run only warns and still reports 2 matches.</p></div></details>
+<details class="fn"><summary><code>test_failed_commit_keeps_staging</code> <span class="badge rs">Flow</span> <span class="badge warn">not on Windows</span></summary><div class="body"><p>A fake mochi (a shell script) that answers <code>--version</code> but fails every commit with <code>IO_ERROR</code>: the run raises, files stay in staging; with the real mochi the next run finishes them. Skipped on Windows because it needs a shell script.</p></div></details>
+</div>
+
+<h2 id="build-exe-bat"><code>build_exe.bat</code></h2>
+<p>Builds <code>dist\FinisarLogsBackup.exe</code>, one file that runs on a Windows PC without Python. Each step stops the build on failure (<code>|| goto :fail</code>).</p>
+<div class="stepper" data-src="build-steps"></div>
+<script type="application/json" id="build-steps">[
+{"title":"Optional clean","who":"<code>build_exe.bat clean</code>","html":"<p>Deletes <code>.venv</code>, <code>build</code>, <code>dist</code> and the <code>.spec</code> file for a from-scratch build.</p>"},
+{"title":"Create a virtual environment","who":"<code>py -3 -m venv .venv</code> (or <code>python -m venv</code>)","html":"<p>A private copy of Python in <code>.venv</code>, so nothing is installed into the system Python. Only on the first run.</p><p class='small muted'>A <b>virtual environment</b> is like a project-local <code>node_modules</code> for Python.</p>"},
+{"title":"Install libraries","who":"<code>pip install -r requirements.txt pyinstaller</code>","html":"<p><code>blake3</code>, <code>pymssql</code>, <code>rich</code>, plus PyInstaller for the build itself.</p>"},
+{"title":"Run the tests (gate)","who":"<code>python -m unittest -q test_logs_backup</code>","html":"<p>If any test fails the build stops with <i>Tests failed: not building</i>. On a PC where mochi is not found, the 12 Flow tests are <b>skipped</b>, not failed, so the build continues; set <code>MOCHI_BIN</code> to run them.</p>"},
+{"title":"Bundle","who":"<code>PyInstaller --onefile --console --name FinisarLogsBackup --collect-all pymssql --collect-submodules rich backup_ui.py</code>","html":"<p>PyInstaller starts at <code>backup_ui.py</code>, follows imports to <code>logs_backup.py</code> and the libraries, and packs them with Python into one .exe. <code>--collect-all pymssql</code> includes its native FreeTDS files, which an import scan alone would miss.</p>"},
+{"title":"Ship","who":"<code>dist\\FinisarLogsBackup.exe</code> + <code>config.example.json</code>","html":"<p>Copy both to the target PC, rename the example to <code>config.json</code> and edit it. mochi.exe is installed separately (MOCHI setup) and found at run time.</p>"}
+]</script>
+
+<h2 id="run-backup-bat"><code>run_backup.bat</code></h2>
+<pre><code>cd /d "%~dp0"                                  :: go to the .bat's own folder
+if exist ".venv\Scripts\python.exe" ( ".venv\Scripts\python.exe" backup_ui.py %* ) else ( python backup_ui.py %* )
+pause                                           :: keep the window open to read the summary</code></pre>
+<p>For running from source on Windows by double-click. <code>%*</code> passes any options through.</p>
+
+<h2 id="bench-py"><code>bench.py</code></h2>
+<pre><code>python bench.py FILES MONTHS DIR [--append N] [--mochi PATH]</code></pre>
+<p>Generates <code>FILES</code> small logs (about 2 KiB each) over five subfolders and <code>MONTHS</code> months, runs one backup through <code>lb.run</code> with a fixed candidate list, and prints seconds per step. Its <code>report</code> callback records the time between progress calls, which is how it splits the run into steps without any timing code inside the logic. <code>--append N</code> then adds files and runs again (the daily case). It <b>deletes DIR</b> first. Results and tuning: <code>docs/performance.md</code>.</p>
+
+<h2 id="config-example-json-and-requirements-txt"><code>config.example.json</code> and <code>requirements.txt</code></h2>
+<div class="grid">
+<div class="card"><h3>config.example.json</h3><p class="small">Every setting with a safe example value; <code>password</code> and <code>mochi</code> are <code>null</code> (asked / searched). Copied next to the .exe by the build. Reference: <a href="data.html#config-json">config.json</a>.</p></div>
+<div class="card"><h3>requirements.txt</h3><p class="small"><code>blake3&gt;=1.0</code> hashing (same function as MOCHI's content hash) · <code>pymssql&gt;=2.3</code> SQL Server · <code>rich&gt;=13</code> terminal UI. Everything else is Python's standard library (<code>sqlite3</code>, <code>subprocess</code>, <code>json</code>, <code>concurrent.futures</code>…).</p></div>
+</div>
+
+</main>
+</div>
+</body>
+</html>

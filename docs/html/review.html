@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reviewer Checklist</title>
+<meta name="description" content="The invariants a change to Finisar Logs Backup must keep, the test that proves each, red flags to look for, and how to validate a build by hand.">
+<link rel="stylesheet" href="assets/site.css">
+<script src="assets/site.js"></script>
+</head>
+<body>
+<div class="layout">
+<aside class="side"><a class="brand" href="index.html">Finisar Logs Backup<small>Developer guide</small></a><nav></nav></aside>
+<main class="main">
+<div class="topbar"><button class="menu-btn">☰ Menu</button><span class="crumbs">Review › Checklist</span><button class="theme-btn">Theme</button></div>
+
+<h1>Reviewer checklist</h1>
+<p class="lead">Use this when reviewing a change. Each item is an invariant the design depends on, where it lives in the code, and the test that proves it. Ticks are saved in this browser only.</p>
+
+<h2 id="invariants">Invariants</h2>
+<div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+<div class="progress-bar" data-for="inv" style="flex:1;min-width:200px"><span></span></div>
+<span class="progress-label small muted" data-for="inv"></span>
+<button class="reset-check" data-for="inv">Clear ticks</button>
+</div>
+<ul class="checklist" data-key="inv">
+<li><input type="checkbox" aria-label="One place"><div><b>A file is in exactly one place.</b> Source → staging only by <code>os.rename</code> on the same drive; staging → gone only after verify + index. No copy+delete, no overwrite.<br><span class="small muted"><code>stage</code>, <code>finish_staged</code> · test_full_flow_then_append, test_crash_after_staging_is_resumed</span></div></li>
+<li><input type="checkbox" aria-label="Listed before moved"><div><b>Listed before moved.</b> Manifest lines are flushed and fsync'ed before their files are renamed.<br><span class="small muted"><code>stage</code> · test_crash_after_staging_is_resumed</span></div></li>
+<li><input type="checkbox" aria-label="Verify before delete"><div><b>Verify before delete.</b> Staged copies are deleted only after: every staged BLAKE3 equals the head's <code>content_hash</code>, <code>mochi verify --level content</code> passes, and the SQLite transaction committed.<br><span class="small muted"><code>commit_month</code>, <code>finish_staged</code> · test_failed_commit_keeps_staging</span></div></li>
+<li><input type="checkbox" aria-label="No duplicate commit"><div><b>No duplicate commit on resume.</b> Resume compares the head with the staged hashes before committing.<br><span class="small muted"><code>commit_month(resume=True)</code> · test_crash_after_commit_before_index_makes_no_new_commit</span></div></li>
+<li><input type="checkbox" aria-label="Idempotent index"><div><b>Indexing is repeatable.</b> <code>scanned_log_entry</code> is upserted on <code>(relative_path, file_storage_volume_id)</code>; <code>session_barcode</code> is <code>INSERT OR IGNORE</code>.<br><span class="small muted"><code>index_month</code>, <code>_run_with_index</code></span></div></li>
+<li><input type="checkbox" aria-label="Months independent"><div><b>Months are independent.</b> A failed month keeps its staging; others finish; the run then raises.<br><span class="small muted"><code>finish_staged</code></span></div></li>
+<li><input type="checkbox" aria-label="Unknown kept"><div><b>Unknown files are kept.</b> Anything in staging not in the manifest is reported, never deleted.<br><span class="small muted"><code>finish_staged</code></span></div></li>
+<li><input type="checkbox" aria-label="Single run"><div><b>One run at a time.</b> OS lock on <code>.backup.lock</code> for the whole run (and export).<br><span class="small muted"><code>lock_run</code> · test_second_run_at_the_same_time_is_refused</span></div></li>
+<li><input type="checkbox" aria-label="Mochi first"><div><b>Engine checked before anything moves.</b> A real run without a working mochi stops before staging.<br><span class="small muted"><code>_run</code> → <code>check_mochi</code> · test_missing_mochi_moves_nothing</span></div></li>
+<li><input type="checkbox" aria-label="Cancel clean"><div><b>Cancel leaves no trace.</b> <code>confirm → False</code>: nothing moved, no session row.<br><span class="small muted">test_callbacks_report_steps_and_cancel_moves_nothing</span></div></li>
+<li><input type="checkbox" aria-label="Threads"><div><b>Threads never touch SQLite or delete files.</b> Workers only hash and run mochi; the main thread indexes and deletes.<br><span class="small muted"><code>commit_month</code> vs <code>finish_staged</code></span></div></li>
+<li><input type="checkbox" aria-label="Exit codes"><div><b>Only exit 0 and 2 pass.</b> Any other mochi exit raises. Arguments are a list, never a shell string.<br><span class="small muted"><code>mochi()</code></span></div></li>
+<li><input type="checkbox" aria-label="Resources"><div><b>Resources are closed.</b> The index connection is closed in <code>finally</code>; the lock file is closed by <code>with</code>. (On Windows an open connection locks <code>index.db</code>.)<br><span class="small muted"><code>_run</code>, <code>open_index</code></span></div></li>
+<li><input type="checkbox" aria-label="UI no decisions"><div><b>The UI makes no backup decisions.</b> <code>backup_ui.py</code> only calls <code>run</code>, <code>export</code>, <code>check_mochi</code>, <code>check_sql</code>, <code>send_email</code>.<br><span class="small muted"><a href="ui.html">UI ↔ logic</a></span></div></li>
+<li><input type="checkbox" aria-label="SQL params"><div><b>SQL Server is read only and parameterised.</b> No writes; dates as <code>%s</code> parameters.<br><span class="small muted"><code>query_candidates</code></span></div></li>
+<li><input type="checkbox" aria-label="Secrets"><div><b>The password is never written.</b> Asked at run time or from <code>DB_PASSWORD</code>; removed from the exported config.<br><span class="small muted"><code>backup_ui.main</code>, <code>export</code> · test_export_copies_checked_and_skips_unchanged</span></div></li>
+</ul>
+
+<h2 id="red-flags">Red flags in a diff</h2>
+<div class="table-wrap"><table>
+<tr><th>If you see…</th><th>Ask…</th></tr>
+<tr><td><code>shutil.move</code>, <code>shutil.copy</code> + <code>unlink</code> in the staging path</td><td>Can the file end up in two places, or none, after a crash? Does it still work across drives without silently copying?</td></tr>
+<tr><td>A new <code>unlink</code> / <code>rmtree</code> / <code>rmdir</code></td><td>Is the file archived, verified and indexed first? Is it listed in the manifest?</td></tr>
+<tr><td>Code moved from <code>finish_staged</code> into <code>commit_month</code></td><td>Does it now run on a worker thread? Does it touch SQLite or delete?</td></tr>
+<tr><td><code>returncode</code> checks changed, or <code>shell=True</code></td><td>Does a MOCHI failure still stop the month? Can a path be misread by a shell?</td></tr>
+<tr><td>A new field read from MOCHI's JSON</td><td>Is it in MOCHI's documented output (<code>docs/c14-cli.md</code>) for the version in use? What if it is missing?</td></tr>
+<tr><td><code>sqlite3.connect</code> without a matching <code>close</code></td><td>Who closes it, on every path, including errors?</td></tr>
+<tr><td>File or database code in <code>backup_ui.py</code></td><td>Should this live in <code>logs_backup.py</code>, with a test?</td></tr>
+<tr><td>A test that is skipped, removed, or no longer needs mochi</td><td>What does the Flow suite still prove? Check the skipped count.</td></tr>
+<tr><td>String-built SQL (<code>f"… WHERE x = '{v}'"</code>)</td><td>Use parameters. (The only f-string SQL today builds the <code>WHERE</code> from fixed text, with values still as parameters.)</td></tr>
+</table></div>
+
+<h2 id="validate-by-hand">Validate a build by hand</h2>
+<p>After the automated tests, on a test PC with a copy of real data:</p>
+<ol>
+<li><code>FinisarLogsBackup.exe --check-sql</code> → both panels green: <i>mochi: found</i> with the version and path, <i>SQL Server: connected</i>.</li>
+<li><code>FinisarLogsBackup.exe --dry-run</code> → the plan per month; compare a few barcodes with SQL Server and the folders by eye.</li>
+<li>A real run on a small <code>date_range</code>; answer <b>y</b>.</li>
+<li>Pick one archived file and check it end to end:
+<pre><code>sqlite3 E:/archive/index.db "SELECT relative_path, content_hash FROM scanned_log_entry WHERE barcode='BC001'"
+mochi get E:/archive/2026/2026-08.mochi BURNIN/unit1_BC001_log.txt -C D:/restore
+b3sum D:/restore/BURNIN/unit1_BC001_log.txt      # must equal content_hash</code></pre></li>
+<li><code>mochi verify E:/archive/2026/2026-08.mochi</code> → exit 0 or 2.</li>
+<li>Pull the plug test (optional): start a run on a bigger window, kill the process during "Commit, verify, index", run again. The summary shows <i>Resumed N files</i>; <code>mochi list</code> shows no duplicate commit for the month.</li>
+</ol>
+
+<h2 id="questions-reviewers-ask">Questions reviewers ask</h2>
+<details class="fn"><summary><b>Why Python plus a Rust program, not all one language?</b></summary><div class="body"><p>MOCHI is a large, separately specified and tested archiver. This tool only needs to decide which files go where and keep a ledger; that is short, readable Python. The command line is a stable, documented contract between them. See <a href="python-rust.html">Python ↔ MOCHI</a>.</p></div></details>
+<details class="fn"><summary><b>Why is a run "LOCAL_COMMITTED" and not "backed up"?</b></summary><div class="body"><p>Because the archive is one file on one disk. A disk failure loses it. <code>--export</code> to another drive makes the independent copy; the UI says so after every run.</p></div></details>
+<details class="fn"><summary><b>Why does every Windows commit say DEGRADED?</b></summary><div class="body"><p>After publishing, MOCHI flushes the folder entry, but Windows does not document that flush as durable, so MOCHI reports <code>directory_unconfirmed</code> with exit 2. The data is committed; Python logs it as "not an error" and continues to verify.</p></div></details>
+<details class="fn"><summary><b>Why verify the whole month each run, not only the new commit?</b></summary><div class="body"><p>Simplicity and coverage: <code>mochi verify --level content</code> checks the archive as a whole. It makes appends to big months a few seconds slower (<code>docs/performance.md</code>).</p></div></details>
+<details class="fn"><summary><b>Why is staging on the source drive and not the output drive?</b></summary><div class="body"><p>A rename is atomic only within one drive. Moving to the output drive would be a copy plus a delete, which a crash can interrupt in between.</p></div></details>
+<details class="fn"><summary><b>What happens if two barcodes are in one file name?</b></summary><div class="body"><p>The file is left in place and counted as an error: it is not clear which month it belongs to. A person decides.</p></div></details>
+
+</main>
+</div>
+</body>
+</html>

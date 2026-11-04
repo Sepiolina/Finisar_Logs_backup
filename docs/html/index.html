@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Finisar Backup Guide</title>
+<meta name="description" content="Developer guide to Finisar Logs Backup: what it does, how the Python code and the MOCHI (Rust) engine fit together, and where to start reading.">
+<link rel="stylesheet" href="assets/site.css">
+<script src="assets/site.js"></script>
+</head>
+<body>
+<div class="layout">
+<aside class="side"><a class="brand" href="index.html">Finisar Logs Backup<small>Developer guide</small></a><nav></nav></aside>
+<main class="main">
+<div class="topbar"><button class="menu-btn">☰ Menu</button><span class="crumbs">Start here</span><button class="theme-btn">Theme</button></div>
+
+<h1>Start here</h1>
+<p class="lead">This guide explains every file in this repository, how they connect, and why the code is shaped the way it is.
+It is written so that a junior developer, or a senior who has never seen Python or Rust, can review the code and judge whether it is right.</p>
+
+<div class="callout junior"><span class="label">If you are new</span>
+<p>Read the pages in order (use <b>Next →</b> at the bottom). Dotted words like <span class="term" data-def="A program that runs on its own and does one job. Here: mochi.exe, written in Rust, which writes and checks .mochi archive files.">engine</span> show a short definition when you point at them or tap them. Nothing here assumes you know Python or Rust.</p></div>
+
+<h2>What the program does, in one minute</h2>
+<p>A factory test station writes thousands of log files a day into folders like <code>D:/logs/BURNIN</code>. Each file name contains a product <b>barcode</b> (for example <code>unit1_<b>BC001</b>_log.txt</code>). Once a product has shipped, its logs only need to be kept, not used, so they should move off the busy disk into compact archives where they can still be found by barcode.</p>
+<div class="flow">
+  <span class="box">Ask <b>SQL Server</b>: which barcodes shipped?</span><span class="arrow">→</span>
+  <span class="box">Find their log files in the <b>source folders</b></span><span class="arrow">→</span>
+  <span class="box">Move them into <b>monthly archives</b> (<code>2026-08.mochi</code>)</span><span class="arrow">→</span>
+  <span class="box">Record every file in a <b>SQLite index</b></span>
+</div>
+<p>The hard part is not moving files. It is doing it so that <b>a crash, a power cut or a full disk at any moment never loses a file and never stores one twice</b>. Most of the design follows from that one goal.</p>
+
+<div class="callout rule"><span class="label">The one rule to keep in mind</span>
+<p>A log file is always in <b>exactly one</b> of three places: the source folder, the staging folder, or a <b>verified</b> archive. A copy is deleted only after the next place has been checked. Every page of this guide comes back to this rule.</p></div>
+
+<h2>The big picture</h2>
+<p>Click any box to see what it is, which file talks to it, and how.</p>
+<div class="legend">
+  <span><i style="background:var(--py)"></i>Python (this repo)</span>
+  <span><i style="background:var(--rs)"></i>Rust (MOCHI engine, separate repo)</span>
+  <span><i style="background:var(--db)"></i>Files and data on disk</span>
+  <span><i style="background:var(--sql)"></i>External services</span>
+</div>
+<div class="card arch">
+<svg viewBox="0 0 900 470" role="img" aria-label="Architecture diagram: the operator starts backup_ui.py, which calls logs_backup.py; logs_backup.py talks to SQL Server, the source folders, the SQLite index, and runs mochi.exe, which writes the .mochi archives.">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--ink-3)"/></marker>
+  </defs>
+  <!-- edges -->
+  <path class="edge" d="M170 58 H 250" marker-end="url(#arr)"/>
+  <path class="edge" d="M360 92 V 175" marker-end="url(#arr)"/>
+  <text class="edge-label" x="368" y="140">run(cfg, report, confirm)</text>
+  <path class="edge" d="M560 58 C 520 58 520 175 520 175" marker-end="url(#arr)"/>
+  <text class="edge-label" x="528" y="120">main()</text>
+  <path class="edge" d="M330 230 H 200" marker-end="url(#arr)"/>
+  <text class="edge-label" x="208" y="222">SELECT barcodes</text>
+  <path class="edge" d="M330 270 C 260 270 230 350 200 360" marker-end="url(#arr)"/>
+  <text class="edge-label" x="212" y="318">scan, rename</text>
+  <path class="edge" d="M570 230 H 690" marker-end="url(#arr)"/>
+  <text class="edge-label" x="582" y="212">subprocess</text><text class="edge-label" x="582" y="226">+ JSON reply</text>
+  <path class="edge" d="M780 268 V 345" marker-end="url(#arr)"/>
+  <text class="edge-label" x="788" y="312">writes</text>
+  <path class="edge" d="M450 290 V 355" marker-end="url(#arr)"/>
+  <text class="edge-label" x="458" y="330">INSERT / UPDATE</text>
+  <path class="edge" d="M200 395 H 690" marker-end="url(#arr)" stroke-dasharray="4 4"/>
+  <text class="edge-label" x="552" y="414">staged files → mochi</text>
+  <path class="edge" d="M570 190 C 640 150 660 110 690 92" marker-end="url(#arr)" stroke-dasharray="4 4"/>
+  <text class="edge-label" x="612" y="140">report (optional)</text>
+
+  <!-- nodes -->
+  <g class="node" data-k="operator"><rect x="20" y="30" width="150" height="56" rx="10" fill="var(--sql-soft)" stroke="var(--sql)"/><text x="95" y="55" text-anchor="middle">Operator</text><text class="sub" x="95" y="72" text-anchor="middle">double-clicks .exe / .bat</text></g>
+  <g class="node" data-k="ui"><rect x="250" y="30" width="220" height="62" rx="10" fill="var(--py-soft)" stroke="var(--py)"/><text x="360" y="56" text-anchor="middle">backup_ui.py</text><text class="sub" x="360" y="74" text-anchor="middle">terminal screens only (rich)</text></g>
+  <g class="node" data-k="sched"><rect x="560" y="30" width="130" height="56" rx="10" fill="var(--sql-soft)" stroke="var(--sql)"/><text x="625" y="55" text-anchor="middle">Task Scheduler</text><text class="sub" x="625" y="72" text-anchor="middle">optional, no screen</text></g>
+  <g class="node" data-k="email"><rect x="700" y="40" width="180" height="50" rx="10" fill="var(--sql-soft)" stroke="var(--sql)"/><text x="790" y="62" text-anchor="middle">Email API</text><text class="sub" x="790" y="78" text-anchor="middle">POST /api/email/send</text></g>
+  <g class="node" data-k="logic"><rect x="330" y="175" width="240" height="115" rx="12" fill="var(--py-soft)" stroke="var(--py)"/><text x="450" y="215" text-anchor="middle">logs_backup.py</text><text class="sub" x="450" y="235" text-anchor="middle">ALL backup decisions</text><text class="sub" x="450" y="252" text-anchor="middle">config · scan · stage · commit</text><text class="sub" x="450" y="268" text-anchor="middle">verify · index · delete · export</text></g>
+  <g class="node" data-k="sql"><rect x="20" y="200" width="180" height="60" rx="10" fill="var(--sql-soft)" stroke="var(--sql)"/><text x="110" y="225" text-anchor="middle">SQL Server</text><text class="sub" x="110" y="243" text-anchor="middle">ForthUtilities (read only)</text></g>
+  <g class="node" data-k="source"><rect x="20" y="335" width="180" height="90" rx="10" fill="var(--db-soft)" stroke="var(--db)"/><text x="110" y="362" text-anchor="middle">Source folders</text><text class="sub" x="110" y="380" text-anchor="middle">D:/logs/BURNIN, ESS, …</text><text class="sub" x="110" y="397" text-anchor="middle">+ .staging/ (same drive)</text></g>
+  <g class="node" data-k="mochi"><rect x="690" y="195" width="190" height="73" rx="10" fill="var(--rs-soft)" stroke="var(--rs)"/><text x="785" y="222" text-anchor="middle">mochi.exe</text><text class="sub" x="785" y="240" text-anchor="middle">MOCHI engine, Rust</text><text class="sub" x="785" y="256" text-anchor="middle">separate program</text></g>
+  <g class="node" data-k="archives"><rect x="690" y="345" width="190" height="80" rx="10" fill="var(--db-soft)" stroke="var(--db)"/><text x="785" y="372" text-anchor="middle">.mochi archives</text><text class="sub" x="785" y="390" text-anchor="middle">E:/archive/2026/</text><text class="sub" x="785" y="406" text-anchor="middle">2026-08.mochi, …</text></g>
+  <g class="node" data-k="index"><rect x="360" y="355" width="180" height="70" rx="10" fill="var(--db-soft)" stroke="var(--db)"/><text x="450" y="382" text-anchor="middle">index.db (SQLite)</text><text class="sub" x="450" y="400" text-anchor="middle">which file is where</text></g>
+</svg>
+<div class="arch-info result" id="arch-info" aria-live="polite"><b>Click a box.</b> Start with <b>logs_backup.py</b> in the middle: everything goes through it.</div>
+</div>
+<script>
+(function () {
+  var info = {
+    operator: ["Operator", "A person at the PC. Starts <code>FinisarLogsBackup.exe</code> or <code>run_backup.bat</code>, reads the plan, and answers <b>yes/no</b> before any file moves. Can also run <code>--dry-run</code>, <code>--check-sql</code> or <code>--export DIR</code>.", "ui.html"],
+    ui: ["backup_ui.py <span class='badge py'>Python</span>", "The <b>screen</b>: progress bars, the yes/no question, the summary table. It makes <b>no backup decisions</b> and cannot move or delete a file. It calls exactly one function, <code>logs_backup.run()</code>, and hands it two small functions (<i>callbacks</i>) to draw progress and ask the question.", "ui.html"],
+    sched: ["Task Scheduler (optional)", "For unattended runs, <code>python logs_backup.py</code> runs the same logic with plain log lines and no questions. Same code path as the UI, minus the screen.", "logs-backup.html#run"],
+    email: ["Email API (optional)", "After a successful run, if <code>email</code> is set in <code>config.json</code>, <code>send_email()</code> POSTs an HTML summary. Failure to send is only a warning: the backup is already done.", "logs-backup.html#export-and-email"],
+    logic: ["logs_backup.py <span class='badge py'>Python</span>", "<b>All the logic</b>, in the order a run executes it: read config → lock → resume leftovers → query SQL Server → scan → stage → commit with MOCHI → verify → index in SQLite → delete staged copies. This is the file to read for a safety review.", "logs-backup.html"],
+    sql: ["SQL Server <span class='badge sql'>external</span>", "Read only. One <code>SELECT DISTINCT</code> returns <code>(barcode, last_update)</code> rows for a date window. Python talks to it with the <code>pymssql</code> library (which uses FreeTDS inside). Nothing is ever written there.", "logs-backup.html#sql-server"],
+    source: ["Source folders + staging <span class='badge db'>disk</span>", "Where the test stations write logs. Matching files are moved (renamed) into <code>.staging/&lt;YYYY-MM&gt;/</code> on the <b>same drive</b>, so the move is instant and atomic. A <code>manifest.jsonl</code> lists every staged file <i>before</i> it moves.", "data.html#staging-and-the-manifest"],
+    mochi: ["mochi.exe <span class='badge rs'>Rust</span>", "The MOCHI archiver, a <b>separate program</b> built from the MOCHI repository. Python never loads Rust code: it <b>starts mochi.exe as a child process</b>, passes arguments, and reads one JSON object from its output. Commands used: <code>--version</code>, <code>create</code>, <code>append</code>, <code>list</code>, <code>verify</code>.", "python-rust.html"],
+    archives: [".mochi archives <span class='badge db'>disk</span>", "One file per month (<code>output_dir/2026/2026-08.mochi</code>). Append-only: each run adds one <b>commit</b>, earlier commits are never rewritten. Only <code>mochi.exe</code> writes these files.", "data.html#inside-a-mochi-archive"],
+    index: ["index.db <span class='badge db'>SQLite</span>", "A small database file. It records each run, each barcode seen, each monthly archive, and each archived file with its BLAKE3 hash, so a file can be found again by barcode. Python's built-in <code>sqlite3</code> module writes it.", "data.html#the-sqlite-index"]
+  };
+  var box = document.getElementById("arch-info");
+  var nodes = document.querySelectorAll(".arch .node");
+  nodes.forEach(function (n) {
+    n.setAttribute("tabindex", "0");
+    n.setAttribute("role", "button");
+    function pick() {
+      nodes.forEach(function (m) { m.classList.toggle("sel", m === n); });
+      var d = info[n.getAttribute("data-k")];
+      box.innerHTML = "<b>" + d[0] + "</b><p style='margin:.4em 0'>" + d[1] + "</p><a href='" + d[2] + "'>Read more →</a>";
+    }
+    n.addEventListener("click", pick);
+    n.addEventListener("keydown", function (e) { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); pick(); } });
+  });
+})();
+</script>
+
+<h2>Two languages, one boundary</h2>
+<div class="grid">
+  <div class="card"><h3><span class="badge py">Python</span> this repository</h3>
+  <p>Decides <i>what</i> to back up and keeps the bookkeeping: config, SQL Server, folder scan, staging, SQLite index, the screen. About 1,200 lines in two files.</p></div>
+  <div class="card"><h3><span class="badge rs">Rust</span> MOCHI repository</h3>
+  <p>Knows <i>how</i> to write an archive safely: compression, deduplication, commits that are never half-written, verification. A large, separately tested project.</p></div>
+</div>
+<p>They meet at a single, narrow point: Python runs <code>mochi.exe --json …</code> as a separate process and reads its JSON answer. There is no shared memory, no library linking, no network. If you can read a command line and a JSON object, you can review the boundary. The full story is on <a href="python-rust.html">Python ↔ MOCHI (Rust)</a>.</p>
+<div class="callout senior"><span class="label">For senior reviewers</span>
+<p>The process boundary is a deliberate choice over Rust bindings (PyO3): it keeps the Python side free of a compiled extension, lets either side be upgraded alone, and makes MOCHI's own exit codes and error codes the contract. The cost is process start-up per command (a few per month per run) and parsing JSON, both negligible next to disk I/O.</p></div>
+
+<h2>Every file in the repository</h2>
+<div class="table-wrap"><table>
+<tr><th>File</th><th>What it is</th><th>Read it when</th></tr>
+<tr><td><code>logs_backup.py</code> <span class="badge py">~920 lines</span></td><td><b>All backup logic</b>, top to bottom in run order. No screen code. Also runnable alone.</td><td>Safety review. <a href="logs-backup.html">Walkthrough</a></td></tr>
+<tr><td><code>backup_ui.py</code> <span class="badge py">~250 lines</span></td><td>Terminal screen built with the <code>rich</code> library: progress, yes/no prompt, summary, <code>--check-sql</code>, <code>--export</code>.</td><td>Changing what the operator sees. <a href="ui.html">UI ↔ logic</a></td></tr>
+<tr><td><code>test_logs_backup.py</code> <span class="badge py">~400 lines</span></td><td>21 automated tests: matching rules, config, full runs, crash recovery, locking, export, finding mochi.</td><td>Checking a claim is proven. <a href="tests-tools.html">Tests</a></td></tr>
+<tr><td><code>bench.py</code></td><td>Benchmark: generates fake logs, times each step.</td><td>Performance work. <a href="tests-tools.html#bench-py">Bench</a></td></tr>
+<tr><td><code>build_exe.bat</code></td><td>Windows: makes <code>.venv</code>, installs libraries, runs the tests, builds one <code>FinisarLogsBackup.exe</code> with PyInstaller.</td><td>Shipping to a PC without Python. <a href="tests-tools.html#build-exe-bat">Build</a></td></tr>
+<tr><td><code>run_backup.bat</code></td><td>Windows launcher: runs <code>backup_ui.py</code> with <code>.venv</code>'s Python if there is one.</td><td>Running from source on Windows.</td></tr>
+<tr><td><code>config.example.json</code></td><td>Template for <code>config.json</code>: paths, SQL login, subfolders, extensions, mochi path.</td><td>Setting up a PC. <a href="data.html#config-json">Config reference</a></td></tr>
+<tr><td><code>requirements.txt</code></td><td>Three Python libraries: <code>blake3</code> (hashing), <code>pymssql</code> (SQL Server), <code>rich</code> (screen).</td><td>Installing.</td></tr>
+<tr><td><code>docs/*.md</code></td><td>The original Markdown docs: how it works, code walkthrough, operations, performance.</td><td>Operating the tool day to day.</td></tr>
+</table></div>
+
+<h2>Pick your reading path</h2>
+<div class="grid">
+  <a class="card" href="run-flow.html"><h3>Junior developer</h3><p>Start with <b>One run, step by step</b>: an animated walk-through where you watch one file travel. Then the Python ↔ Rust page.</p></a>
+  <a class="card" href="python-rust.html"><h3>Senior, new to this stack</h3><p>Go straight to the <b>boundary</b>: how mochi.exe is found, called and trusted. Then <b>logs_backup.py</b>, function by function.</p></a>
+  <a class="card" href="review.html"><h3>Reviewing a change</h3><p>Use the <b>reviewer checklist</b>: the invariants a change must keep, with the test that proves each one. Your ticks are saved in this browser.</p></a>
+</div>
+
+<h2>Python in five minutes (for non-Python readers)</h2>
+<p>You only need these constructs to read every line of this repository.</p>
+<div class="tabs">
+<div role="tablist" aria-label="Python constructs">
+  <button role="tab" aria-controls="py1" id="t-py1">with</button>
+  <button role="tab" aria-controls="py2" id="t-py2">try / finally</button>
+  <button role="tab" aria-controls="py3" id="t-py3">dict, list, tuple</button>
+  <button role="tab" aria-controls="py4" id="t-py4">functions as values</button>
+  <button role="tab" aria-controls="py5" id="t-py5">threads</button>
+  <button role="tab" aria-controls="py6" id="t-py6">subprocess</button>
+</div>
+<div role="tabpanel" id="py1" aria-labelledby="t-py1">
+<pre><code>with lock_run(cfg):           # take the lock
+    return _run(cfg, ...)     # ... released here, even if _run raises
+
+with db:                      # SQLite: one transaction
+    db.execute("INSERT ...")  # committed at the end, rolled back on error</code></pre>
+<p><code>with X:</code> runs set-up code, then the block, then <b>always</b> runs clean-up, even after an error. Like C#'s <code>using</code>, Java's try-with-resources, Go's <code>defer</code>, or Rust's <code>Drop</code>. On a SQLite connection, <code>with db:</code> means "one transaction" (it does <b>not</b> close the connection).</p>
+</div>
+<div role="tabpanel" id="py2" aria-labelledby="t-py2">
+<pre><code>db = open_index(cfg.db_path)
+try:
+    return _run_with_index(db, ...)
+finally:
+    db.close()        # runs whether the try block returned or raised</code></pre>
+<p><code>raise</code> throws an exception, <code>except E as e:</code> catches it. Expected failures are <code>BackupError</code>; the UI shows its message to the operator.</p>
+</div>
+<div role="tabpanel" id="py3" aria-labelledby="t-py3">
+<pre><code>entry = {"relative_path": "BURNIN/unit1_BC001_log.txt", "barcode": "BC001"}   # dict = map/object
+months = defaultdict(list)            # dict that starts each new key with []
+head = (seq, commit_id)               # tuple = fixed small group of values
+fresh = [(b, d) for b, d in rows if ...]   # list comprehension = map + filter</code></pre>
+</div>
+<div role="tabpanel" id="py4" aria-labelledby="t-py4">
+<pre><code>def quiet(step, message="", done=0, total=None):
+    pass                                  # does nothing
+
+lb.run(cfg, report=steps, confirm=ask)    # pass functions in, like callbacks/lambdas
+lambda *_: CANDIDATES                     # tiny anonymous function ignoring its arguments</code></pre>
+<p>Functions are ordinary values. This is how the UI plugs its drawing code into the logic without the logic knowing anything about screens. Tests use the same trick to replace SQL Server with a fixed list.</p>
+</div>
+<div role="tabpanel" id="py5" aria-labelledby="t-py5">
+<pre><code>with ThreadPoolExecutor(8) as pool:
+    job = pool.submit(commit_month, cfg, "2026-08", entries)  # starts on a worker thread
+    hashes, head = job.result()                               # waits; re-raises its error here</code></pre>
+<p>Several months are committed at the same time on worker threads. Worker threads only run <code>mochi.exe</code> and hash files. <b>SQLite writes and file deletes stay on the main thread</b>, which keeps ordering simple to reason about.</p>
+</div>
+<div role="tabpanel" id="py6" aria-labelledby="t-py6">
+<pre><code>p = subprocess.run([exe, "--json", "list", archive], capture_output=True, text=True)
+p.returncode      # mochi's exit code (0 = ok)
+p.stdout          # what mochi printed: one JSON object
+json.loads(p.stdout)   # -> Python dict</code></pre>
+<p>This is the whole bridge to Rust: start a program, wait for it, read its exit code and output.</p>
+</div>
+</div>
+
+<h2>Words used in this guide</h2>
+<div class="table-wrap"><table>
+<tr><th>Word</th><th>Meaning here</th></tr>
+<tr><td>Barcode</td><td>Product serial number from SQL Server (<code>serial_no</code>), also found inside log file names.</td></tr>
+<tr><td>Candidate</td><td>A barcode returned by SQL Server for the current date window: its logs may be archived.</td></tr>
+<tr><td>Month / volume</td><td><code>YYYY-MM</code> of the barcode's <code>last_update</code>. One archive file per month.</td></tr>
+<tr><td>Staging</td><td><code>source_dir/.staging/</code>: the waiting room between the source folders and the archive.</td></tr>
+<tr><td>Manifest</td><td><code>.staging/manifest.jsonl</code>: one JSON line per staged file, written and flushed to disk <i>before</i> the file moves.</td></tr>
+<tr><td>Commit</td><td>One write to a <code>.mochi</code> archive. Either fully there or not at all. Numbered by <code>seq</code> (0, 1, 2, …).</td></tr>
+<tr><td>Head</td><td>The newest commit of an archive: what <code>mochi list</code> shows.</td></tr>
+<tr><td>BLAKE3</td><td>A fast cryptographic hash. Two files with the same BLAKE3 have the same bytes. Python and MOCHI compute it the same way, which is how Python checks MOCHI's work.</td></tr>
+<tr><td>LOCAL_COMMITTED</td><td>The final state of a run: data written and synced to <b>one</b> local archive. Not a backup by itself; <code>--export</code> makes an independent copy.</td></tr>
+<tr><td>DEGRADED (not an error)</td><td>MOCHI's warning that the data is committed but the operating system did not confirm the folder entry is durable. Always printed on Windows.</td></tr>
+</table></div>
+
+</main>
+</div>
+</body>
+</html>
