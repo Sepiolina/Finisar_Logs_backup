@@ -77,7 +77,7 @@ next to the `.exe`. See [Single-file .exe](docs/operations.md#single-file-exe-wi
 | Output | Layout |
 |---|---|
 | Archives | `<output_dir>/<YYYY>/<YYYY-MM>.mochi`, month from the barcode's `last_update` |
-| Paths in an archive | `<SUBFOLDER>/<filename>`, for example `BURNIN/unit1_BC001_log.txt` |
+| Paths in an archive | `<SUBFOLDER>/<filename>`, for example `BURNIN/unit1_BC001_log.txt`; files in deeper folders keep them (`BURNIN/line2/unit1_BC001_log.txt`) |
 | SQLite index | Same 4 tables and `user_version = 2`, with a BLAKE3 `content_hash` and `commit_seq` per file |
 | Manifest | `manifest.jsonl` in the same line format |
 
@@ -89,6 +89,7 @@ Deliberate differences:
 - **Verify checks the whole month each run**, not only the new commit. This makes appends to big months a few seconds slower (see [performance](docs/performance.md)).
 - **Staging defaults to `source_dir/.staging`**, not `output_dir/.staging`. Files move into staging by rename, which only works on the same drive.
 - **Added: a run lock**, so two runs started at once cannot share staging.
+- **Scans folders inside each subfolder too** (`"recursive": true`, the default), keeping them in the archive paths. The original read only files directly in each subfolder; `"recursive": false` does the same.
 
 A run ends **committed (LOCAL_COMMITTED)**. That is not a backup on its own:
 keep an independent copy of the output folder and of the SQLite index.

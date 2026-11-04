@@ -92,7 +92,8 @@ variable if set, otherwise from `sql_server` in the file. `cfg.manifest` and
 |---|---|
 | `find_barcodes(name, barcodes)` | Lists every position a barcode may start (start of name, or after a delimiter) and may end (end of name, or before a delimiter), and checks each substring between them against the barcode set. Same results as the original's Aho-Corasick search, with no extra library. |
 | `has_extension(name, extensions)` | Text after the last `.`, compared without case. |
-| `scan(cfg, dates, report)` | Reads each subfolder with `os.scandir` as it goes, so a huge folder is never held in memory whole (not recursive, symlinks not followed). Keeps files with an allowed extension and exactly one barcode. Returns manifest-ready dicts. A missing subfolder or an ambiguous name counts as an error and does not stop the run. |
+| `walk_files(top, recursive, skip, on_error)` | Yields each file under `top` with the folder path between them, reading each folder with `os.scandir` as it goes (a huge folder is never held in memory whole). With `recursive` it descends into every folder except those in `skip`; links are not followed. An unreadable folder goes to `on_error` and is skipped. |
+| `scan(cfg, dates, report)` | Walks each subfolder (`cfg.recursive`, default on), never entering the staging or output folders. Keeps files with an allowed extension and exactly one barcode in the file name; `relative_path` keeps the folders (`BURNIN/line2/x_BC001.txt`), `source_subfolder` is the top folder. Returns manifest-ready dicts. A missing or unreadable folder or an ambiguous name counts as an error and does not stop the run. |
 
 ### Stage
 
@@ -115,7 +116,8 @@ safe to resume. A broken last line (a crash mid-write) is skipped.
 
 | Function | What it does |
 |---|---|
-| `mochi_places(configured)` | Where to look for `mochi`: only the configured path if one is set (`"mochi"` alone counts as unset), else PATH, cargo's bin folder, next to the program, and a `MOCHI` checkout beside it. |
+| `registry_mochi(reg)` | Windows only: the `mochi.exe` paths the MOCHI setup recorded: `App Paths\mochi.exe` (setup 0.9.15+, `HKCU` then `HKLM`), then MOCHI's install-location key plus `bin\mochi.exe` (setup 0.9.14). `reg` is `winreg`; tests pass a stand-in. |
+| `mochi_places(configured)` | Where to look for `mochi`: only the configured path if one is set (`"mochi"` alone counts as unset), else the registry (`registry_mochi`), PATH, the setup's `bin` folder, cargo's bin folder, next to the program, and a `MOCHI` checkout beside it. |
 | `check_mochi(cfg)` | Tries each place with `mochi --version` and sets `cfg.mochi` to the full path of the first that works. Called first in every run, before resuming or moving anything. A real run stops if none works, listing every place tried (and noting if only the desktop app is installed); a dry run logs a warning. Also shown by `--check-sql`. |
 | `mochi(cfg, *args)` | Runs `mochi --json --no-local-history ARGS`. Exit 0 and 2 pass (2 = committed or checked, with a warning such as unconfirmed folder durability). Any other exit raises `BackupError` with MOCHI's error code. |
 | `head_files(cfg, archive)` | `mochi list`: returns `{path: BLAKE3}` of the archive head, plus `(seq, commit_id)`. |
@@ -134,7 +136,8 @@ safe to resume. A broken last line (a crash mid-write) is skipped.
 
 | Function | What it does |
 |---|---|
-| `lock_run(cfg)` | Takes an OS file lock on `output_dir/.backup.lock` (`msvcrt` on Windows, `fcntl` elsewhere). A second run at the same time gets a clear `BackupError`. |
+| `lock_run(cfg)` | Creates `output_dir` if needed, then takes an OS file lock on `output_dir/.backup.lock` (`msvcrt` on Windows, `fcntl` elsewhere). A second run at the same time gets a clear `BackupError`. |
+| `prepare_folders(cfg)` | Real runs, after `mochi` is found: creates `output_dir`, `staging_dir` and the index's folder if missing, with a clear `BackupError` if one cannot be made. `source_dir` is never created (a missing one is a wrong setting): it only logs a warning. |
 | `plan(entries)` | `{month: (barcodes, files, bytes)}`. One helper for both what a run would archive (confirm, dry run) and what it did archive (summary), so the two always count the same way. |
 | `export(cfg, target, report)` | `--export`: under the run lock, copies the archives (skipping ones unchanged since the last export, per `export-manifest.json`), the index via SQLite's backup API, the config without its password, and staging if present. Writes `RESTORE.txt`. Refuses a target inside `source_dir` or `output_dir`. |
 | `copy_checked(src, dst)` | Copies through a `.partial` file, hashing while reading. The copy is hashed again and must match before it replaces `dst`. |
@@ -172,6 +175,10 @@ MOCHI_BIN=/path/to/mochi python -m unittest -v
 | `test_backspace_in_a_path_is_refused` | `"E:\backup"` in JSON is caught |
 | `test_sql_errors_are_one_readable_line_with_a_hint` | Your error 20002, a stale code from `pymssql`, login failure, a bad `encryption` value |
 | `test_export_copies_checked_and_skips_unchanged` | Export layout and hashes, password removed, a second export copies no archive, a target inside `output_dir` is refused |
+| `test_mochi_path_from_the_registry` | App Paths read first, then the install key plus `bin`; nothing found; no registry off Windows; the registry comes before PATH and a set path still wins |
+| `test_recursive_scan_keeps_folders_and_appends_into_them` | Nested files archived with their folders, the same name in two folders, the index rows; a later run adds to an existing nested folder and keeps the earlier file |
+| `test_recursive_off_and_staging_inside_a_subfolder` | `"recursive": false` scans one level; a staging folder inside a subfolder is never scanned; a non-boolean `recursive` is refused |
+| `test_missing_output_staging_and_index_folders_are_created` | Missing output, staging and index folders are created by a run; a folder that cannot be created gives a clear error |
 | `test_mochi_is_found_without_a_config_path` | Finds `mochi` in a MOCHI checkout beside the program and in cargo's bin folder; lists the places when missing; notes a desktop-only install |
 | `test_missing_mochi_moves_nothing` | No `mochi`: a real run stops before staging, a dry run warns |
 | `test_config_is_found_without_an_argument` | Current folder first, then next to the program, a given path wins, a clear error when none exists |

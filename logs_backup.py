@@ -135,6 +135,9 @@ class Config:
         self.db_path = Path(raw["db_path"])
         self.subfolders = raw.get("subfolders", ["BURNIN", "ESS", "JTAG", "STM", "Xray"])
         self.extensions = {e.lstrip(".").lower() for e in raw.get("extensions", ["txt", "zip"])}
+        self.recursive = raw.get("recursive", True)  # scan folders inside each subfolder too
+        if not isinstance(self.recursive, bool):
+            raise BackupError('"recursive" in config.json must be true or false')
         self.lookback_days = raw.get("lookback_days", 2)
         self.date_range = raw.get("date_range")  # optional ["YYYY-MM-DD", "YYYY-MM-DD"]
         self.mochi = raw.get("mochi")  # None: found by check_mochi() (PATH, cargo's bin, a MOCHI checkout)
@@ -310,34 +313,55 @@ def has_extension(name, extensions):
     return "." in name and name.rsplit(".", 1)[1].lower() in extensions
 
 
-def scan(cfg, dates, report=quiet):
-    """Matched files as manifest entries, plus error and scanned-file counts. Not recursive."""
-    entries, errors, seen = [], 0, 0
-    for sub in cfg.subfolders:
+def walk_files(top, recursive, skip, on_error):
+    """Yields (folder path below `top` ending in "/", or "", DirEntry) for each file in `top`, and with
+    `recursive` in every folder below it. Folders are read as they go (never held whole in memory);
+    symlinks are not followed and folders in `skip` are not entered. An unreadable folder is passed
+    to on_error(folder, error) and skipped."""
+    stack = [(Path(top), "")]
+    while stack:
+        folder, rel = stack.pop()
         try:
-            listing = os.scandir(cfg.source_dir / sub)  # read as it goes, never held whole in memory
+            with os.scandir(folder) as listing:
+                for item in listing:
+                    if item.is_dir(follow_symlinks=False):
+                        if recursive and Path(item.path).resolve() not in skip:
+                            stack.append((Path(item.path), f"{rel}{item.name}/"))
+                    elif item.is_file(follow_symlinks=False):
+                        yield rel, item
         except OSError as e:
-            log.warning("skipping subfolder %s: %s", sub, e)
-            errors += 1
-            continue
-        with listing:
-            for item in listing:
-                seen += 1
-                if seen % 2000 == 0:
-                    report("scan", f"{len(entries)} matches", seen)
-                if not item.is_file(follow_symlinks=False) or not has_extension(item.name, cfg.extensions):
-                    continue
-                found = find_barcodes(item.name, dates)
-                if len(found) != 1:
-                    errors += len(found) > 1  # several barcodes: ambiguous
-                    continue
-                barcode = found.pop()
-                month = dates[barcode][:7]
-                if not (len(month) == 7 and month[:4].isdigit() and month[4] == "-" and month[5:].isdigit()):
-                    errors += 1
-                    continue
-                entries.append({"relative_path": f"{sub}/{item.name}", "source_subfolder": sub,
-                                "barcode": barcode, "original_size": item.stat().st_size, "volume_name": month})
+            on_error(folder, e)
+
+
+def scan(cfg, dates, report=quiet):
+    """Matched files as manifest entries, plus error and scanned-file counts. Each subfolder is scanned
+    at every depth (config "recursive", default on); the staging and output folders are never entered."""
+    entries, errors, seen = [], 0, 0
+    skip = {cfg.staging_dir.resolve(), cfg.output_dir.resolve()}
+
+    def unreadable(folder, e):
+        nonlocal errors
+        log.warning("skipping folder %s: %s", folder, e)
+        errors += 1
+
+    for sub in cfg.subfolders:
+        for rel, item in walk_files(cfg.source_dir / sub, cfg.recursive, skip, unreadable):
+            seen += 1
+            if seen % 2000 == 0:
+                report("scan", f"{len(entries)} matches", seen)
+            if not has_extension(item.name, cfg.extensions):
+                continue
+            found = find_barcodes(item.name, dates)
+            if len(found) != 1:
+                errors += len(found) > 1  # several barcodes: ambiguous
+                continue
+            barcode = found.pop()
+            month = dates[barcode][:7]
+            if not (len(month) == 7 and month[:4].isdigit() and month[4] == "-" and month[5:].isdigit()):
+                errors += 1
+                continue
+            entries.append({"relative_path": f"{sub}/{rel}{item.name}", "source_subfolder": sub,
+                            "barcode": barcode, "original_size": item.stat().st_size, "volume_name": month})
     report("scan", f"{len(entries)} matches", seen, seen)
     log.info("scanned %d files, %d matches", seen, len(entries))
     return entries, errors, seen
@@ -401,17 +425,43 @@ def read_manifest(cfg):
 MOCHI_EXE = "mochi.exe" if os.name == "nt" else "mochi"
 
 
+APP_PATHS_KEY = r"Software\Microsoft\Windows\CurrentVersion\App Paths\mochi.exe"
+MOCHI_INSTALL_KEY = r"Software\The MOCHI Project contributors\MOCHI"  # Tauri's install-location key
+
+
+def registry_mochi(reg=None):
+    """mochi.exe paths the MOCHI setup recorded in the Windows registry ([] elsewhere), in order:
+    App Paths\\mochi.exe (setup 0.9.15+; per user, then per machine), then Tauri's install-location
+    key plus bin\\mochi.exe (setup 0.9.14). `reg` is the winreg module (tests pass a stand-in)."""
+    if reg is None:
+        if os.name != "nt":
+            return []
+        import winreg as reg
+    found = []
+    for root, key, add in ((reg.HKEY_CURRENT_USER, APP_PATHS_KEY, ""), (reg.HKEY_LOCAL_MACHINE, APP_PATHS_KEY, ""),
+                           (reg.HKEY_CURRENT_USER, MOCHI_INSTALL_KEY, "bin")):
+        try:
+            with reg.OpenKey(root, key) as k:
+                value = reg.QueryValueEx(k, "")[0]
+        except OSError:
+            continue
+        if value:
+            value = os.path.expandvars(str(value).strip('"'))
+            found.append(str(Path(value) / add / MOCHI_EXE) if add else value)
+    return found
+
+
 def mochi_places(configured):
     """Where to look for the mochi command-line program, in order. A path set in config.json is the
-    only place used; otherwise PATH, the MOCHI setup's bin folder (%LOCALAPPDATA%/MOCHI/bin, also
-    found here when a terminal opened before the install has the old PATH), cargo's bin folder,
-    next to this program, and a MOCHI checkout beside this one
-    (D:/GitHub/MOCHI/target/release/mochi.exe next to D:/GitHub/Finisar_Logs_backup)."""
+    only place used; otherwise the path the MOCHI setup registered (registry_mochi), PATH, the MOCHI
+    setup's bin folder (%LOCALAPPDATA%/MOCHI/bin), cargo's bin folder, next to this program, and a
+    MOCHI checkout beside this one (D:/GitHub/MOCHI/target/release/mochi.exe next to
+    D:/GitHub/Finisar_Logs_backup)."""
     if configured and configured != "mochi":  # "mochi" (the old example config) also means: find it
         return [str(configured)]
     here = program_dir()
     setup = os.environ.get("LOCALAPPDATA")
-    places = [shutil.which("mochi"), setup and Path(setup) / "MOCHI" / "bin" / MOCHI_EXE,
+    places = [*registry_mochi(), shutil.which("mochi"), setup and Path(setup) / "MOCHI" / "bin" / MOCHI_EXE,
               Path.home() / ".cargo" / "bin" / MOCHI_EXE, here / MOCHI_EXE,
               here.parent / "MOCHI" / "target" / "release" / MOCHI_EXE,
               here.parent / "mochi" / "target" / "release" / MOCHI_EXE]
@@ -599,7 +649,10 @@ def lock_run(cfg):
     """Holds <output_dir>/.backup.lock so two runs never share staging. Returns the open lock file.
 
     The OS releases the lock when the process ends, even after a crash, so it never goes stale."""
-    cfg.output_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        cfg.output_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise BackupError(f"cannot create output_dir {cfg.output_dir}: {e.strerror or e}") from e
     lock = open(cfg.output_dir / ".backup.lock", "a+b")
     try:
         if os.name == "nt":
@@ -636,6 +689,19 @@ def run(cfg, candidates_fn=None, dry_run=False, report=quiet, confirm=None):
         return _run(cfg, candidates_fn, dry_run, report, confirm)
 
 
+def prepare_folders(cfg):
+    """Creates the output, staging and index folders if they do not exist yet. The source folder is
+    never created: a missing one is a wrong setting, and the scan says so."""
+    for name, folder in (("output_dir", cfg.output_dir), ("staging_dir", cfg.staging_dir),
+                         ("db_path's folder", cfg.db_path.parent)):
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            raise BackupError(f"cannot create {name} {folder}: {e.strerror or e}") from e
+    if not cfg.source_dir.is_dir():
+        log.warning("source_dir %s does not exist: nothing to scan", cfg.source_dir)
+
+
 def _run(cfg, candidates_fn, dry_run, report, confirm):
     # Checked before anything moves: without mochi, staged files could not be committed.
     try:
@@ -644,6 +710,8 @@ def _run(cfg, candidates_fn, dry_run, report, confirm):
         if not dry_run:
             raise
         log.warning("a real run would stop here: %s", e)
+    if not dry_run:
+        prepare_folders(cfg)
     db = open_index(cfg.db_path)
     resumed = 0
     if not dry_run and cfg.manifest.exists():

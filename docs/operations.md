@@ -33,12 +33,16 @@ Install, configure, run, get files back, move to another PC, and fix problems.
 
    With `"mochi": null` in the config (the default), the tool finds it on its own.
    It looks in this order:
-   1. PATH
-   2. `%LOCALAPPDATA%\MOCHI\bin` (the MOCHI setup; found even from a terminal opened
+   1. **the Windows registry**, where the MOCHI setup records it: setup 0.9.15 and later write
+      `HKCU\Software\Microsoft\Windows\CurrentVersion\App Paths\mochi.exe` (also read from
+      `HKLM`); for setup 0.9.14 the tool reads MOCHI's install folder
+      (`HKCU\Software\The MOCHI Project contributors\MOCHI`) and adds `bin\mochi.exe`
+   2. PATH
+   3. `%LOCALAPPDATA%\MOCHI\bin` (the MOCHI setup; found even from a terminal opened
       before the install, which still has the old PATH)
-   3. `%USERPROFILE%\.cargo\bin` (where `cargo install --path crates/mochi-cli` puts it)
-   4. next to `backup_ui.py`
-   5. a MOCHI checkout beside this one, such as `D:/GitHub/MOCHI/target/release/mochi.exe`
+   4. `%USERPROFILE%\.cargo\bin` (where `cargo install --path crates/mochi-cli` puts it)
+   5. next to `backup_ui.py` (or the `.exe`)
+   6. a MOCHI checkout beside this one, such as `D:/GitHub/MOCHI/target/release/mochi.exe`
       next to `D:/GitHub/Finisar_Logs_backup`
 
    Anywhere else, set the full path, for example
@@ -106,11 +110,12 @@ path last, for example `python backup_ui.py --dry-run D:/configs/line2.json`.
 | Key | Default | Meaning |
 |---|---|---|
 | `source_dir` | required | Folder that holds the subfolders below |
-| `output_dir` | required | Where `YYYY/YYYY-MM.mochi` archives go |
+| `output_dir` | required | Where `YYYY/YYYY-MM.mochi` archives go. Created if missing. |
 | `db_path` | required | SQLite index file. Its folder is created if missing. |
 | `sql_server` | none | SQL Server login, see below |
-| `staging_dir` | `source_dir/.staging` | Must be on the **same drive** as `source_dir`: files are moved there by rename. A run refuses to start staging otherwise. Not scanned, because only the subfolders are. |
-| `subfolders` | `BURNIN, ESS, JTAG, STM, Xray` | Scanned one level deep |
+| `staging_dir` | `source_dir/.staging` | Must be on the **same drive** as `source_dir`: files are moved there by rename. A run refuses to start staging otherwise. Created if missing. Never scanned, even inside a subfolder. |
+| `subfolders` | `BURNIN, ESS, JTAG, STM, Xray` | The folders scanned under `source_dir` |
+| `recursive` | `true` | `true`: also scan every folder inside each subfolder, at any depth, keeping those folders in the archive paths (`BURNIN/line2/unit1_BC001_log.txt`). `false`: only files directly in each subfolder. |
 | `extensions` | `txt, zip` | Allowed file extensions |
 | `lookback_days` | `2` | The newest `N` days are left for the next run |
 | `date_range` | none | `["YYYY-MM-DD", "YYYY-MM-DD"]` to back-fill a fixed window instead |
