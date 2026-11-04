@@ -13,6 +13,7 @@
   },
   "subfolders": ["BURNIN", "ESS", "JTAG", "STM", "Xray"],
   "extensions": ["txt", "zip"],
+  "recursive": true,
   "lookback_days": 2,
   "date_range": null,
   "mochi": null,

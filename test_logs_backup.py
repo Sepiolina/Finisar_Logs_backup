@@ -1,4 +1,5 @@
 """Tests. The flow tests need the `mochi` CLI (on PATH or in $MOCHI_BIN): python -m unittest -v"""
+import contextlib
 import json
 import os
 import shutil
@@ -98,6 +99,34 @@ class ConfigFile(unittest.TestCase):
                 (tmp / "exe").mkdir()
                 (tmp / "exe" / "config.json").write_text("{}")
                 self.assertEqual(lb.find_config().resolve(), (tmp / "exe" / "config.json").resolve())  # next to the .exe
+
+    def test_mochi_path_from_the_registry(self):
+        class FakeReg:  # stands in for winreg, which exists only on Windows
+            HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE = "HKCU", "HKLM"
+
+            def __init__(self, values):
+                self.values = values
+
+            def OpenKey(self, root, key):
+                if (root, key) not in self.values:
+                    raise FileNotFoundError(key)
+                return contextlib.nullcontext((root, key))
+
+            def QueryValueEx(self, k, name):
+                return self.values[k], 1
+
+        both = FakeReg({("HKCU", lb.APP_PATHS_KEY): r"C:\Users\u\AppData\Local\MOCHI\bin\mochi.exe",
+                        ("HKCU", lb.MOCHI_INSTALL_KEY): r"C:\Users\u\AppData\Local\MOCHI"})
+        found = lb.registry_mochi(both)
+        self.assertEqual(found[0], r"C:\Users\u\AppData\Local\MOCHI\bin\mochi.exe")  # App Paths first (0.9.15)
+        self.assertEqual(len(found), 2)
+        self.assertTrue(found[1].endswith(lb.MOCHI_EXE) and "bin" in found[1])  # install key + bin (0.9.14)
+        self.assertEqual(lb.registry_mochi(FakeReg({})), [])
+        if os.name != "nt":
+            self.assertEqual(lb.registry_mochi(), [])  # no registry off Windows
+        with unittest.mock.patch.object(lb, "registry_mochi", lambda: ["/reg/mochi"]):
+            self.assertEqual(lb.mochi_places(None)[0], "/reg/mochi")  # before PATH and the other places
+            self.assertEqual(lb.mochi_places("C:/tools/mochi.exe"), ["C:/tools/mochi.exe"])  # a set path wins
 
     def test_index_folder_is_created(self):
         tmp = Path(tempfile.mkdtemp())
@@ -260,6 +289,62 @@ class Flow(unittest.TestCase):
             cfg.mochi = None
             with self.assertRaisesRegex(lb.BackupError, "desktop app is installed, but this version of its setup does not include"):
                 lb.check_mochi(cfg)
+
+    def test_recursive_scan_keeps_folders_and_appends_into_them(self):
+        self.write("BURNIN/line2/2026-08/unit3_BC001_log.txt", b"nested")
+        self.write("BURNIN/line3/unit1_BC001_log.txt", b"same name, other folder")
+        self.write("BURNIN/line3/deep/er/x_BC002.txt", b"deeper")
+        self.run_backup()
+        files, _ = self.head("2026-08")
+        self.assertEqual(sorted(files), ["BURNIN/line2/2026-08/unit3_BC001_log.txt",
+                                         "BURNIN/line3/unit1_BC001_log.txt", "BURNIN/unit1_BC001_log.txt"])
+        self.assertIn("BURNIN/line3/deep/er/x_BC002.txt", self.head("2026-07")[0])
+        rows = sqlite3.connect(self.cfg.db_path).execute(
+            "SELECT relative_path, source_subfolder FROM scanned_log_entry WHERE relative_path LIKE '%line2%'").fetchall()
+        self.assertEqual(rows, [("BURNIN/line2/2026-08/unit3_BC001_log.txt", "BURNIN")])
+        self.assertFalse(self.cfg.staging_dir.exists())
+        # A later file in an existing folder merges into it: the earlier ones stay in the head.
+        self.write("BURNIN/line2/2026-08/unit4_BC001_log.txt", b"later")
+        self.run_backup()
+        files, seq = self.head("2026-08")
+        self.assertEqual(seq, 1)
+        self.assertIn("BURNIN/line2/2026-08/unit3_BC001_log.txt", files)
+        self.assertIn("BURNIN/line2/2026-08/unit4_BC001_log.txt", files)
+
+    def test_recursive_off_and_staging_inside_a_subfolder(self):
+        raw = json.loads(self.cfg.path.read_text())
+        raw.update(recursive=False, staging_dir=str(self.cfg.source_dir / "BURNIN" / "staging"))
+        self.cfg.path.write_text(json.dumps(raw))
+        cfg = lb.Config(self.cfg.path)
+        self.write("BURNIN/line2/unit3_BC001_log.txt", b"nested")
+        self.write("BURNIN/staging/stray_BC001.txt", b"inside staging")
+        entries, _, _ = lb.scan(cfg, dict(self.CANDIDATES))
+        self.assertEqual(sorted(e["relative_path"] for e in entries), ["BURNIN/unit1_BC001_log.txt", "ESS/unit2_BC002.txt"])
+        raw["recursive"] = True
+        self.cfg.path.write_text(json.dumps(raw))
+        entries, _, _ = lb.scan(lb.Config(self.cfg.path), dict(self.CANDIDATES))
+        paths = sorted(e["relative_path"] for e in entries)
+        self.assertIn("BURNIN/line2/unit3_BC001_log.txt", paths)
+        self.assertNotIn("BURNIN/staging/stray_BC001.txt", paths)  # the staging folder is never scanned
+        raw["recursive"] = "yes"
+        self.cfg.path.write_text(json.dumps(raw))
+        with self.assertRaisesRegex(lb.BackupError, '"recursive"'):
+            lb.Config(self.cfg.path)
+
+    def test_missing_output_staging_and_index_folders_are_created(self):
+        raw = json.loads(self.cfg.path.read_text())
+        raw.update(output_dir=str(self.tmp / "new" / "out"), db_path=str(self.tmp / "new" / "db" / "index.db"),
+                   staging_dir=str(self.tmp / "src" / "new-staging"))
+        self.cfg.path.write_text(json.dumps(raw))
+        cfg = lb.Config(self.cfg.path)
+        self.assertEqual(lb.run(cfg, lambda *_: self.CANDIDATES)["files_moved"], 2)
+        self.assertTrue((self.tmp / "new" / "out" / "2026" / "2026-08.mochi").is_file())
+        self.assertTrue((self.tmp / "new" / "db" / "index.db").is_file())
+        (self.tmp / "blocker").write_text("a file, not a folder")
+        raw["output_dir"] = str(self.tmp / "blocker" / "out")
+        self.cfg.path.write_text(json.dumps(raw))
+        with self.assertRaisesRegex(lb.BackupError, "cannot create output_dir"):
+            lb.run(lb.Config(self.cfg.path), lambda *_: self.CANDIDATES)
 
     def test_missing_mochi_moves_nothing(self):
         self.cfg.mochi = str(self.tmp / "missing-mochi")

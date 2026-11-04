@@ -12,7 +12,7 @@ flowchart TD
     R -- yes --> RF[Finish that batch first:<br/>commit, verify, index, delete]
     RF --> Q
     R -- no --> Q[Query SQL Server for<br/>barcode + last_update in the window]
-    Q --> S[Scan each subfolder, not recursive:<br/>extension allowed + exactly one barcode]
+    Q --> S[Scan each subfolder and the folders in it:<br/>extension allowed + exactly one barcode]
     S --> C{UI only:<br/>confirm?}
     C -- no --> X[Stop. Nothing moved,<br/>nothing recorded]
     C -- yes --> B[Record session + barcode statuses]
@@ -38,7 +38,8 @@ overlap catches rows that arrived late.
 
 ### Which files match
 
-A file in `<source_dir>/<SUBFOLDER>/` (not in deeper folders) matches when:
+A file in `<source_dir>/<SUBFOLDER>/`, or in any folder below it (`"recursive": true`, the
+default; `false` scans only the subfolder itself), matches when:
 
 1. its extension (after the last `.`) is in `extensions` (case does not matter), and
 2. its name contains **exactly one** candidate barcode that has `_`, `.`, `-`,
@@ -50,6 +51,11 @@ left alone.
 
 The archive month is the barcode's `last_update` month from SQL Server, not
 today's month.
+
+The scan never enters the staging or output folders (even if they sit inside a
+subfolder) and does not follow links. A folder it cannot read is skipped with a
+warning and counted as an error; the rest of the scan goes on. Only the file name
+is matched, not the names of the folders above it.
 
 ## What it leaves on disk
 
@@ -70,7 +76,9 @@ backup.log                   full run log, written by backup_ui.py next to confi
 ### Inside an archive
 
 A `.mochi` file is an append-only chain of commits. Each run adds **one commit**
-to each month it touched. Paths inside are `<SUBFOLDER>/<filename>`:
+to each month it touched. Paths inside are `<SUBFOLDER>/<filename>`, with any folders
+between them kept (`BURNIN/line2/2026-08/unit3_BC001_log.txt`). A later file in a folder
+the archive already has is added to that folder; the earlier files stay:
 
 ```
 2026-08.mochi
