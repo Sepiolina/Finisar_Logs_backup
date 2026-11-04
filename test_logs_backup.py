@@ -154,7 +154,9 @@ class Flow(unittest.TestCase):
     CANDIDATES = [("BC001", "2026-08-03 10:00:00"), ("BC002", "2026-07-30 09:00:00"), ("BC404", "2026-08-01 00:00:00")]
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        # resolve(): on Windows the temp folder can come as a short 8.3 name (C:\Users\IT_113~1\...),
+        # while check_mochi reports the full name (C:\Users\IT_113280\...).
+        self.tmp = Path(tempfile.mkdtemp()).resolve()
         self.addCleanup(shutil.rmtree, self.tmp)
         # On Windows every commit warns "DEGRADED (not an error)": expected, so not printed here.
         logger = logging.getLogger("logs_backup")
