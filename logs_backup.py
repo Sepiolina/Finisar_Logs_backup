@@ -166,9 +166,22 @@ class Config:
 # ---------------------------------------------------------------- SQLite index
 
 def open_index(path):
+    """Opens (or creates) the SQLite index. The caller closes it: on Windows an open connection
+    keeps index.db locked, so nothing can move or delete it until then."""
     path.parent.mkdir(parents=True, exist_ok=True)  # SQLite creates the file, not its folder
     try:
         db = sqlite3.connect(path)
+    except sqlite3.Error as e:
+        raise BackupError(f"cannot open the index {path}: {e}") from e
+    try:
+        return _check_index(db, path)
+    except BaseException:
+        db.close()
+        raise
+
+
+def _check_index(db, path):
+    try:
         db.execute("PRAGMA user_version")
     except sqlite3.Error as e:
         raise BackupError(f"cannot open the index {path}: {e}") from e
@@ -713,6 +726,13 @@ def _run(cfg, candidates_fn, dry_run, report, confirm):
     if not dry_run:
         prepare_folders(cfg)
     db = open_index(cfg.db_path)
+    try:
+        return _run_with_index(db, cfg, candidates_fn, dry_run, report, confirm)
+    finally:
+        db.close()  # an open connection keeps index.db locked on Windows
+
+
+def _run_with_index(db, cfg, candidates_fn, dry_run, report, confirm):
     resumed = 0
     if not dry_run and cfg.manifest.exists():
         report("resume", "finishing the batch an earlier run left in staging")

@@ -1,6 +1,7 @@
 """Tests. The flow tests need the `mochi` CLI (on PATH or in $MOCHI_BIN): python -m unittest -v"""
 import contextlib
 import json
+import logging
 import os
 import shutil
 import sqlite3
@@ -12,6 +13,14 @@ from pathlib import Path
 import logs_backup as lb
 
 MOCHI = os.environ.get("MOCHI_BIN") or shutil.which("mochi")
+
+
+def connect(test, path):
+    """A SQLite connection closed when the test ends: an open one keeps the file locked on Windows,
+    so the temp folder could not be deleted."""
+    db = sqlite3.connect(path)
+    test.addCleanup(db.close)
+    return db
 
 
 class Matching(unittest.TestCase):
@@ -73,7 +82,12 @@ class ConfigFile(unittest.TestCase):
     def test_encryption_values(self):
         for given, mode in [(None, "request"), ("request", "request"), (False, "off"), ("off", "off"),
                             ("false", "off"), ("0", "off"), (True, "require"), ("require", "require"), ("1", "require")]:
-            lb.set_encryption(given)
+            if mode == "off":  # the warning is expected: checked here, not printed
+                with self.assertLogs("logs_backup", "WARNING") as logs:
+                    lb.set_encryption(given)
+                self.assertIn("without encryption", logs.output[0])
+            else:
+                lb.set_encryption(given)
             conf = Path(os.environ["FREETDSCONF"]).read_text()
             self.assertIn(f"encryption = {mode}", conf, given)
 
@@ -142,6 +156,10 @@ class Flow(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.tmp)
+        # On Windows every commit warns "DEGRADED (not an error)": expected, so not printed here.
+        logger = logging.getLogger("logs_backup")
+        self.addCleanup(logger.setLevel, logger.level)
+        logger.setLevel(logging.ERROR)
         cfg = {"source_dir": str(self.tmp / "src"), "output_dir": str(self.tmp / "out"),
                "db_path": str(self.tmp / "index.db"), "subfolders": ["BURNIN", "ESS"],
                "date_range": ["2026-07-01", "2026-09-01"], "mochi": MOCHI}
@@ -176,7 +194,7 @@ class Flow(unittest.TestCase):
         self.assertTrue((self.cfg.source_dir / "ESS/BC0011_other.txt").exists())
         self.assertFalse(self.cfg.staging_dir.exists())
 
-        db = sqlite3.connect(self.cfg.db_path)
+        db = connect(self, self.cfg.db_path)
         rows = db.execute("SELECT barcode, relative_path, source_subfolder, content_hash, commit_seq"
                           " FROM scanned_log_entry ORDER BY barcode").fetchall()
         self.assertEqual(rows[0], ("BC001", "BURNIN/unit1_BC001_log.txt", "BURNIN",
@@ -194,6 +212,7 @@ class Flow(unittest.TestCase):
 
     def test_crash_after_staging_is_resumed(self):
         db = lb.open_index(self.cfg.db_path)
+        self.addCleanup(db.close)
         entries, _, _ = lb.scan(self.cfg, dict(self.CANDIDATES))
         lb.stage(self.cfg, lb.start_session(db, "", "x"), entries)
         self.CANDIDATES = []
@@ -203,6 +222,7 @@ class Flow(unittest.TestCase):
 
     def test_crash_after_commit_before_index_makes_no_new_commit(self):
         db = lb.open_index(self.cfg.db_path)
+        self.addCleanup(db.close)
         entries, _, _ = lb.scan(self.cfg, dict(self.CANDIDATES))
         lb.stage(self.cfg, lb.start_session(db, "", "x"), entries)
         lb.commit_month(self.cfg, "2026-08", [e for e in entries if e["volume_name"] == "2026-08"])
@@ -220,7 +240,7 @@ class Flow(unittest.TestCase):
         self.assertEqual((summary["candidates"], summary["matched_barcodes"], summary["matched_files"]), (3, 2, 2))
         self.assertEqual(sorted(set(steps)), ["query", "scan"])
         self.assertTrue((self.cfg.source_dir / "BURNIN/unit1_BC001_log.txt").exists())
-        self.assertEqual(sqlite3.connect(self.cfg.db_path).execute("SELECT COUNT(*) FROM scan_session").fetchone()[0], 0)
+        self.assertEqual(connect(self, self.cfg.db_path).execute("SELECT COUNT(*) FROM scan_session").fetchone()[0], 0)
 
         summary = lb.run(self.cfg, lambda *_: self.CANDIDATES, report=lambda step, *_: steps.append(step),
                          confirm=lambda volumes: True)
@@ -261,7 +281,9 @@ class Flow(unittest.TestCase):
         cfg = lb.Config(self.cfg.path)
         env = {"PATH": str(self.tmp / "empty"), "HOME": str(home), "USERPROFILE": str(home),
                "LOCALAPPDATA": str(home / "AppData"), "ProgramFiles": str(home / "Program Files")}
+        # registry_mochi is off too: on a PC with the MOCHI setup installed it would find the real mochi.exe.
         with unittest.mock.patch.object(lb, "__file__", str(program / "logs_backup.py")), \
+                unittest.mock.patch.object(lb, "registry_mochi", lambda: []), \
                 unittest.mock.patch.dict(os.environ, env):
             for configured in (None, "mochi"):  # "mochi" was the old example config's value
                 cfg.mochi = configured
@@ -299,7 +321,7 @@ class Flow(unittest.TestCase):
         self.assertEqual(sorted(files), ["BURNIN/line2/2026-08/unit3_BC001_log.txt",
                                          "BURNIN/line3/unit1_BC001_log.txt", "BURNIN/unit1_BC001_log.txt"])
         self.assertIn("BURNIN/line3/deep/er/x_BC002.txt", self.head("2026-07")[0])
-        rows = sqlite3.connect(self.cfg.db_path).execute(
+        rows = connect(self, self.cfg.db_path).execute(
             "SELECT relative_path, source_subfolder FROM scanned_log_entry WHERE relative_path LIKE '%line2%'").fetchall()
         self.assertEqual(rows, [("BURNIN/line2/2026-08/unit3_BC001_log.txt", "BURNIN")])
         self.assertFalse(self.cfg.staging_dir.exists())
