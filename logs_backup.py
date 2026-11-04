@@ -22,6 +22,7 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.request
@@ -103,11 +104,19 @@ def quiet(step, message="", done=0, total=None):
 
 # ---------------------------------------------------------------- config
 
+def program_dir():
+    """The folder this program is in: the .exe's folder when built with build_exe.bat (PyInstaller
+    unpacks the code to a temporary folder, so __file__ would point there), else this file's folder."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
 def find_config(given=None):
     """The config file: `given` if passed, else config.json in the current folder, else next to this program."""
     if given:
         return Path(given)
-    places = [Path.cwd() / "config.json", Path(__file__).resolve().parent / "config.json"]
+    places = [Path.cwd() / "config.json", program_dir() / "config.json"]
     found = next((p for p in places if p.is_file()), None)
     if not found:
         raise BackupError("no config.json found in " + " or ".join(str(p.parent) for p in places)
@@ -400,7 +409,7 @@ def mochi_places(configured):
     (D:/GitHub/MOCHI/target/release/mochi.exe next to D:/GitHub/Finisar_Logs_backup)."""
     if configured and configured != "mochi":  # "mochi" (the old example config) also means: find it
         return [str(configured)]
-    here = Path(__file__).resolve().parent
+    here = program_dir()
     setup = os.environ.get("LOCALAPPDATA")
     places = [shutil.which("mochi"), setup and Path(setup) / "MOCHI" / "bin" / MOCHI_EXE,
               Path.home() / ".cargo" / "bin" / MOCHI_EXE, here / MOCHI_EXE,

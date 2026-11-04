@@ -54,6 +54,43 @@ Install, configure, run, get files back, move to another PC, and fix problems.
    cannot be found. A dry run only warns. A Python venv makes no difference: it
    changes which Python runs, not where programs are found.
 
+## Single-file .exe (Windows)
+
+`build_exe.bat` packs Python, the code and its libraries into one `FinisarLogsBackup.exe`, so the
+PC that runs the backup does not need Python. Build it on any Windows PC with Python 3.9 or newer:
+
+```bash
+build_exe.bat
+```
+
+What it does:
+
+1. creates a virtual environment in `.venv` the first time (with `py -3`, else `python`), so nothing
+   goes into the system Python;
+2. installs `requirements.txt` and PyInstaller into `.venv`;
+3. runs the tests and stops if they fail;
+4. writes `dist\FinisarLogsBackup.exe` and copies `config.example.json` next to it.
+
+`build_exe.bat clean` deletes `.venv`, `build` and `dist` first and builds from scratch.
+
+To use the `.exe`, put it in a folder together with `config.json`. It looks for `config.json` in the
+current folder first, then in the `.exe`'s folder, and writes `backup.log` next to the config. Double-click
+it for a normal run (the window waits for Enter at the end), or run it from a terminal with the same
+options as `backup_ui.py`:
+
+```bash
+FinisarLogsBackup.exe --check-sql
+```
+
+```bash
+FinisarLogsBackup.exe --dry-run
+```
+
+The `.exe` does not contain `mochi.exe`. It finds it the same way as the Python version (step 3 of
+[Install](#install-once)), and also looks for `mochi.exe` in the `.exe`'s own folder.
+
+Once `.venv` exists, `run_backup.bat` uses it too.
+
 ## Configure
 
 Copy `config.example.json` to `config.json`, next to the program.
@@ -150,7 +187,7 @@ the double-click launcher and scheduled tasks see them.
 | Check that `mochi` is found and SQL Server answers | `python backup_ui.py --check-sql` |
 | Copy everything needed to restore, to another drive | `python backup_ui.py --export E:/finisar_export` (see [Export](#export-a-copy-of-everything-to-restore-from)) |
 | See what would happen | `python backup_ui.py --dry-run` |
-| Run by hand | Double-click `run_backup.bat`, or `python backup_ui.py` |
+| Run by hand | Double-click `run_backup.bat` or `FinisarLogsBackup.exe`, or `python backup_ui.py` |
 | Run without the question | `python backup_ui.py --yes` |
 | Plain log output (scheduled task) | `python logs_backup.py` |
 

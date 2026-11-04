@@ -240,4 +240,13 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        # The .exe started by double-click (no arguments) gets its own window, which would close
+        # before the summary can be read.
+        if getattr(sys, "frozen", False) and len(sys.argv) == 1:
+            try:
+                input("Press Enter to close...")
+            except EOFError:
+                pass

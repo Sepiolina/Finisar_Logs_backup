@@ -92,6 +92,12 @@ class ConfigFile(unittest.TestCase):
             (here / "config.json").write_text("{}")
             self.assertEqual(lb.find_config().resolve(), (here / "config.json").resolve())  # current folder first
             self.assertEqual(lb.find_config("x/other.json"), Path("x/other.json"))  # a given path wins
+            (here / "config.json").unlink()
+            with unittest.mock.patch.object(lb.sys, "frozen", True, create=True), \
+                    unittest.mock.patch.object(lb.sys, "executable", str(tmp / "exe" / "app.exe")):
+                (tmp / "exe").mkdir()
+                (tmp / "exe" / "config.json").write_text("{}")
+                self.assertEqual(lb.find_config().resolve(), (tmp / "exe" / "config.json").resolve())  # next to the .exe
 
     def test_index_folder_is_created(self):
         tmp = Path(tempfile.mkdtemp())

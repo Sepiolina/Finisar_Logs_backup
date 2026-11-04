@@ -48,6 +48,10 @@ python backup_ui.py --export E:/finisar_export
 
 On Windows, double-click `run_backup.bat`. Full steps are in [docs/operations.md](docs/operations.md).
 
+To build one `FinisarLogsBackup.exe` that runs on a PC without Python, run `build_exe.bat`. It sets up a
+virtual environment in `.venv`, runs the tests, and writes `dist\FinisarLogsBackup.exe`. Put `config.json`
+next to the `.exe`. See [Single-file .exe](docs/operations.md#single-file-exe-windows).
+
 ## Documentation
 
 | Page | For |
@@ -65,7 +69,8 @@ On Windows, double-click `run_backup.bat`. Full steps are in [docs/operations.md
 | `backup_ui.py` | Terminal UI (`rich`): progress, a confirm prompt before files move, a summary. Makes no backup decisions. |
 | `test_logs_backup.py` | Tests: `MOCHI_BIN=/path/to/mochi python -m unittest -v` |
 | `bench.py` | Benchmark on generated files |
-| `config.example.json`, `run_backup.bat`, `requirements.txt` | Config template, Windows launcher, Python libraries (`blake3`, `pymssql`, `rich`) |
+| `config.example.json`, `run_backup.bat`, `requirements.txt` | Config template, Windows launcher (uses `.venv` if present), Python libraries (`blake3`, `pymssql`, `rich`) |
+| `build_exe.bat` | Windows: builds `dist\FinisarLogsBackup.exe` (one file, PyInstaller) in a `.venv` virtual environment |
 
 ## Same result as Finisar_move_log_files
 
