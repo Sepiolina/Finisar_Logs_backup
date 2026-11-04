@@ -19,22 +19,26 @@ Install, configure, run, get files back, move to another PC, and fix problems.
    pip install -r requirements.txt
    ```
 
-3. **The `mochi` program.** Build it from the MOCHI repository (needs Rust from rustup.rs):
+3. **The `mochi` program** (the command line, not only the desktop app). Either:
+   - install MOCHI with a setup that includes it: it puts `mochi.exe` in
+     `%LOCALAPPDATA%\MOCHI\bin` and adds that folder to your PATH (older setups installed
+     only the desktop app), or
+   - build it from the MOCHI repository (needs Rust from rustup.rs):
 
-   ```bash
-   cargo build --release -p mochi-cli
-   ```
+     ```bash
+     cargo build --release -p mochi-cli
+     ```
 
-   This gives you `target/release/mochi` (`mochi.exe` on Windows). The MOCHI
-   **desktop app installer does not include it**: the backup needs this
-   command-line program.
+     This gives you `target/release/mochi` (`mochi.exe` on Windows).
 
    With `"mochi": null` in the config (the default), the tool finds it on its own.
    It looks in this order:
    1. PATH
-   2. `%USERPROFILE%\.cargo\bin` (where `cargo install --path crates/mochi-cli` puts it)
-   3. next to `backup_ui.py`
-   4. a MOCHI checkout beside this one, such as `D:/GitHub/MOCHI/target/release/mochi.exe`
+   2. `%LOCALAPPDATA%\MOCHI\bin` (the MOCHI setup; found even from a terminal opened
+      before the install, which still has the old PATH)
+   3. `%USERPROFILE%\.cargo\bin` (where `cargo install --path crates/mochi-cli` puts it)
+   4. next to `backup_ui.py`
+   5. a MOCHI checkout beside this one, such as `D:/GitHub/MOCHI/target/release/mochi.exe`
       next to `D:/GitHub/Finisar_Logs_backup`
 
    Anywhere else, set the full path, for example

@@ -394,24 +394,27 @@ MOCHI_EXE = "mochi.exe" if os.name == "nt" else "mochi"
 
 def mochi_places(configured):
     """Where to look for the mochi command-line program, in order. A path set in config.json is the
-    only place used; otherwise PATH, cargo's bin folder, next to this program, and a MOCHI checkout
-    beside this one (D:/GitHub/MOCHI/target/release/mochi.exe next to D:/GitHub/Finisar_Logs_backup)."""
+    only place used; otherwise PATH, the MOCHI setup's bin folder (%LOCALAPPDATA%/MOCHI/bin, also
+    found here when a terminal opened before the install has the old PATH), cargo's bin folder,
+    next to this program, and a MOCHI checkout beside this one
+    (D:/GitHub/MOCHI/target/release/mochi.exe next to D:/GitHub/Finisar_Logs_backup)."""
     if configured and configured != "mochi":  # "mochi" (the old example config) also means: find it
         return [str(configured)]
     here = Path(__file__).resolve().parent
-    places = [shutil.which("mochi"), Path.home() / ".cargo" / "bin" / MOCHI_EXE, here / MOCHI_EXE,
+    setup = os.environ.get("LOCALAPPDATA")
+    places = [shutil.which("mochi"), setup and Path(setup) / "MOCHI" / "bin" / MOCHI_EXE,
+              Path.home() / ".cargo" / "bin" / MOCHI_EXE, here / MOCHI_EXE,
               here.parent / "MOCHI" / "target" / "release" / MOCHI_EXE,
               here.parent / "mochi" / "target" / "release" / MOCHI_EXE]
     return list(dict.fromkeys(str(p) for p in places if p))  # in order, without repeats
 
 
 def desktop_app_hint():
-    """A note if only the MOCHI desktop app is installed: it does not include the mochi command."""
-    roots = [os.environ.get(v) for v in ("LOCALAPPDATA", "ProgramFiles")]
-    apps = [Path(r) / sub / "MOCHI" / "mochi-desktop.exe" for r in roots if r for sub in ("Programs", "")]
-    if any(a.is_file() for a in apps) or shutil.which("mochi-desktop"):
-        return (" The MOCHI desktop app is installed, but it does not include the mochi command-line"
-                " program this backup needs.")
+    """A note if only the MOCHI desktop app is installed (setups before the one that added bin/mochi.exe)."""
+    setup = os.environ.get("LOCALAPPDATA")
+    if (setup and (Path(setup) / "MOCHI" / "mochi-desktop.exe").is_file()) or shutil.which("mochi-desktop"):
+        return (" The MOCHI desktop app is installed, but this version of its setup does not include the"
+                " mochi command-line program: install a newer MOCHI setup (it adds bin\\mochi.exe), or build it.")
     return ""
 
 
