@@ -10,8 +10,8 @@ and leaves the same result on disk.
 resume leftovers -> query SQL Server -> scan -> stage -> commit -> verify -> index -> delete staged copy
 ```
 
-A file is always in exactly one place: the source folder, staging, or a
-verified archive. A run can stop at any point. The next run continues where it
+A file is always in the source folder, staging, or a verified archive (on a
+network drive the original stays in the source until its archive is verified). A run can stop at any point. The next run continues where it
 stopped, without losing or duplicating anything.
 
 ## Quick start
@@ -88,7 +88,7 @@ Deliberate differences:
 - **MOCHI through its command line** (`mochi --json`), not the Rust library.
 - **One commit per month per run**, not commits split at 1 GiB or 20,000 files. The archive contents are the same.
 - **Verify checks the whole month each run**, not only the new commit. This makes appends to big months a few seconds slower (see [performance](docs/performance.md)).
-- **Staging defaults to `source_dir/.staging`**, not `output_dir/.staging`. Files move into staging by rename, which only works on the same drive.
+- **Two kinds of staging.** On a local disk files move into `source_dir/.staging` by rename (same drive). On a network drive they are copied to `output_dir/.staging` on the local disk, and the originals are deleted only after their archive is verified (`"staging_mode"` in config.json).
 - **Added: a run lock**, so two runs started at once cannot share staging.
 - **Scans folders inside each subfolder too** (`"recursive": true`, the default), keeping them in the archive paths. The original read only files directly in each subfolder; `"recursive": false` does the same.
 

@@ -113,10 +113,11 @@ path last, for example `python backup_ui.py --dry-run D:/configs/line2.json`.
 | `output_dir` | required | Where `YYYY/YYYY-MM.mochi` archives go. Created if missing. |
 | `db_path` | required | SQLite index file. Its folder is created if missing. |
 | `sql_server` | none | SQL Server login, see below |
-| `staging_dir` | `source_dir/.staging` | Must be on the **same drive** as `source_dir`: files are moved there by rename. A run refuses to start staging otherwise. Created if missing. Never scanned, even inside a subfolder. |
+| `staging_mode` | `null`: automatic | How files get into staging. `"move"`: renamed into staging on the source drive. `"copy"`: copied to staging on a local disk, and each original deleted from the source only after its archive is verified (and only if it did not change after it was copied; a changed file stays for the next run). Automatic: **`"copy"` when `source_dir` is a network drive** (a mapped drive or `//server/share`), `"move"` on a local disk. |
+| `staging_dir` | `source_dir/.staging` (move), `output_dir/.staging` (copy) | With `"move"` it must be on the **same drive** as `source_dir` (files are moved there by rename); a run refuses to start staging otherwise. With `"copy"` put it on a **local disk** with room for one batch (a run checks for the batch's size plus 10% before copying). Created if missing. Never scanned, even inside a subfolder. |
 | `subfolders` | `BURNIN, ESS, JTAG, STM, Xray` | The folders scanned under `source_dir` |
 | `recursive` | `true` | `true`: also scan every folder inside each subfolder, at any depth, keeping those folders in the archive paths (`BURNIN/line2/unit1_BC001_log.txt`). `false`: only files directly in each subfolder. |
-| `file_threads` | `null`: automatic | How many files are renamed into staging, and deleted after the commit, at once. Automatic: **16 when `source_dir` is a network drive** (a mapped drive or `//server/share`), where each rename mostly waits on the network; 1 on a local disk, where one thread is fastest. Set 1–64 to override. |
+| `file_threads` | `null`: automatic | How many folders are listed, and files copied or renamed into staging and deleted after the commit, at once. Automatic: **16 when `source_dir` is a network drive** (a mapped drive or `//server/share`), where each call mostly waits on the network; 1 on a local disk, where one thread is fastest. Set 1–64 to override. |
 | `extensions` | `txt, zip` | Allowed file extensions |
 | `lookback_days` | `2` | The newest `N` days are left for the next run |
 | `date_range` | none | `["YYYY-MM-DD", "YYYY-MM-DD"]` to back-fill a fixed window instead |
@@ -249,7 +250,7 @@ python backup_ui.py --export E:/finisar_export
 | `archives/YYYY/YYYY-MM.mochi` | `output_dir` | Every copy is checked against the original (BLAKE3) before it replaces anything. Archives unchanged since the last export to the same folder are skipped, so exporting again is quick. |
 | `index.db` | `db_path` | Copied with SQLite's backup method, so the copy is consistent |
 | `config.json` | your config | The SQL Server password is removed. It is asked again on the first run. |
-| `staging/` | `staging_dir` | Only after an interrupted run. Those files are in no archive yet, so this is their only other copy. |
+| `staging/` | `staging_dir` | Only after an interrupted run. Those files are in no archive yet. With move staging this is their only other copy; with copy staging the originals are also still in the source. |
 | `RESTORE.txt` | | The restore steps below |
 | `export-manifest.json` | | Size and BLAKE3 of every exported file |
 
@@ -276,7 +277,7 @@ ideally one you can unplug and keep elsewhere.
 |---|---|
 | `output_dir` (all `.mochi` files) | The archived logs |
 | `db_path` (the index) | Lookup by barcode, and where the next run should start |
-| `staging_dir` (default `source_dir/.staging`), **if it exists** | Only after an interrupted run. It holds files that are in no archive yet and no longer in the source. Copy as is. |
+| `staging_dir` (default `source_dir/.staging`, or `output_dir/.staging` with copy staging), **if it exists** | Only after an interrupted run. It holds files that are in no archive yet (with move staging, no longer in the source either). Copy as is. |
 | `config.json` | Paths and settings |
 | Your SQL password, and any `DB_*` values | They are not in any file (unless you wrote the password in `config.json`) |
 

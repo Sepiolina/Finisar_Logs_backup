@@ -16,11 +16,11 @@ flowchart TD
     S --> C{UI only:<br/>confirm?}
     C -- no --> X[Stop. Nothing moved,<br/>nothing recorded]
     C -- yes --> B[Record session + barcode statuses]
-    B --> ST[Stage: write manifest lines and fsync,<br/>then move files to staging/YYYY-MM/SUB/]
+    B --> ST[Stage: write manifest lines and fsync,<br/>then move or copy files to staging/YYYY-MM/SUB/]
     ST --> M[Per month, in parallel:<br/>mochi create/append, one commit]
     M --> V[Verify: BLAKE3 of every staged file<br/>equals the archive head's hash,<br/>then mochi verify --level content]
     V --> I[Index the month in SQLite<br/>one transaction]
-    I --> D[Delete that month's staged copies]
+    I --> D[Delete that month's staged copies<br/>copy staging: and the unchanged originals]
     D --> E[Remove manifest and empty staging folders<br/>mark the session success]
 ```
 
@@ -66,9 +66,10 @@ is matched, not the names of the folders above it.
     2026-08.mochi
   .backup.lock               run lock (empty file, safe to ignore)
 <source_dir>/
-  .staging/                  only during a run, or after an interrupted one
+  .staging/                  move staging: only during a run, or after an interrupted one
     manifest.jsonl
     2026-08/BURNIN/unit1_BC001_log.txt
+<output_dir>/.staging/       copy staging (network drive): the same layout
 <db_path>                    SQLite index (default name in the example: index.db)
 backup.log                   full run log, written by backup_ui.py next to config.json
 ```
@@ -87,7 +88,7 @@ the archive already has is added to that folder; the earlier files stay:
 ```
 
 Each file is stored with its original modification time (moving into staging
-keeps it). MOCHI compresses and deduplicates by itself.
+keeps it; copy staging sets it from the scan). MOCHI compresses and deduplicates by itself.
 
 ### The SQLite index
 
@@ -109,14 +110,34 @@ left untouched. Move it aside and a new one is created.
 the session, then one line per file:
 
 ```
-{"scan_session_id": 42}
-{"relative_path": "BURNIN/unit1_BC001_log.txt", "source_subfolder": "BURNIN", "barcode": "BC001", "original_size": 18234, "volume_name": "2026-08"}
+{"scan_session_id": 42, "mode": "copy"}
+{"relative_path": "BURNIN/unit1_BC001_log.txt", "source_subfolder": "BURNIN", "barcode": "BC001", "original_size": 18234, "mtime_ns": 1785312000000000000, "volume_name": "2026-08"}
 ```
+
+`mode` is how the batch was staged (`"move"` or `"copy"`; a manifest without it
+is `"move"`), so a batch is finished the way it was started even if the setting
+changed. A run looks for a leftover batch in both default staging folders.
+
+### Move or copy staging
+
+| | Move (local disk) | Copy (network drive) |
+|---|---|---|
+| Staging | `source_dir/.staging`, same drive | `output_dir/.staging`, a local disk |
+| Into staging | rename (one call) | copy to `<file>.partial`, check the size, set the time, rename |
+| The original | gone from the source once staged | stays in the source until its archive is verified |
+| After the archive is verified | delete the staged file | delete the staged copy, and the original if its size and modification time still match the scan |
+| `mochi` and the hash check read | the share (twice per file) | the local disk |
+
+On a network drive every call waits on the network, so copy staging needs the
+fewest calls per file there (list, read once, check, delete), and the slow
+reads in the commit step become local.
 
 ## Why nothing is lost
 
-**Rule: a file is always in exactly one place, the source folder, staging, or
-a verified archive.**
+**Rule: a file is always in the source folder, staging, or a verified archive.**
+With move staging it is in exactly one of them. With copy staging the original
+stays in the source until its archive is verified, so a crash at any point
+leaves the original where it was.
 
 | Moment of the crash | State afterwards | What the next run does |
 |---|---|---|
@@ -127,7 +148,11 @@ a verified archive.**
 | After index, during deletes | Some staged copies remain | Commits nothing new for them, re-indexes (an upsert), deletes |
 
 Also:
-- **Never overwrite.** A file is not moved into staging if that staging path is already taken.
+- **Never overwrite.** A file is not moved or copied into staging if that staging path is already taken.
+- **Only whole copies.** A copy is written to `<file>.partial` and renamed only once its size matches the
+  scan; a crash mid-copy leaves a `.partial` file, which the next finish deletes (the original is in the source).
+- **Changed originals stay.** With copy staging an original whose size or modification time changed after
+  the scan is not deleted: the archive has the older content, and the next run archives the new one.
 - **Verify before delete.** A month's staged copies are deleted only after: every
   staged file's BLAKE3 equals the archive head's hash for that path, `mochi verify
   --level content` passes, and the SQLite transaction committed.
