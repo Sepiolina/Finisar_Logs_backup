@@ -180,7 +180,9 @@ FROM scan_session ORDER BY id DESC LIMIT 10;</code></pre></div>
 <tr><td><code>source_dir</code></td><td>required</td><td>Folder holding the subfolders.</td></tr>
 <tr><td><code>output_dir</code></td><td>required</td><td>Where <code>YYYY/YYYY-MM.mochi</code> go. Created if missing.</td></tr>
 <tr><td><code>db_path</code></td><td>required</td><td>SQLite index file; its folder is created.</td></tr>
-<tr><td><code>staging_dir</code></td><td><code>source_dir/.staging</code></td><td>Must be on the same drive as <code>source_dir</code> (checked with <code>st_dev</code> before staging).</td></tr>
+<tr><td><code>staging_mode</code></td><td><code>null</code>: <code>"copy"</code> on a network drive, else <code>"move"</code></td><td>Move: rename into staging on the source drive. Copy: copy to staging on a local disk; the original is deleted only after its archive is verified, and only if unchanged since the scan.</td></tr>
+<tr><td><code>staging_dir</code></td><td><code>source_dir/.staging</code> (move), <code>output_dir/.staging</code> (copy)</td><td>Move: must be on the same drive as <code>source_dir</code> (checked with <code>st_dev</code> before staging). Copy: needs room for the batch plus 10%.</td></tr>
+<tr><td><code>file_threads</code></td><td><code>null</code>: 16 on a network drive, else 1</td><td>Folders listed and files copied, renamed or deleted at once.</td></tr>
 <tr><td><code>subfolders</code></td><td><code>BURNIN, ESS, JTAG, STM, Xray</code></td><td>Each must be one plain folder name: no <code>/ \ :</code>, not <code>.</code> or <code>..</code>.</td></tr>
 <tr><td><code>extensions</code></td><td><code>txt, zip</code></td><td>Compared without case; a leading dot is ignored.</td></tr>
 <tr><td><code>recursive</code></td><td><code>true</code></td><td>Scan folders inside each subfolder. Must be a real JSON boolean.</td></tr>

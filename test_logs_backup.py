@@ -171,6 +171,29 @@ class Staging(unittest.TestCase):
         self.assertTrue(lb.is_network_path(r"\\server\share\logs"))
         self.assertFalse(lb.is_network_path(tempfile.gettempdir()))
 
+    def test_parallel_scan_finds_the_same_files(self):
+        cfg = self.config()
+        for n in range(300):
+            p = cfg.source_dir / "ESS" / f"line{n % 7}" / f"sub{n % 3}" / f"u_BC{n:04}.txt"
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text("x")
+        (cfg.source_dir / ".staging" / "ESS").mkdir(parents=True)
+        (cfg.source_dir / ".staging" / "ESS" / "u_BC0001.txt").write_text("staged")
+        found = {}
+        for threads in (1, 8):
+            found[threads] = sorted(f"{rel}{item.name}" for rel, item in lb.walk_files(
+                cfg.source_dir / "ESS", True, {lb.path_key(cfg.source_dir / ".staging")}, None, threads))
+        self.assertEqual(len(found[1]), 300)
+        self.assertEqual(found[1], found[8])
+
+    def test_staging_mode_setting(self):
+        self.assertEqual(self.config().mode, "move")  # a local temp folder
+        cfg = self.config(staging_mode="copy")
+        self.assertEqual(cfg.staging_dir, cfg.output_dir / ".staging")
+        self.assertEqual(cfg.staging_dirs(), [cfg.output_dir / ".staging", cfg.source_dir / ".staging"])
+        with self.assertRaisesRegex(lb.BackupError, "staging_mode"):
+            self.config(staging_mode="rename")
+
     def test_threaded_stage_moves_every_file_and_never_overwrites(self):
         cfg = self.config(file_threads=8)
         entries = []
@@ -282,6 +305,85 @@ class Flow(unittest.TestCase):
         self.run_backup()
         self.assertEqual(self.head("2026-08")[1], 0)
         self.assertEqual(db.execute("SELECT COUNT(*) FROM scanned_log_entry").fetchone()[0], 2)
+
+    def copy_mode(self):
+        """Switches this test's config to copy staging (what a network drive gets by default)."""
+        raw = json.loads((self.tmp / "config.json").read_text())
+        (self.tmp / "config.json").write_text(json.dumps(dict(raw, staging_mode="copy", file_threads=4)))
+        self.cfg = lb.Config(self.tmp / "config.json")
+        self.assertEqual(self.cfg.staging_dir, self.cfg.output_dir / ".staging")
+
+    def test_copy_staging_deletes_originals_only_once_archived(self):
+        self.copy_mode()
+        summary = self.run_backup()
+        self.assertEqual((summary["files_moved"], summary["errors"]), (2, 0))
+        self.assertEqual(self.head("2026-08")[0],
+                         {"BURNIN/unit1_BC001_log.txt": lb.blake3.blake3(b"burnin one").hexdigest()})
+        self.assertFalse((self.cfg.source_dir / "BURNIN/unit1_BC001_log.txt").exists())
+        self.assertFalse((self.cfg.source_dir / "ESS/unit2_BC002.txt").exists())
+        self.assertTrue((self.cfg.source_dir / "ESS/BC0011_other.txt").exists())
+        self.assertFalse(self.cfg.staging_dir.exists())
+
+    @unittest.skipIf(os.name == "nt", "uses a shell script as a fake mochi")
+    def test_copy_staging_failed_commit_leaves_the_source_untouched(self):
+        self.copy_mode()
+        fake = self.tmp / "failing-mochi"  # starts, but every commit fails
+        fake.write_text('#!/bin/sh\n[ "$1" = --version ] && echo "mochi 0.0" && exit 0\n'
+                        'echo \'{"error":{"code":"IO_ERROR","message":"test"}}\'; exit 3\n')
+        fake.chmod(0o755)
+        self.cfg.mochi = str(fake)
+        with self.assertRaisesRegex(lb.BackupError, "IO_ERROR"):
+            self.run_backup()
+        self.assertTrue((self.cfg.source_dir / "BURNIN/unit1_BC001_log.txt").is_file())  # original kept
+        self.assertTrue((self.cfg.staging_dir / "2026-08/BURNIN/unit1_BC001_log.txt").is_file())
+        self.cfg.mochi = MOCHI
+        self.CANDIDATES = []
+        self.assertEqual(self.run_backup()["resumed"], 2)
+        self.assertFalse((self.cfg.source_dir / "BURNIN/unit1_BC001_log.txt").exists())
+        self.assertFalse(self.cfg.staging_dir.exists())
+
+    def test_copy_staging_keeps_an_original_that_changed(self):
+        self.copy_mode()
+        db = lb.open_index(self.cfg.db_path)
+        self.addCleanup(db.close)
+        entries, _, _ = lb.scan(self.cfg, dict(self.CANDIDATES))
+        self.assertEqual(lb.stage(self.cfg, lb.start_session(db, "", "x"), entries), 0)
+        changed = self.cfg.source_dir / "BURNIN/unit1_BC001_log.txt"
+        staged = self.cfg.staging_dir / "2026-08/BURNIN/unit1_BC001_log.txt"
+        self.assertEqual(staged.stat().st_mtime_ns, changed.stat().st_mtime_ns)  # kept, as a rename would
+        changed.write_bytes(b"burnin one, more lines")  # written to after it was copied
+        result = lb.finish_staged(db, self.cfg)
+        self.assertEqual((result["files_moved"], result["errors"]), (2, 1))
+        self.assertTrue(changed.is_file())  # kept: the archive holds the older content
+        self.assertFalse((self.cfg.source_dir / "ESS/unit2_BC002.txt").exists())
+        self.CANDIDATES = [("BC001", "2026-08-03 10:00:00")]
+        self.run_backup()  # the next run archives the new content
+        self.assertFalse(changed.exists())
+        self.assertEqual(self.head("2026-08")[0]["BURNIN/unit1_BC001_log.txt"],
+                         lb.blake3.blake3(b"burnin one, more lines").hexdigest())
+
+    def test_copy_staging_skips_a_file_that_changed_before_the_copy(self):
+        self.copy_mode()
+        db = lb.open_index(self.cfg.db_path)
+        self.addCleanup(db.close)
+        entries, _, _ = lb.scan(self.cfg, dict(self.CANDIDATES))
+        self.write("BURNIN/unit1_BC001_log.txt", b"grew after the scan")
+        with self.assertLogs("logs_backup", "WARNING"):
+            self.assertEqual(lb.stage(self.cfg, lb.start_session(db, "", "x"), entries), 1)
+        self.assertFalse((self.cfg.staging_dir / "2026-08/BURNIN/unit1_BC001_log.txt").exists())
+        self.assertEqual(list(self.cfg.staging_dir.rglob("*.partial")), [])
+
+    def test_move_batch_left_by_an_older_run_is_resumed_in_copy_mode(self):
+        db = lb.open_index(self.cfg.db_path)
+        self.addCleanup(db.close)
+        entries, _, _ = lb.scan(self.cfg, dict(self.CANDIDATES))
+        lb.stage(self.cfg, lb.start_session(db, "", "x"), entries)  # move mode, in <source>/.staging
+        moved_to = self.cfg.staging_dir
+        self.copy_mode()
+        self.CANDIDATES = []
+        self.assertEqual(self.run_backup()["resumed"], 2)
+        self.assertEqual(len(self.head("2026-08")[0]), 1)
+        self.assertFalse(moved_to.exists())
 
     def test_callbacks_report_steps_and_cancel_moves_nothing(self):
         steps = []

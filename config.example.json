@@ -2,6 +2,8 @@
   "source_dir": "D:/logs",
   "output_dir": "E:/archive",
   "staging_dir": null,
+  "staging_mode": null,
+  "file_threads": null,
   "db_path": "E:/archive/index.db",
   "sql_server": {
     "server": "sqlhost",

@@ -6,12 +6,16 @@ monthly MOCHI archives (<output_dir>/<YYYY>/<YYYY-MM>.mochi, in-archive path
 
     resume leftover staging -> query -> scan -> stage -> commit -> verify -> index -> delete
 
-A file is always in exactly one place: the source tree, staging, or a
-committed and verified archive. Staged copies are deleted only after their
-month's archive was verified and indexed; on any failure they stay, and the
-next run resumes them first.
+A file is always in the source tree, staging, or a committed and verified
+archive. Files are moved into staging by rename (local disk), or copied there
+(network drive: the original stays in the source until it is archived).
+Staged copies, and copied originals, are deleted only after their month's
+archive was verified and indexed; on any failure they stay, and the next run
+resumes them first.
 """
 import argparse
+import contextlib
+import copy
 import datetime as dt
 import html
 import itertools
@@ -27,7 +31,7 @@ import tempfile
 import time
 import urllib.request
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
 import blake3
@@ -37,7 +41,8 @@ log = logging.getLogger("logs_backup")
 DELIMITERS = "_.-"  # characters allowed on each side of a barcode in a filename
 MANIFEST_BATCH = 2000  # manifest lines synced before the matching files are moved
 WORKERS = min(os.cpu_count() or 1, 8)  # hashing threads, and months committed side by side
-NETWORK_FILE_THREADS = 16  # renames/deletes at once on a network drive: each waits on a round trip
+NETWORK_FILE_THREADS = 16  # folders listed, files copied/renamed/deleted at once on a network drive
+STAGING_SPACE_MARGIN = 1.1  # copy staging needs the batch's size plus this margin free
 PROGRESS_EVERY = 100  # files between progress updates while staging
 
 SCHEMA_VERSION = 2
@@ -132,8 +137,14 @@ class Config:
         raw = json.loads(self.path.read_text(encoding="utf-8"))
         self.source_dir = Path(raw["source_dir"])
         self.output_dir = Path(raw["output_dir"])
-        # Staging must be on the source drive: files are moved there by rename.
-        self.staging_dir = Path(raw.get("staging_dir") or self.source_dir / ".staging")
+        # "move": files are renamed into staging, which must be on the source drive (default there).
+        # "copy": files are copied to staging on a local disk (default <output_dir>/.staging) and
+        # deleted from the source only once archived. None: "copy" on a network drive, else "move".
+        self.staging_mode = raw.get("staging_mode")
+        if self.staging_mode not in (None, "move", "copy"):
+            raise BackupError('"staging_mode" in config.json must be "move", "copy" or null')
+        self.staging_dir_set = bool(raw.get("staging_dir"))
+        self.staging_dir = Path(raw["staging_dir"]) if self.staging_dir_set else None  # see mode
         self.db_path = Path(raw["db_path"])
         self.subfolders = raw.get("subfolders", ["BURNIN", "ESS", "JTAG", "STM", "Xray"])
         self.extensions = {e.lstrip(".").lower() for e in raw.get("extensions", ["txt", "zip"])}
@@ -146,6 +157,8 @@ class Config:
         self.recursive = raw.get("recursive", True)  # scan folders inside each subfolder too
         if not isinstance(self.recursive, bool):
             raise BackupError('"recursive" in config.json must be true or false')
+        if not self.staging_dir_set:
+            self.staging_dir = self.default_staging(self.mode)
         self.lookback_days = raw.get("lookback_days", 2)
         self.date_range = raw.get("date_range")  # optional ["YYYY-MM-DD", "YYYY-MM-DD"]
         self.mochi = raw.get("mochi")  # None: found by check_mochi() (PATH, cargo's bin, a MOCHI checkout)
@@ -164,11 +177,38 @@ class Config:
                 raise BackupError(f"subfolder {sub!r} must be a single plain folder name")
 
     @property
+    def on_network(self):
+        if not hasattr(self, "_on_network"):
+            self._on_network = is_network_path(self.source_dir)
+        return self._on_network
+
+    @property
     def threads(self):
-        """Threads for renames and deletes in source_dir."""
+        """Threads for work in source_dir: folder listings, copies, renames and deletes."""
         if self.file_threads is None:
-            self.file_threads = NETWORK_FILE_THREADS if is_network_path(self.source_dir) else 1
+            self.file_threads = NETWORK_FILE_THREADS if self.on_network else 1
         return self.file_threads
+
+    @property
+    def mode(self):
+        """How files get into staging: "copy" (network drive by default) or "move"."""
+        return self.staging_mode or ("copy" if self.on_network else "move")
+
+    def default_staging(self, mode):
+        return self.output_dir / ".staging" if mode == "copy" else self.source_dir / ".staging"
+
+    def staging_dirs(self):
+        """Every folder an earlier run may have left a batch in: the configured one, and with no
+        staging_dir set, the other mode's default too (the mode may have changed since)."""
+        dirs = [self.staging_dir]
+        if not self.staging_dir_set:
+            dirs += [d for d in (self.default_staging("move"), self.default_staging("copy")) if d not in dirs]
+        return dirs
+
+    def with_staging(self, folder):
+        other = copy.copy(self)
+        other.staging_dir = folder
+        return other
 
     @property
     def manifest(self):
@@ -341,31 +381,50 @@ def has_extension(name, extensions):
     return "." in name and name.rsplit(".", 1)[1].lower() in extensions
 
 
-def walk_files(top, recursive, skip, on_error):
+def path_key(path):
+    """A path compared without touching the disk (resolve() would cost a network round trip)."""
+    return os.path.normcase(os.path.abspath(path))
+
+
+def walk_files(top, recursive, skip, on_error, threads=1):
     """Yields (folder path below `top` ending in "/", or "", DirEntry) for each file in `top`, and with
-    `recursive` in every folder below it. Folders are read as they go (never held whole in memory);
-    symlinks are not followed and folders in `skip` are not entered. An unreadable folder is passed
-    to on_error(folder, error) and skipped."""
-    stack = [(Path(top), "")]
-    while stack:
-        folder, rel = stack.pop()
+    `recursive` in every folder below it. Up to `threads` folders are listed at once (on a network
+    drive each listing mostly waits on the network); only folders being listed are held in memory.
+    Symlinks are not followed and folders whose path_key is in `skip` are not entered. An unreadable
+    folder is passed to on_error(folder, error) and skipped."""
+    def listing(job):
+        folder, rel = job
+        files, folders = [], []
         try:
-            with os.scandir(folder) as listing:
-                for item in listing:
+            with os.scandir(folder) as items:
+                for item in items:
                     if item.is_dir(follow_symlinks=False):
-                        if recursive and Path(item.path).resolve() not in skip:
-                            stack.append((Path(item.path), f"{rel}{item.name}/"))
+                        if recursive and path_key(item.path) not in skip:
+                            folders.append((Path(item.path), f"{rel}{item.name}/"))
                     elif item.is_file(follow_symlinks=False):
-                        yield rel, item
+                        files.append(item)
         except OSError as e:
-            on_error(folder, e)
+            return folder, rel, files, folders, e
+        return folder, rel, files, folders, None
+
+    with ThreadPoolExecutor(max(threads, 1)) as pool:
+        pending = {pool.submit(listing, (Path(top), ""))}
+        while pending:
+            done, pending = wait(pending, return_when=FIRST_COMPLETED)
+            for job in done:
+                folder, rel, files, folders, error = job.result()
+                pending |= {pool.submit(listing, f) for f in folders}
+                if error:
+                    on_error(folder, error)
+                for item in files:
+                    yield rel, item
 
 
 def scan(cfg, dates, report=quiet):
     """Matched files as manifest entries, plus error and scanned-file counts. Each subfolder is scanned
     at every depth (config "recursive", default on); the staging and output folders are never entered."""
     entries, errors, seen = [], 0, 0
-    skip = {cfg.staging_dir.resolve(), cfg.output_dir.resolve()}
+    skip = {path_key(p) for p in (*cfg.staging_dirs(), cfg.output_dir)}
 
     def unreadable(folder, e):
         nonlocal errors
@@ -373,7 +432,7 @@ def scan(cfg, dates, report=quiet):
         errors += 1
 
     for sub in cfg.subfolders:
-        for rel, item in walk_files(cfg.source_dir / sub, cfg.recursive, skip, unreadable):
+        for rel, item in walk_files(cfg.source_dir / sub, cfg.recursive, skip, unreadable, cfg.threads):
             seen += 1
             if seen % 2000 == 0:
                 report("scan", f"{len(entries)} matches", seen)
@@ -388,8 +447,9 @@ def scan(cfg, dates, report=quiet):
             if not (len(month) == 7 and month[:4].isdigit() and month[4] == "-" and month[5:].isdigit()):
                 errors += 1
                 continue
-            entries.append({"relative_path": f"{sub}/{rel}{item.name}", "source_subfolder": sub,
-                            "barcode": barcode, "original_size": item.stat().st_size, "volume_name": month})
+            st = item.stat()  # on Windows from the folder listing: no extra round trip
+            entries.append({"relative_path": f"{sub}/{rel}{item.name}", "source_subfolder": sub, "barcode": barcode,
+                            "original_size": st.st_size, "mtime_ns": st.st_mtime_ns, "volume_name": month})
     report("scan", f"{len(entries)} matches", seen, seen)
     log.info("scanned %d files, %d matches", seen, len(entries))
     return entries, errors, seen
@@ -423,15 +483,25 @@ def staged_path(cfg, entry):
 # ---------------------------------------------------------------- stage
 
 def stage(cfg, sid, entries, report=quiet):
-    """Moves files into staging/<YYYY-MM>/<SUB>/; each manifest line is synced before its file moves.
+    """Puts files into staging/<YYYY-MM>/<SUB>/; the manifest lists each file before it is touched.
 
-    Returns the number of files that could not be moved (they stay in the source).
-    Renames run on cfg.threads threads: one on a local disk (measured, threads made them slower
-    there), several on a network drive, where each rename mostly waits on the network."""
-    errors = 0
+    cfg.mode "move": renamed there (staging is on the source drive); the staged file is the only copy.
+    cfg.mode "copy": copied there (staging on a local disk); the original stays in the source until
+    its archive is verified, then finish_staged deletes it if it did not change meanwhile.
+    Returns the number of files not staged (they stay in the source; a later run picks them up).
+    Works on cfg.threads files at once: one on a local disk (measured, threads made renames slower
+    there), several on a network drive, where each file mostly waits on the network."""
+    errors, mode = 0, cfg.mode
     cfg.staging_dir.mkdir(parents=True, exist_ok=True)
-    if os.stat(cfg.staging_dir).st_dev != os.stat(cfg.source_dir).st_dev:
-        raise BackupError(f"staging_dir {cfg.staging_dir} must be on the same drive as source_dir (files move by rename)")
+    if mode == "move" and os.stat(cfg.staging_dir).st_dev != os.stat(cfg.source_dir).st_dev:
+        raise BackupError(f"staging_dir {cfg.staging_dir} must be on the same drive as source_dir (files move by"
+                          ' rename), or set "staging_mode": "copy"')
+    if mode == "copy":
+        need = sum(e["original_size"] for e in entries) * STAGING_SPACE_MARGIN
+        free = shutil.disk_usage(cfg.staging_dir).free
+        if free < need:
+            raise BackupError(f"staging_dir {cfg.staging_dir} has {free / 2**30:.1f} GiB free; copying this batch"
+                              f" needs {need / 2**30:.1f} GiB. Free space there, or set staging_dir to a bigger disk.")
     for d in {staged_path(cfg, e).parent for e in entries}:
         d.mkdir(parents=True, exist_ok=True)
 
@@ -448,25 +518,45 @@ def stage(cfg, sid, entries, report=quiet):
             log.warning("not staged %s: %s", src, err)
             return 1
 
+    def copy_in(e):
+        src, dst = cfg.source_dir / e["relative_path"], staged_path(cfg, e)
+        tmp = dst.with_name(dst.name + ".partial")  # a staged file is always whole
+        try:
+            if dst.exists():  # local: cheap
+                raise FileExistsError(dst)
+            shutil.copyfile(src, tmp)
+            if tmp.stat().st_size != e["original_size"]:  # changed since the scan: a later run takes it
+                raise OSError(f"changed since the scan ({tmp.stat().st_size} bytes, scanned {e['original_size']})")
+            os.utime(tmp, ns=(e["mtime_ns"], e["mtime_ns"]))  # the archive keeps it; from the scan, no round trip
+            os.replace(tmp, dst)
+            return 0
+        except OSError as err:  # the original was not touched
+            log.warning("not staged %s: %s", src, err)
+            with contextlib.suppress(OSError):
+                tmp.unlink()
+            return 1
+
     with open(cfg.manifest, "w", encoding="utf-8") as manifest:
-        manifest.write(json.dumps({"scan_session_id": sid}) + "\n")
+        manifest.write(json.dumps({"scan_session_id": sid, "mode": mode}) + "\n")
         for i in range(0, len(entries), MANIFEST_BATCH):
             batch = entries[i:i + MANIFEST_BATCH]
             manifest.writelines(json.dumps(e) + "\n" for e in batch)
             manifest.flush()
             os.fsync(manifest.fileno())  # the batch is listed on disk before any of it moves
-            for n, failed in enumerate(each(cfg.threads, move, batch), i + 1):
+            for n, failed in enumerate(each(cfg.threads, copy_in if mode == "copy" else move, batch), i + 1):
                 errors += failed
                 if n % PROGRESS_EVERY == 0 or n == i + len(batch):
-                    report("stage", "", n, len(entries))
+                    report("stage", "copying to local staging" if mode == "copy" else "", n, len(entries))
     return errors
 
 
 def read_manifest(cfg):
-    """(session id, entries) or None. A truncated last line is skipped."""
+    """(session id, entries, mode) or None. A truncated last line is skipped. Manifests written
+    before copy staging existed have no mode: they are "move"."""
     try:
         lines = cfg.manifest.read_text(encoding="utf-8").splitlines()
-        sid = json.loads(lines[0])["scan_session_id"]
+        head = json.loads(lines[0])
+        sid, mode = head["scan_session_id"], head.get("mode", "move")
     except (OSError, IndexError, KeyError, ValueError):
         return None
     entries = []
@@ -475,7 +565,7 @@ def read_manifest(cfg):
             entries.append(json.loads(line))
         except ValueError:
             pass
-    return sid, entries
+    return sid, entries, mode
 
 
 # ---------------------------------------------------------------- MOCHI
@@ -654,12 +744,35 @@ def index_month(db, cfg, sid, month, entries, hashes, head):
                    " (SELECT COUNT(*) FROM scanned_log_entry WHERE file_storage_volume_id = ?) WHERE id = ?", (vid, vid))
 
 
+def release(cfg, e, mode):
+    """After e's archive is verified and indexed: deletes its staged file, and with copy staging
+    its original in the source, unless the original changed since the scan (then it stays, and a
+    later run archives the new content). Returns 1 if an original was kept, else 0."""
+    kept = 0
+    if mode == "copy":
+        src = cfg.source_dir / e["relative_path"]
+        try:
+            st = os.stat(src)
+            if (st.st_size, st.st_mtime_ns) != (e["original_size"], e.get("mtime_ns")):
+                log.warning("kept %s in the source: it changed after it was copied", src)
+                kept = 1
+            else:
+                os.unlink(src)
+        except FileNotFoundError:
+            pass  # already deleted (a resumed batch)
+        except OSError as err:
+            log.warning("kept %s in the source (it is archived): %s", src, err)
+            kept = 1
+    staged_path(cfg, e).unlink()
+    return kept
+
+
 def finish_staged(db, cfg, report=quiet, resume=False):
     """Archives whatever the manifest lists in staging. Returns a summary dict, or None if nothing is staged."""
     manifest = read_manifest(cfg)
     if manifest is None:
         return None
-    sid, listed = manifest
+    sid, listed, mode = manifest
     if not db.execute("SELECT 1 FROM scan_session WHERE id = ?", (sid,)).fetchone():
         log.warning("staging references missing session %s; recording into a new one", sid)
         sid = start_session(db, "resumed", "resumed")
@@ -669,7 +782,7 @@ def finish_staged(db, cfg, report=quiet, resume=False):
         if moved:  # listed but never moved: still in the source
             months[e["volume_name"]].append(e)
 
-    archived, failures = [], []
+    archived, failures, errors = [], [], 0
     report("commit", "", 0, len(months))
     with ThreadPoolExecutor(min(WORKERS, max(len(months), 1))) as pool:
         jobs = {m: pool.submit(commit_month, cfg, m, es, resume) for m, es in months.items()}
@@ -681,8 +794,9 @@ def finish_staged(db, cfg, report=quiet, resume=False):
                 log.error("%s kept in staging: %s", month, e)
                 failures.append(e)
                 continue
-            for _ in each(cfg.threads, lambda e: staged_path(cfg, e).unlink(), months[month]):
-                pass
+            report("commit", f"{month} cleaning up", len(plan(archived)), len(months))
+            kept = sum(each(cfg.threads, lambda e: release(cfg, e, mode), months[month]))
+            errors += kept
             archived += months[month]
             log.info("%s: %d files committed (LOCAL_COMMITTED), verified and indexed", month, len(months[month]))
             report("commit", month, len(plan(archived)), len(months))
@@ -693,13 +807,17 @@ def finish_staged(db, cfg, report=quiet, resume=False):
     leftovers = 0
     for d, _, files in sorted(os.walk(cfg.staging_dir), key=lambda w: -len(w[0])):
         for f in files:  # not in the manifest: never deleted
+            if mode == "copy" and f.endswith(".partial"):  # a copy cut short; the original is in the source
+                os.unlink(Path(d) / f)
+                continue
             log.warning("left in staging (not listed in the manifest): %s", Path(d) / f)
             leftovers += 1
         if not os.listdir(d):
             os.rmdir(d)
     barcodes = len({e["barcode"] for e in archived})
-    complete_session(db, sid, "success", barcodes, len(archived), leftovers)
-    return {"files_moved": len(archived), "barcodes": barcodes, "errors": leftovers, "volumes": plan(archived)}
+    complete_session(db, sid, "success", barcodes, len(archived), leftovers + errors)
+    return {"files_moved": len(archived), "barcodes": barcodes, "errors": leftovers + errors,
+            "volumes": plan(archived)}
 
 
 # ---------------------------------------------------------------- run
@@ -780,11 +898,14 @@ def _run(cfg, candidates_fn, dry_run, report, confirm):
 
 def _run_with_index(db, cfg, candidates_fn, dry_run, report, confirm):
     resumed = 0
-    if not dry_run and cfg.manifest.exists():
+    for folder in cfg.staging_dirs() if not dry_run else ():
+        leftover = cfg.with_staging(folder)
+        if not leftover.manifest.exists():
+            continue
         report("resume", "finishing the batch an earlier run left in staging")
         # The resumed batch's progress is shown on the "resume" row.
-        finished = finish_staged(db, cfg, lambda _step, *args: report("resume", *args), resume=True)
-        resumed = finished["files_moved"] if finished else 0
+        finished = finish_staged(db, leftover, lambda _step, *args: report("resume", *args), resume=True)
+        resumed += finished["files_moved"] if finished else 0
         report("resume", f"{resumed} files", 1, 1)
 
     date_from, date_to = query_window(db, cfg)

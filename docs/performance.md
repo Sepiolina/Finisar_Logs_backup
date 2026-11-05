@@ -64,6 +64,8 @@ save little.
 | Stream the scan instead of listing every folder first | Lower memory, same speed | yes |
 | Hash in chunks of 500 files per task | 300,000 files: peak memory 1.15 GB → 0.69 GB | yes |
 | Renames and deletes on 4–16 threads | **Slower** here: 50,000 renames took 0.8 s on 1 thread, 2–3 s on 4–8 threads | local disk: no; network drive: yes (below) |
+| Copy staging to a local disk on a network drive | Simulated network (below): 20 s → 6.5 s for 5,000 files | network drive: yes |
+| List folders on 16 threads, compare paths without `resolve()` | Simulated network: scan 0.8 s → 0.3 s for 40 folders | network drive: yes |
 
 ### On a network drive
 
@@ -76,6 +78,26 @@ network drive (a mapped drive letter or `//server/share`), renames, the
 (`file_threads` in config.json changes this). On Windows the rename itself refuses
 to overwrite, so the separate "does the target exist?" check, one more round
 trip per file, is skipped there.
+
+Then copy staging (the default on a network drive) cut the remaining trips.
+Moving files on the share left `mochi` and the hash check reading every staged
+file over the network, and the rename itself was a round trip. Now each file is
+listed, read once (copied to `output_dir/.staging` on the local disk), checked
+and deleted: everything else is local. Folders are listed 16 at a time too.
+
+Simulated with a 3 ms delay on every call in the source folder (listing,
+rename, copy, stat, delete, and each read by the hash check and a stand-in
+`mochi`), 5,000 files in 40 folders:
+
+| Setup | Total | Stage | Commit and cleanup |
+|---|---|---|---|
+| Move, 1 thread (before) | 79.8 s | 46.2 s | 32.7 s |
+| Move, 16 threads | 20.4 s | 3.0 s | 17.0 s |
+| Copy, 1 thread | 82.2 s | 47.4 s | 33.6 s |
+| **Copy, 16 threads (default on a network drive)** | **6.5 s** | 3.8 s | 2.3 s |
+
+A real share's delay, and how many calls at once it handles well, differ:
+measure there, and try `"file_threads"` 8 or 32.
 
 The fastest setup is still to run the backup **on the file server itself**,
 against its local disk: then nothing crosses the network. Antivirus that scans

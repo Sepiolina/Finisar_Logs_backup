@@ -60,8 +60,10 @@ The file is laid out in run order and split by `# ----` section comments.
 
 `find_config(given)` picks the file: the path passed on the command line if
 any, else `config.json` in the current folder, else the one next to the program.
-`Config(path)` reads it, fills defaults (staging defaults to
-`source_dir/.staging`, the same drive as the source) and checks every subfolder
+`Config(path)` reads it, fills defaults (`cfg.mode` is `"copy"` on a network
+drive, else `"move"`; staging defaults to `output_dir/.staging` for copy and
+`source_dir/.staging`, the same drive as the source, for move; `cfg.threads` is
+16 on a network drive, else 1) and checks every subfolder
 is a single plain folder name (no `/`, `\`, `:`, `..`). It refuses a path that
 contains a control character (what `"E:\backup"` turns into in JSON). `cfg.sql`
 holds the SQL Server login: each value comes from the `DB_*` environment
@@ -92,25 +94,33 @@ variable if set, otherwise from `sql_server` in the file. `cfg.manifest` and
 |---|---|
 | `find_barcodes(name, barcodes)` | Lists every position a barcode may start (start of name, or after a delimiter) and may end (end of name, or before a delimiter), and checks each substring between them against the barcode set. Same results as the original's Aho-Corasick search, with no extra library. |
 | `has_extension(name, extensions)` | Text after the last `.`, compared without case. |
-| `walk_files(top, recursive, skip, on_error)` | Yields each file under `top` with the folder path between them, reading each folder with `os.scandir` as it goes (a huge folder is never held in memory whole). With `recursive` it descends into every folder except those in `skip`; links are not followed. An unreadable folder goes to `on_error` and is skipped. |
+| `walk_files(top, recursive, skip, on_error, threads)` | Yields each file under `top` with the folder path between them, listing up to `threads` folders at once with `os.scandir` (on a network drive each listing mostly waits on the network). With `recursive` it descends into every folder whose `path_key` is not in `skip`; links are not followed. `path_key` compares paths without touching the disk (`resolve()` would cost a round trip per folder). An unreadable folder goes to `on_error` and is skipped. |
 | `scan(cfg, dates, report)` | Walks each subfolder (`cfg.recursive`, default on), never entering the staging or output folders. Keeps files with an allowed extension and exactly one barcode in the file name; `relative_path` keeps the folders (`BURNIN/line2/x_BC001.txt`), `source_subfolder` is the top folder. Returns manifest-ready dicts. A missing or unreadable folder or an ambiguous name counts as an error and does not stop the run. |
 
 ### Stage
 
-`stage(cfg, sid, entries, report)` first checks that staging and the source are
-on the same drive (a rename cannot cross drives). It then writes the manifest
-header and, for each batch of 2,000 entries:
+`stage(cfg, sid, entries, report)` first checks, for move staging, that staging
+and the source are on the same drive (a rename cannot cross drives), and for
+copy staging, that staging has room for the batch plus 10%. It then writes the
+manifest header (session and mode) and, for each batch of 2,000 entries:
 
 1. writes their manifest lines, then `flush` and `fsync`, so the lines are on disk;
-2. moves each file with `os.rename` into `staging/<YYYY-MM>/<SUB>/<file>`,
-   refusing a path that already exists.
+2. move: renames each file with `os.rename` into `staging/<YYYY-MM>/<SUB>/<file>`,
+   refusing a path that already exists. Copy: copies it to `<file>.partial`,
+   checks the size against the scan, sets the scan's modification time, and
+   renames it into place; the original is not touched.
 
-A file that cannot be moved (locked, permissions) is logged and counted, stays
-in the source folder, and a later run picks it up. Renames run on `cfg.threads`
-threads: one on a local disk (measured, threads made them slower there), 16 on
-a network drive, where each rename mostly waits on the network
-(`is_network_path`, overridable with `file_threads`). Progress is reported every
-100 files.
+A file that cannot be staged (locked, permissions, changed since the scan) is
+logged and counted, stays in the source folder, and a later run picks it up.
+Files are staged on `cfg.threads` threads: one on a local disk (measured,
+threads made renames slower there), 16 on a network drive, where each file
+mostly waits on the network (`is_network_path`, overridable with
+`file_threads`). Progress is reported every 100 files.
+
+After a month is verified and indexed, `release(cfg, e, mode)` deletes each
+staged file; with copy staging it first deletes the original, only if its size
+and modification time still match the scan (otherwise it stays and counts as
+an error, and the next run archives the new content).
 
 `read_manifest(cfg)` reads it back. A broken first line means there is nothing
 safe to resume. A broken last line (a crash mid-write) is skipped.
@@ -174,6 +184,13 @@ MOCHI_BIN=/path/to/mochi python -m unittest -v
 | `test_callbacks_report_steps_and_cancel_moves_nothing` | Progress steps, and a declined confirm moves and records nothing |
 | `test_second_run_at_the_same_time_is_refused` | Run lock |
 | `test_failed_commit_keeps_staging` | A failing `mochi` keeps staging, and the next run completes it |
+| `test_copy_staging_deletes_originals_only_once_archived` | Copy staging: files are archived, originals deleted, staging removed |
+| `test_copy_staging_failed_commit_leaves_the_source_untouched` | Copy staging with a failing `mochi`: originals stay, the next run finishes the batch |
+| `test_copy_staging_keeps_an_original_that_changed` | An original written to after its copy stays in the source; the next run archives the new content. Staged copies keep the modification time |
+| `test_copy_staging_skips_a_file_that_changed_before_the_copy` | A file whose size changed since the scan is not staged, and no `.partial` file is left |
+| `test_move_batch_left_by_an_older_run_is_resumed_in_copy_mode` | A move batch in `source_dir/.staging` is finished after switching to copy staging |
+| `Staging.test_parallel_scan_finds_the_same_files` | Listing folders on 8 threads finds the same files as on 1, and skips staging |
+| `Staging.test_staging_mode_setting` | `staging_mode` defaults, staging folder per mode, bad values refused |
 | `test_sql_login_from_config_with_env_override` | Login read from `config.json`, `DB_*` variables win, a missing part is named |
 | `test_backspace_in_a_path_is_refused` | `"E:\backup"` in JSON is caught |
 | `test_sql_errors_are_one_readable_line_with_a_hint` | Your error 20002, a stale code from `pymssql`, login failure, a bad `encryption` value |
