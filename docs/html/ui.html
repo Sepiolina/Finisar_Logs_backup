@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>UI and Logic</title>
+<meta name="description" content="How backup_ui.py (the terminal screen) connects to logs_backup.py (the logic) through one function call and two callbacks.">
+<link rel="stylesheet" href="assets/site.css">
+<script src="assets/site.js"></script>
+<style>
+.term-screen { background: #121212; color: #e6e6e6; font: 13px/1.5 var(--mono); padding: 14px 16px; border-radius: 10px; min-height: 210px; overflow-x: auto; white-space: pre; }
+.term-screen .g { color: #7fd18b; } .term-screen .y { color: #e8c66a; } .term-screen .r { color: #f08a82; } .term-screen .d { color: #8a8a8a; } .term-screen .c { color: #79c6e6; }
+</style>
+</head>
+<body>
+<div class="layout">
+<aside class="side"><a class="brand" href="index.html">Finisar Logs Backup<small>Developer guide</small></a><nav></nav></aside>
+<main class="main">
+<div class="topbar"><button class="menu-btn">☰ Menu</button><span class="crumbs">How the parts connect › UI ↔ logic</span><button class="theme-btn">Theme</button></div>
+
+<h1>UI ↔ logic: <code>backup_ui.py</code></h1>
+<p class="lead"><code>backup_ui.py</code> draws the screen. <code>logs_backup.py</code> decides everything. This page shows the small, strict contract between them, and why it makes the code safer to review.</p>
+
+<h2>The pattern: logic knows nothing about screens</h2>
+<div class="grid">
+<div class="card"><h3><span class="badge py">logs_backup.py</span> logic</h3><ul class="small">
+<li>Reads config, queries, scans, moves, commits, verifies, indexes, deletes.</li>
+<li>Never prints a progress bar or asks a question.</li>
+<li>Tells the outside world what it is doing by <b>calling functions it was given</b>.</li>
+<li>Runs alone too: <code>python logs_backup.py</code> (scheduled tasks).</li></ul></div>
+<div class="card"><h3><span class="badge py">backup_ui.py</span> screen</h3><ul class="small">
+<li>Parses options, finds the config, sets up logging, asks for the password.</li>
+<li>Calls <b>one</b> function: <code>lb.run(cfg, dry_run, report=…, confirm=…)</code>.</li>
+<li>Draws what it is told; returns the operator's yes/no.</li>
+<li><b>Cannot move, commit or delete a file</b>: it has no code that does.</li></ul></div>
+</div>
+<div class="callout rule"><span class="label">Review consequence</span>
+<p>For a safety review you only need <code>logs_backup.py</code>. A change to <code>backup_ui.py</code> can make the screen wrong, but it cannot lose a file, as long as it keeps calling only <code>run()</code>, <code>export()</code>, <code>check_mochi()</code>, <code>check_sql()</code> and <code>send_email()</code>. A change that adds file operations to the UI breaks the pattern and should be questioned.</p></div>
+<div class="callout junior"><span class="label">Name for this</span>
+<p>This is the <b>callback</b> (or "dependency injection") pattern: instead of the logic importing a screen library, the caller passes in small functions. The tests use the same door: they pass a list instead of SQL Server, and a <code>confirm</code> that says no.</p></div>
+
+<h2 id="the-contract-in-full">The contract, in full</h2>
+<pre><code>summary = lb.run(cfg, candidates_fn=None, dry_run=False, report=quiet, confirm=None)</code></pre>
+<div class="table-wrap"><table>
+<tr><th>Parameter</th><th>Type</th><th>Meaning</th></tr>
+<tr><td><code>report</code></td><td><code>report(step, message="", done=0, total=None)</code></td><td>Progress only. <code>step</code> is <code>resume</code>, <code>query</code>, <code>scan</code>, <code>stage</code> or <code>commit</code> (<code>export</code> for <code>lb.export</code>). <code>total=None</code> = not known yet (spinner). Default <code>quiet</code> does nothing. Its return value is ignored.</td></tr>
+<tr><td><code>confirm</code></td><td><code>confirm(volumes) -&gt; bool</code></td><td>Called once, after the scan and <b>before any file moves</b>, with <code>{"2026-08": (barcodes, files, bytes), …}</code>. <code>False</code> → <code>status="cancelled"</code>, nothing moved, nothing written to the index. Not called when nothing matched. <code>None</code> = do not ask.</td></tr>
+<tr><td><code>dry_run</code></td><td><code>bool</code></td><td>Query and scan only; returns <code>status="dry_run"</code>. A missing mochi is only a warning.</td></tr>
+<tr><td><code>candidates_fn</code></td><td><code>fn(date_from, date_to) -&gt; [(barcode, last_update)]</code></td><td>Replaces the SQL Server query. The UI never sets it; tests and <code>bench.py</code> do.</td></tr>
+</table></div>
+<p><b>Returns</b> a plain dict. <b>Raises</b> <code>BackupError</code> (expected problems, message meant for the operator) or any other exception (bugs, disk errors).</p>
+<details class="fn"><summary><code>summary</code> keys <span class="what">what the UI draws at the end</span></summary><div class="body">
+<table>
+<tr><th>Key</th><th>Meaning</th></tr>
+<tr><td><code>status</code></td><td><code>done</code>, <code>dry_run</code> or <code>cancelled</code></td></tr>
+<tr><td><code>window</code></td><td><code>(from, to)</code>; <code>from</code> is <code>None</code> on the first run</td></tr>
+<tr><td><code>candidates</code></td><td>distinct barcodes from SQL Server</td></tr>
+<tr><td><code>scanned</code></td><td>files looked at</td></tr>
+<tr><td><code>matched_barcodes</code>, <code>matched_files</code></td><td>what this run found to archive</td></tr>
+<tr><td><code>barcodes</code>, <code>files_moved</code></td><td>what was committed (0 for dry run / cancel)</td></tr>
+<tr><td><code>volumes</code></td><td><code>{month: (barcodes, files, bytes)}</code>: committed when <code>done</code>, otherwise found</td></tr>
+<tr><td><code>resumed</code>, <code>errors</code></td><td>files finished from an earlier run; problems counted</td></tr>
+<tr><td><code>session_id</code>, <code>unmatched</code></td><td>only when <code>done</code>; <code>unmatched</code> = barcodes with no files (used by the email)</td></tr>
+</table></div></details>
+
+<h2>Watch the callbacks drive the screen</h2>
+<p>Press <b>Play</b>. Left: the calls the logic makes. Right: what <code>backup_ui.py</code> draws in response (simplified).</p>
+<div class="card">
+<div class="tools"><button class="primary" id="play">▶ Play</button><button id="answer-no">Play, answer "No"</button><span class="muted small" style="align-self:center">The <code>Steps</code> class adds a progress row the first time a step reports.</span></div>
+<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(280px,1fr))">
+<pre id="calls" style="min-height:210px;margin:0"><code>(calls appear here)</code></pre>
+<div id="screen" class="term-screen"></div>
+</div>
+</div>
+<script>
+(function () {
+  var script = [
+    ["report('query', '(start) .. 2026-11-02')", { query: ["⠋", "Query SQL Server (start) .. 2026-11-02", ""] }],
+    ["report('query', '3 candidate barcodes', 1, 1)", { query: ["✓", "Query SQL Server 3 candidate barcodes", "1/1"] }],
+    ["report('scan', '0 matches', 2000)", { scan: ["⠙", "Scan folders 0 matches", "2000/?"] }],
+    ["report('scan', '2 matches', 4, 4)", { scan: ["✓", "Scan folders 2 matches", "4/4"] }],
+    ["confirm({'2026-07': (1, 1, 7), '2026-08': (1, 1, 10)})", "confirm"],
+    ["report('stage', '', 2, 2)", { stage: ["✓", "Stage files", "2/2"] }],
+    ["report('commit', '', 0, 2)", { commit: ["⠹", "Commit, verify, index", "0/2"] }],
+    ["report('commit', '2026-07', 1, 2)", { commit: ["⠸", "Commit, verify, index 2026-07", "1/2"] }],
+    ["report('commit', '2026-08', 2, 2)", { commit: ["✓", "Commit, verify, index 2026-08", "2/2"] }],
+    ["return {'status': 'done', 'files_moved': 2, …}", "summary"]
+  ];
+  var calls = document.getElementById("calls"), screen = document.getElementById("screen");
+  var timer = null;
+  function render(rows, extra) {
+    var out = "";
+    ["query", "scan", "stage", "commit"].forEach(function (k) {
+      if (!rows[k]) return;
+      var r = rows[k], done = r[0] === "✓";
+      out += (done ? "<span class='g'>✓</span>" : "<span class='c'>" + r[0] + "</span>") + " " + r[1] + "  <span class='d'>" + (done ? "━━━━━━━━━━" : "━━━━╺━━━━━") + "</span> " + r[2] + "\n";
+    });
+    screen.innerHTML = out + (extra || "");
+  }
+  function play(no) {
+    clearInterval(timer);
+    var rows = {}, i = 0, log = [];
+    calls.textContent = ""; render(rows);
+    timer = setInterval(function () {
+      if (i >= script.length) { clearInterval(timer); return; }
+      var s = script[i++], extra = "";
+      if (s[1] === "confirm") {
+        extra = "\n<span class='y'>Month     Barcodes  Files  Size  Status\n2026-07          1      1  7 B   to archive\n2026-08          1      1  10 B  to archive</span>\nArchive 2 barcodes (2 files, 17 B) into 2 monthly archive(s)? [y/n] (n): " + (no ? "<span class='r'>n</span>" : "<span class='g'>y</span>");
+        log.push(s[0] + "  -> " + (no ? "False" : "True"));
+        if (no) {
+          log.push("return {'status': 'cancelled', 'files_moved': 0, …}");
+          calls.textContent = log.join("\n");
+          render(rows, extra + "\n\n<span class='y'>╭──────────────────────────────────────────────╮\n│ Cancelled. Nothing was moved or recorded.    │\n╰──────────────────────────────────────────────╯</span>");
+          clearInterval(timer); return;
+        }
+      } else if (s[1] === "summary") {
+        extra = "\n<span class='g'>╭─ Finisar log backup ──────────────────────────╮\n│ Window      (start) .. 2026-11-02             │\n│ Candidates  3 barcodes                        │\n│ To archive  2 files (2 barcodes)              │\n│ Committed   2 files (2 barcodes)              │\n│ Errors      0                                 │\n╰───────────────────────────────────────────────╯</span>";
+        log.push(s[0]);
+      } else {
+        for (var k in s[1]) rows[k] = s[1][k];
+        log.push(s[0]);
+      }
+      calls.textContent = log.join("\n");
+      render(rows, extra);
+    }, 650);
+  }
+  document.getElementById("play").addEventListener("click", function () { play(false); });
+  document.getElementById("answer-no").addEventListener("click", function () { play(true); });
+  render({});
+})();
+</script>
+
+<h2>How the two files find each other</h2>
+<div class="tabs">
+<div role="tablist" aria-label="How files are found">
+<button role="tab" aria-controls="f1" id="tf1">From source</button>
+<button role="tab" aria-controls="f2" id="tf2">As FinisarLogsBackup.exe</button>
+<button role="tab" aria-controls="f3" id="tf3">Finding config.json</button>
+</div>
+<div role="tabpanel" id="f1" aria-labelledby="tf1">
+<pre><code>import logs_backup as lb      # first line of logic in backup_ui.py</code></pre>
+<p>Python looks for <code>logs_backup.py</code> in the folder of the script it is running, so the two files must sit side by side. That is the whole connection: an ordinary import, then ordinary function calls in the same process. <code>run_backup.bat</code> just runs <code>backup_ui.py</code> with <code>.venv\Scripts\python.exe</code> if it exists, else <code>python</code>.</p></div>
+<div role="tabpanel" id="f2" aria-labelledby="tf2">
+<p><code>build_exe.bat</code> runs PyInstaller on <code>backup_ui.py</code>. PyInstaller follows the imports and packs Python itself, both <code>.py</code> files and the libraries (<code>rich</code>, <code>pymssql</code> with its FreeTDS, <code>blake3</code>) into one file. At start-up the .exe unpacks to a temporary folder and runs from there.</p>
+<p>That is why <code>program_dir()</code> exists: in the .exe, <code>__file__</code> points into the temporary folder, so "next to the program" must use <code>sys.executable</code> (the .exe's real folder) instead. <code>mochi.exe</code> is <b>not</b> packed inside; it is found at run time like any other install.</p></div>
+<div role="tabpanel" id="f3" aria-labelledby="tf3">
+<p><code>find_config()</code>: the path given on the command line, else <code>config.json</code> in the current folder, else <code>config.json</code> next to the program (the .exe's folder when frozen). Double-clicking the .exe starts it in its own folder, so a <code>config.json</code> beside it is found. <code>backup.log</code> is written next to whichever config was used.</p></div>
+</div>
+
+<h2><code>main()</code> step by step</h2>
+<div class="stepper" data-src="ui-steps"></div>
+<script type="application/json" id="ui-steps">[
+{"title":"Parse options","who":"<code>argparse</code>","html":"<p><code>[CONFIG] --dry-run --yes --check-sql --export DIR</code>. No options = a normal interactive run.</p>"},
+{"title":"Find the config","who":"<code>lb.find_config</code>","html":"<p>On failure: a red <i>Config problem</i> panel and exit code 2, before anything else happens.</p>"},
+{"title":"Set up logging (two places)","who":"<code>RichHandler</code> + <code>FileHandler</code>","html":"<p>Warnings and errors go to the screen (without tracebacks). <b>Everything</b> from INFO up goes to <code>backup.log</code> next to the config, with timestamps, for audit. The logic only uses <code>log.info/warning/error</code>; where it ends up is the UI's choice.</p>"},
+{"title":"Read the config","who":"<code>lb.Config</code>","html":"<p>Invalid JSON, a missing key or a broken path → <i>Config problem</i> panel, exit 2. If the error is about an escape, it adds: write Windows paths with <code>/</code>.</p>"},
+{"title":"Branch: --export","who":"<code>export(cfg, target)</code> → <code>lb.export</code>","html":"<p>Copies archives, index (SQLite backup API), config without password, staging if any, and <code>RESTORE.txt</code>. Draws a table of what was copied now vs unchanged. No SQL password needed.</p>"},
+{"title":"Ask for the SQL password","who":"<code>Prompt.ask(..., password=True)</code>","html":"<p>Only if a user is set and the password is empty in both <code>config.json</code> and <code>DB_PASSWORD</code>. Typed hidden, kept in memory for this run, never written.</p>"},
+{"title":"Branch: --check-sql","who":"<code>check_setup</code>","html":"<p>Finds mochi (green or red panel), then makes <b>one</b> SQL Server connection (<code>SELECT @@VERSION</code>, no retries). Changes nothing on disk. Exit 1 if either fails.</p>"},
+{"title":"Run","who":"<code>lb.run(cfg, dry_run, report=Steps(progress), confirm=ask_confirm(progress, yes))</code>","html":"<p>The progress display is live while the logic runs. <code>ask_confirm</code> pauses it to print the table and ask, then resumes it.</p>"},
+{"title":"If it fails","who":"<code>except Exception</code>","html":"<p>Marks the running step with a red ✗, writes the full traceback to <code>backup.log</code>, and shows: <i>Nothing is lost: files not yet committed are still in the source folders or in staging. Run again to continue.</i> Exit 1.</p>"},
+{"title":"Summary and email","who":"<code>print_summary</code>, <code>lb.send_email</code>","html":"<p>Archive table plus totals. Only after <code>status == 'done'</code> and with <code>email</code> configured is the report emailed. When the .exe was double-clicked (no arguments), it waits for Enter so the window does not vanish.</p>"}
+]</script>
+
+<h2>Options</h2>
+<div class="table-wrap"><table>
+<tr><th>Command</th><th>Does</th><th>Moves files?</th></tr>
+<tr><td><code>backup_ui.py</code></td><td>Normal run, asks before moving</td><td>Yes, after "y"</td></tr>
+<tr><td><code>--dry-run</code></td><td>Query and scan, show what would be archived</td><td>No</td></tr>
+<tr><td><code>--yes</code></td><td>Normal run without the question</td><td>Yes</td></tr>
+<tr><td><code>--check-sql</code></td><td>Find mochi, connect to SQL Server once</td><td>No</td></tr>
+<tr><td><code>--export DIR</code></td><td>Copy everything needed to restore, each file BLAKE3-checked</td><td>No (copies)</td></tr>
+<tr><td><code>python logs_backup.py [--dry-run] [--export DIR]</code></td><td>Same logic, plain log lines, never asks</td><td>Yes</td></tr>
+</table></div>
+
+<h2>Check yourself</h2>
+<div class="quiz"><p class="q">A developer wants the UI to delete empty staging folders after a run. Where should that code go?</p>
+<div class="opts"><button>In <code>backup_ui.py</code>, after <code>print_summary</code>.</button><button data-right>In <code>logs_backup.py</code> (it already does this in <code>finish_staged</code>).</button><button>In a new callback.</button></div>
+<p class="why">File operations belong to the logic, where they are tested and ordered with the safety rules. The UI only draws.</p></div>
+
+</main>
+</div>
+</body>
+</html>

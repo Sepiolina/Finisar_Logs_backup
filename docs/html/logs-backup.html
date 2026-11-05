@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>logs_backup.py Walkthrough</title>
+<meta name="description" content="Every function in logs_backup.py, in run order: what it does, why it is written that way, who calls it, and what to watch when changing it.">
+<link rel="stylesheet" href="assets/site.css">
+<script src="assets/site.js"></script>
+<style>
+.fn .meta { font-size: .85rem; color: var(--ink-3); margin: 4px 0 8px; }
+.fn .why { border-left: 3px solid var(--sql); padding-left: 10px; margin: 8px 0; }
+.fn .watch { border-left: 3px solid var(--bad); padding-left: 10px; margin: 8px 0; }
+.calltree { font: 13px/1.7 var(--mono); }
+.calltree ul { list-style: none; padding-left: 18px; margin: 0; border-left: 1px dashed var(--line); }
+.calltree > ul { border-left: 0; padding-left: 0; }
+.calltree a { text-decoration: none; }
+.calltree .rs { color: var(--rs); } .calltree .db { color: var(--db); } .calltree .sql { color: var(--sql); }
+</style>
+</head>
+<body>
+<div class="layout">
+<aside class="side"><a class="brand" href="index.html">Finisar Logs Backup<small>Developer guide</small></a><nav></nav></aside>
+<main class="main">
+<div class="topbar"><button class="menu-btn">☰ Menu</button><span class="crumbs">File by file › logs_backup.py</span><button class="theme-btn">Theme</button></div>
+
+<h1><code>logs_backup.py</code></h1>
+<p class="lead">All the backup logic, about 920 lines, laid out top to bottom in the order a run executes it and split by <code># ---- section</code> comments. Each function below opens to show what it does, why, and what to watch when changing it.</p>
+
+<div class="tools">
+<input type="text" id="filter" placeholder="Filter functions… (e.g. hash, sqlite, mochi)" aria-label="Filter functions" style="flex:1">
+<button data-expand="open" data-target=".main">Open all</button>
+<button data-expand="close" data-target=".main">Close all</button>
+</div>
+
+<h2 id="call-tree">Who calls whom</h2>
+<p>The run, as a tree of calls. Colors show what each call reaches: <span class="badge rs">mochi.exe</span> <span class="badge db">SQLite</span> <span class="badge sql">SQL Server</span>. Click a name to jump to it.</p>
+<div class="card calltree"><ul>
+<li><a href="#f-run">run</a>
+<ul>
+<li><a href="#f-lock_run">lock_run</a> <span class="muted">— OS lock on .backup.lock</span></li>
+<li><a href="#f-_run">_run</a>
+<ul>
+<li><a href="#f-check_mochi">check_mochi</a> → <a href="#f-mochi_places">mochi_places</a> → <a href="#f-registry_mochi">registry_mochi</a> · <span class="rs">mochi --version</span></li>
+<li><a href="#f-prepare_folders">prepare_folders</a></li>
+<li><a href="#f-open_index">open_index</a> <span class="db">CREATE TABLE…</span></li>
+<li><a href="#f-_run_with_index">_run_with_index</a>
+<ul>
+<li><a href="#f-finish_staged">finish_staged</a>(resume=True) <span class="muted">— only if a manifest is left over</span></li>
+<li><a href="#f-query_window">query_window</a> <span class="db">last success</span></li>
+<li>candidates_fn → <a href="#f-query_candidates">query_candidates</a> → <a href="#f-run_sql">run_sql</a> → <a href="#f-set_encryption">set_encryption</a> · <span class="sql">SELECT</span></li>
+<li><a href="#f-scan">scan</a> → <a href="#f-walk_files">walk_files</a>, <a href="#f-has_extension">has_extension</a>, <a href="#f-find_barcodes">find_barcodes</a></li>
+<li><a href="#f-plan">plan</a> → confirm(volumes) <span class="muted">— UI callback</span></li>
+<li><a href="#f-start_session">start_session</a> · <span class="db">session_barcode</span></li>
+<li><a href="#f-stage">stage</a> <span class="muted">— manifest + fsync, then rename</span></li>
+<li><a href="#f-finish_staged">finish_staged</a>
+<ul>
+<li><a href="#f-read_manifest">read_manifest</a></li>
+<li>worker threads: <a href="#f-commit_month">commit_month</a>
+<ul>
+<li><a href="#f-hash_all">hash_all</a> → <a href="#f-b3">b3</a></li>
+<li><a href="#f-commit">commit</a> → <a href="#f-mochi">mochi</a> <span class="rs">create / append</span></li>
+<li><a href="#f-head_files">head_files</a> → <a href="#f-mochi">mochi</a> <span class="rs">list</span></li>
+<li><a href="#f-mochi">mochi</a> <span class="rs">verify --level content</span></li>
+</ul></li>
+<li>main thread: <a href="#f-index_month">index_month</a> <span class="db">upsert</span>, then delete staged copies</li>
+<li><a href="#f-complete_session">complete_session</a> <span class="db">success</span></li>
+</ul></li>
+</ul></li>
+<li><span class="db">db.close()</span> <span class="muted">— always, in finally</span></li>
+</ul></li>
+</ul></li>
+</ul></div>
+
+<h2 id="constants">Constants and schema</h2>
+<details class="fn" id="f-constants"><summary><code>DELIMITERS, MANIFEST_BATCH, WORKERS, SCHEMA</code> <span class="what">the knobs</span></summary><div class="body">
+<table class="small">
+<tr><td><code>DELIMITERS = "_.-"</code></td><td>Characters allowed on each side of a barcode in a file name.</td></tr>
+<tr><td><code>MANIFEST_BATCH = 2000</code></td><td>Manifest lines synced per <code>fsync</code> before their files move. Bigger = fewer syncs. Safety does not depend on its value.</td></tr>
+<tr><td><code>WORKERS = min(cpu_count, 8)</code></td><td>Hashing threads, and how many months are committed side by side.</td></tr>
+<tr><td><code>SCHEMA_VERSION = 2</code>, <code>SCHEMA</code></td><td>The four SQLite tables (<a href="data.html#the-sqlite-index">described here</a>), all <code>CREATE … IF NOT EXISTS</code>.</td></tr>
+</table>
+<div class="why">Why <code>now()</code> returns <code>"epoch:1730000000"</code> and not a date: the format is the one the earlier tool wrote, so both tools' indexes read the same.</div>
+</div></details>
+<details class="fn" id="f-quiet"><summary><code>BackupError</code>, <code>quiet(step, message, done, total)</code> <span class="what">expected failures; the do-nothing progress callback</span></summary><div class="body">
+<p><code>BackupError</code> is raised for every <b>expected</b> problem (bad config, mochi missing, SQL login wrong, a month that failed). Its message is written for the operator. Anything else that is raised is a bug or an OS error.</p>
+<p><code>quiet</code> is the default <code>report</code> callback, so the logic can always call <code>report(...)</code> without checking whether a UI is attached.</p>
+</div></details>
+
+<h2 id="config">Config</h2>
+<details class="fn" id="f-program_dir"><summary><code>program_dir()</code> <span class="what">the folder this program lives in</span></summary><div class="body">
+<p>The .exe's folder when frozen by PyInstaller (<code>sys.frozen</code>), otherwise the folder of <code>logs_backup.py</code>.</p>
+<div class="why">In the .exe, <code>__file__</code> points into a temporary unpack folder that disappears after the run. Looking for <code>config.json</code> or <code>mochi.exe</code> "next to the program" must use the real .exe location.</div>
+</div></details>
+<details class="fn" id="f-find_config"><summary><code>find_config(given=None)</code> <span class="what">which config.json to use</span></summary><div class="body">
+<p>The given path; else <code>config.json</code> in the current folder; else next to the program. Raises with both folders named if none exists. <span class="muted">Test: test_config_is_found_without_an_argument.</span></p>
+</div></details>
+<details class="fn" id="f-Config"><summary><code>class Config</code> <span class="what">reads and checks config.json</span></summary><div class="body">
+<p>Turns the JSON into attributes (<code>source_dir</code>, <code>output_dir</code>, <code>staging_dir</code>, <code>db_path</code>, <code>subfolders</code>, <code>extensions</code>, <code>recursive</code>, <code>lookback_days</code>, <code>date_range</code>, <code>mochi</code>, <code>email</code>, <code>sql</code>) with defaults. <code>sql</code> merges <code>sql_server</code> with <code>DB_*</code> environment variables (environment wins). Two helpers: <code>cfg.manifest</code> and <code>cfg.archive(month)</code> → <code>output_dir/YYYY/YYYY-MM.mochi</code>.</p>
+<p>Refuses: a path with a control character (a JSON <code>\b</code> or <code>\t</code> from a Windows backslash), a subfolder that is not one plain folder name, a non-boolean <code>recursive</code>.</p>
+<div class="why">Validating up front means a typo stops the run before anything is touched, with a message that names the setting.</div>
+<div class="watch">A subfolder like <code>../other</code> would let the scan leave <code>source_dir</code>; the plain-name check prevents it. Keep it if you add settings that become paths.</div>
+</div></details>
+
+<h2 id="sqlite-index">SQLite index</h2>
+<details class="fn" id="f-open_index"><summary><code>open_index(path)</code> / <code>_check_index</code> <span class="what">open or create index.db; caller must close it</span></summary><div class="body">
+<p>Creates the folder, connects, checks <code>user_version</code> is 0 (new) or 2 and that no old-format columns exist, then runs the schema. On any failure after connecting, it <b>closes the connection before raising</b>.</p>
+<div class="watch">On Windows an open SQLite connection locks the file: nothing can move or delete <code>index.db</code> until it is closed. Every caller closes it (<code>_run</code> in a <code>finally</code>; tests via <code>addCleanup</code>). <code>with db:</code> is a transaction, it does <b>not</b> close.</div>
+</div></details>
+<details class="fn" id="f-start_session"><summary><code>start_session(db, from, to)</code></summary><div class="body"><p>Inserts a <code>scan_session</code> row with status <code>running</code>; returns its id.</p></div></details>
+<details class="fn" id="f-complete_session"><summary><code>complete_session(db, sid, status, barcodes, moved, errors)</code></summary><div class="body"><p>Sets <code>completed_at</code>, the final status (<code>success</code> / <code>failed</code>) and totals.</p></div></details>
+<details class="fn" id="f-query_window"><summary><code>query_window(db, cfg)</code> <span class="what">which dates to ask SQL Server for</span></summary><div class="body">
+<p><code>date_range</code> if set. Otherwise: end = today (UTC) − <code>lookback_days</code>; start = last successful run's end − 1 day, or <code>None</code> on the first run. Sessions dated <code>resumed</code> are ignored.</p>
+<div class="why">The start comes from the index, not a fixed schedule, so a missed week is caught up automatically.</div>
+</div></details>
+
+<h2 id="sql-server">SQL Server</h2>
+<details class="fn" id="f-query_candidates"><summary><code>query_candidates(sql_login, from, to)</code> <span class="badge sql">SQL</span> <span class="what">the one business query</span></summary><div class="body">
+<pre><code>SELECT DISTINCT sfs.serial_no, CONVERT(VARCHAR(50), sft.last_update, 120)
+FROM ForthUtilities.dbo.ShipmentFinisarSerial sfs WITH (NOLOCK)
+JOIN ForthUtilities.dbo.ShipmentFinisarTrace sft WITH (NOLOCK) ON sfs.trace_id = sft.trace_id
+WHERE sft.last_update &gt;= %s AND sft.last_update &lt; %s</code></pre>
+<p>Dates are <b>parameters</b> (<code>%s</code>), never pasted into the text: no SQL injection, no date-format surprises. Barcodes are stripped of spaces. Returns <code>[(barcode, "YYYY-MM-DD HH:MM:SS")]</code>.</p>
+<div class="why"><code>WITH (NOLOCK)</code> reads without taking locks, so the backup never blocks the production database. The price is a "dirty read": a row being written at that moment may be seen early or not at all. It is the same query the earlier tool ran; the 1-day window overlap gives a late row a second chance.</div>
+</div></details>
+<details class="fn" id="f-run_sql"><summary><code>run_sql(sql_login, sql, params, retries)</code> <span class="what">connect, run, retry with backoff</span></summary><div class="body">
+<p>Imports <code>pymssql</code> only here (the rest of the module and the tests work without it). Names any missing login part. A <code>HOST\NAME</code> server connects by instance name with no port. Retries <code>DB_RETRY_ATTEMPTS</code> times (default 3) waiting 2 s, 4 s, 8 s…; the last failure becomes a <code>BackupError</code> via <code>sql_error</code>.</p>
+</div></details>
+<details class="fn" id="f-check_sql"><summary><code>check_sql(sql_login)</code></summary><div class="body"><p><code>SELECT @@VERSION</code> with no retries, for <code>--check-sql</code>.</p></div></details>
+<details class="fn" id="f-set_encryption"><summary><code>set_encryption(mode)</code> <span class="what">login encryption through a tiny freetds.conf</span></summary><div class="body">
+<p>Normalises <code>null/true/false/"yes"/"0"…</code> to <code>request</code>, <code>require</code> or <code>off</code>, writes <code>[global] encryption = &lt;mode&gt;</code> to a temp file and points <code>FREETDSCONF</code> at it. <code>off</code> logs a warning every run.</p>
+<div class="why">FreeTDS (the driver inside <code>pymssql</code>) reads this setting only from a config file, not from a connect argument.</div>
+</div></details>
+<details class="fn" id="f-sql_error"><summary><code>sql_error(e)</code>, <code>SQL_HINTS</code> <span class="what">one readable line + a hint</span></summary><div class="body">
+<p><code>pymssql</code> errors are a code plus a multi-line byte string. This keeps the first meaningful line, takes the code from the text when it starts with <code>DB-Lib error message N</code> (pymssql can keep a stale code), and adds a hint for 20002 (handshake/port/encryption), 20009 (unreachable), 18456 (login), 4060 (database).</p>
+</div></details>
+
+<h2 id="scan">Scan</h2>
+<details class="fn" id="f-find_barcodes"><summary><code>find_barcodes(name, barcodes)</code> <span class="what">barcodes bounded by delimiters</span></summary><div class="body">
+<pre><code>starts = [0] + [i + 1 for i, c in enumerate(name) if c in DELIMITERS]
+ends   = [i for i, c in enumerate(name) if c in DELIMITERS] + [len(name)]
+return {name[s:e] for s in starts for e in ends if e &gt; s and name[s:e] in barcodes}</code></pre>
+<p>Every substring that starts at a boundary and ends at a boundary, looked up in a set. <a href="run-flow.html#matching-playground">Try it in the playground.</a></p>
+</div></details>
+<details class="fn" id="f-has_extension"><summary><code>has_extension(name, extensions)</code></summary><div class="body"><p>Text after the last <code>.</code>, lower-cased, must be in the set. No dot = no extension.</p></div></details>
+<details class="fn" id="f-walk_files"><summary><code>walk_files(top, recursive, skip, on_error)</code> <span class="what">streaming folder walk</span></summary><div class="body">
+<p>A loop with an explicit stack, using <code>os.scandir</code>: yields <code>(folder below top, entry)</code> for each file. Does not follow symlinks; does not enter folders in <code>skip</code> (staging and output); passes unreadable folders to <code>on_error</code> and goes on.</p>
+<div class="why">A generator never holds a whole huge folder tree in memory; an explicit stack avoids Python's recursion limit on deep trees. Skipping staging matters when <code>staging_dir</code> is inside a subfolder: otherwise a run would re-scan its own staged files.</div>
+</div></details>
+<details class="fn" id="f-scan"><summary><code>scan(cfg, dates, report)</code> <span class="what">→ (entries, errors, scanned)</span></summary><div class="body">
+<p>For each subfolder, each file: allowed extension, exactly one barcode, a valid <code>YYYY-MM</code> month from <code>dates[barcode]</code>. Builds manifest-ready dicts. Two or more barcodes = ambiguous, counted as an error and left in place. Reports progress every 2,000 files.</p>
+</div></details>
+<details class="fn" id="f-staged_path"><summary><code>staged_path(cfg, entry)</code></summary><div class="body"><p><code>staging_dir / volume_name / relative_path</code>. The single definition of where a staged file lives.</p></div></details>
+
+<h2 id="stage">Stage</h2>
+<details class="fn" id="f-stage" open><summary><code>stage(cfg, sid, entries, report)</code> <span class="what">the most safety-critical function</span></summary><div class="body">
+<ol>
+<li>Refuses if staging and source are on different devices (<code>st_dev</code>): a rename cannot cross drives.</li>
+<li>Creates the target folders.</li>
+<li>Writes the header line, then per batch of 2,000: write lines → <code>flush()</code> → <code>os.fsync()</code> → rename each file.</li>
+<li>Never overwrites: an existing target raises <code>FileExistsError</code> for that file, which is logged and left in the source.</li>
+</ol>
+<div class="why">"Listed before moved" makes the manifest a complete list of staging. Renames run on one thread: measured, threads made them slower because they queue on the same folder.</div>
+<div class="watch">Do not reorder the fsync and the rename, do not replace <code>os.rename</code> with a copy+delete, and do not add an overwrite: each would break "a file is in exactly one place".</div>
+</div></details>
+<details class="fn" id="f-read_manifest"><summary><code>read_manifest(cfg)</code> <span class="what">→ (session id, entries) or None</span></summary><div class="body"><p>A broken header = nothing safe to resume (<code>None</code>). A broken line (only the last can be, after a crash) is skipped.</p></div></details>
+
+<h2 id="mochi">MOCHI</h2>
+<p>The full story of this section, with an interactive search order and real JSON, is on <a href="python-rust.html">Python ↔ MOCHI</a>.</p>
+<details class="fn" id="f-registry_mochi"><summary><code>registry_mochi(reg=None)</code> <span class="what">Windows: where the MOCHI setup put mochi.exe</span></summary><div class="body"><p>App Paths (HKCU, then HKLM), then the install-location key + <code>bin\mochi.exe</code>. <code>[]</code> off Windows. Tests pass a fake <code>reg</code>.</p></div></details>
+<details class="fn" id="f-mochi_places"><summary><code>mochi_places(configured)</code></summary><div class="body"><p>The configured path only, or: registry, PATH, <code>%LOCALAPPDATA%/MOCHI/bin</code>, <code>~/.cargo/bin</code>, program folder, <code>../MOCHI/target/release</code>, <code>../mochi/target/release</code>. Order kept, repeats removed.</p></div></details>
+<details class="fn" id="f-check_mochi"><summary><code>check_mochi(cfg)</code> <span class="badge rs">--version</span></summary><div class="body"><p>Tries each place; the first that exits 0 and prints <code>mochi …</code> wins and <code>cfg.mochi</code> becomes its full path. Otherwise raises, listing every place and why it failed, plus a hint if only the desktop app is installed (<code>desktop_app_hint</code>).</p></div></details>
+<details class="fn" id="f-mochi"><summary><code>mochi(cfg, *args)</code> <span class="badge rs">every command</span> <span class="what">the only door to mochi.exe</span></summary><div class="body">
+<pre><code>p = subprocess.run([cfg.mochi, "--json", "--no-local-history", *map(str, args)],
+                   capture_output=True, text=True)
+out = json.loads(p.stdout)        # {} if not JSON
+if p.returncode not in (0, 2):
+    raise BackupError(f"mochi {args[0]} {args[1]}: exit {p.returncode} {out.get('error') or p.stderr.strip()}")
+return out</code></pre>
+<p>If <code>cfg.mochi</code> is not yet an absolute path it calls <code>check_mochi</code> first. Arguments are a <b>list</b>, never one string through a shell, so paths with spaces or special characters cannot be misread.</p>
+</div></details>
+<details class="fn" id="f-head_files"><summary><code>head_files(cfg, archive)</code> <span class="badge rs">list</span></summary><div class="body"><p><code>({path: content_hash}, (seq, commit_id))</code> for files in the head; <code>({}, None)</code> if the archive does not exist.</p></div></details>
+<details class="fn" id="f-b3"><summary><code>b3(path)</code>, <code>hash_all(pool, paths, chunk=500)</code></summary><div class="body"><p id="f-hash_all"><code>b3</code>: BLAKE3 of a file through a memory map, with BLAKE3's own multithreading for large files. <code>hash_all</code>: submits chunks of 500 paths to the pool and returns a lazy iterator of hashes in order, so hashing runs while MOCHI commits.</p></div></details>
+<details class="fn" id="f-commit"><summary><code>commit(cfg, month)</code> <span class="badge rs">create / append</span></summary><div class="body"><p><code>create</code> if the archive file does not exist, else <code>append</code>, with every <code>staging/&lt;month&gt;/&lt;SUB&gt;</code> folder as input. Logs <i>DEGRADED (not an error)</i> when <code>durability</code> is not <code>durable</code>.</p></div></details>
+<details class="fn" id="f-commit_month" open><summary><code>commit_month(cfg, month, entries, resume=False)</code> <span class="what">commit + check one month; runs on a worker thread</span></summary><div class="body">
+<ol>
+<li>Start hashing every staged file.</li>
+<li>Normal: <code>commit</code>. Resume: list the head first; commit only if some staged file is missing or differs (prevents a duplicate commit after a crash).</li>
+<li>List the head; every staged path must have the same hash, else raise.</li>
+<li><code>mochi verify --level content</code>.</li>
+<li>Return <code>(hashes, (seq, commit_id))</code>.</li>
+</ol>
+<div class="watch">It must not touch SQLite or delete anything: it runs on a worker thread, and the main thread decides about deletion only after indexing. Keep it that way.</div>
+</div></details>
+
+<h2 id="index-and-clean-up">Index and clean up</h2>
+<details class="fn" id="f-index_month"><summary><code>index_month(db, cfg, sid, month, entries, hashes, head)</code> <span class="badge db">one transaction</span></summary><div class="body"><p>Inside <code>with db:</code> (commit or roll back as a whole): insert/update the month's <code>file_storage_volume</code>, upsert each <code>scanned_log_entry</code> (<code>ON CONFLICT … DO UPDATE</code>), recount <code>entry_count</code>.</p>
+<div class="why">An upsert makes re-indexing after a crash harmless: same rows, same values.</div></div></details>
+<details class="fn" id="f-finish_staged" open><summary><code>finish_staged(db, cfg, report, resume=False)</code> <span class="what">archive what the manifest lists</span></summary><div class="body">
+<ol>
+<li>Read the manifest (none → return <code>None</code>). If its session is missing from the index, record into a new <code>resumed</code> session.</li>
+<li>Keep entries whose staged file exists; group by month.</li>
+<li>Submit <code>commit_month</code> per month to a pool.</li>
+<li>On the main thread, month by month: get the result → <code>index_month</code> → delete that month's staged files. A failure is logged; the month keeps its files; the others go on.</li>
+<li>If any month failed: raise, keep the manifest.</li>
+<li>Else: delete the manifest, remove empty folders, report (never delete) files not in the manifest, complete the session.</li>
+</ol>
+</div></details>
+
+<h2 id="run">Run</h2>
+<details class="fn" id="f-lock_run"><summary><code>lock_run(cfg)</code> <span class="what">one run at a time</span></summary><div class="body"><p>Creates <code>output_dir</code>, opens <code>.backup.lock</code>, takes a non-blocking exclusive OS lock (<code>msvcrt.locking</code> / <code>fcntl.flock</code>). Returns the open file; closing it (end of the <code>with</code>, or process death) releases the lock.</p></div></details>
+<details class="fn" id="f-plan"><summary><code>plan(entries)</code></summary><div class="body"><p><code>{month: (barcodes, files, bytes)}</code>, sorted. Used for the confirm question, the dry run and the summary.</p></div></details>
+<details class="fn" id="f-run"><summary><code>run(cfg, candidates_fn, dry_run, report, confirm)</code> <span class="what">the public entry point</span></summary><div class="body"><p>Defaults <code>candidates_fn</code> to the SQL Server query, takes the lock, calls <code>_run</code>. Contract: <a href="ui.html#the-contract-in-full">UI ↔ logic</a>.</p></div></details>
+<details class="fn" id="f-prepare_folders"><summary><code>prepare_folders(cfg)</code></summary><div class="body"><p>Creates output, staging and the index folder (clear error naming the setting if it cannot). Warns, without creating it, if <code>source_dir</code> is missing.</p></div></details>
+<details class="fn" id="f-_run"><summary><code>_run(...)</code></summary><div class="body"><p><code>check_mochi</code> (fatal unless dry run) → <code>prepare_folders</code> (not in a dry run) → <code>open_index</code> → <code>_run_with_index</code> in <code>try</code>, <code>db.close()</code> in <code>finally</code>.</p></div></details>
+<details class="fn" id="f-_run_with_index"><summary><code>_run_with_index(db, ...)</code> <span class="what">the run itself</span></summary><div class="body">
+<p>Resume leftovers → window → query → scan → plan. Dry run: return. Confirm says no: return <code>cancelled</code>. Otherwise: start session, record new barcodes (skipping ones already recorded), stage, finish, complete. Any exception marks the session <code>failed</code> and re-raises.</p>
+</div></details>
+
+<h2 id="export-and-email">Export and email</h2>
+<details class="fn" id="f-copy_checked"><summary><code>copy_checked(src, dst)</code></summary><div class="body"><p>Copies through <code>dst.partial</code>, hashing while reading, <code>fsync</code>, re-hashes the copy, keeps the timestamps, then renames into place. A mismatch deletes the partial and raises.</p></div></details>
+<details class="fn" id="f-export"><summary><code>export(cfg, target, report)</code> <span class="what">an independent copy to restore from</span></summary><div class="body">
+<p>Refuses a target inside (or containing) the source or output folder. Holds the run lock. Copies every archive and any staged file with <code>copy_checked</code>, skipping archives unchanged since the last export (size + mtime in <code>export-manifest.json</code>). Copies the index with SQLite's <b>backup API</b> (a consistent snapshot, unlike a file copy), writes <code>config.json</code> with the password removed, and <code>RESTORE.txt</code>.</p></div></details>
+<details class="fn" id="f-send_email"><summary><code>send_email(cfg, summary)</code></summary><div class="body"><p>Best effort: POSTs an HTML table to <code>{api_base_url}/api/email/send</code>; barcodes are HTML-escaped and the body is capped at 95,000 characters. A failure is a warning.</p></div></details>
+<details class="fn" id="f-main"><summary><code>main()</code> <span class="what">python logs_backup.py</span></summary><div class="body"><p>Plain logging to the console, no questions: <code>[config] [--dry-run] [--export DIR]</code>. For scheduled tasks.</p></div></details>
+
+<script>
+(function () {
+  var f = document.getElementById("filter");
+  f.addEventListener("input", function () {
+    var q = f.value.trim().toLowerCase();
+    document.querySelectorAll("details.fn").forEach(function (d) {
+      var hit = !q || d.textContent.toLowerCase().indexOf(q) >= 0;
+      d.style.display = hit ? "" : "none";
+      if (q && hit) d.open = true;
+    });
+  });
+  document.querySelectorAll(".calltree a").forEach(function (a) {
+    a.addEventListener("click", function () {
+      var t = document.querySelector(a.getAttribute("href"));
+      if (t && t.tagName === "DETAILS") t.open = true;
+      else if (t && t.closest("details")) t.closest("details").open = true;
+    });
+  });
+  if (location.hash) {
+    var t = document.querySelector(location.hash);
+    if (t && t.tagName === "DETAILS") t.open = true;
+  }
+})();
+</script>
+
+</main>
+</div>
+</body>
+</html>

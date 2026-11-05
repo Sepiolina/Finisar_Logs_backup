@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>One Backup Run</title>
+<meta name="description" content="Walk through one backup run step by step, simulate a crash at any point, and try the filename matching rules.">
+<link rel="stylesheet" href="assets/site.css">
+<script src="assets/site.js"></script>
+</head>
+<body>
+<div class="layout">
+<aside class="side"><a class="brand" href="index.html">Finisar Logs Backup<small>Developer guide</small></a><nav></nav></aside>
+<main class="main">
+<div class="topbar"><button class="menu-btn">☰ Menu</button><span class="crumbs">Start › One run</span><button class="theme-btn">Theme</button></div>
+
+<h1>One run, step by step</h1>
+<p class="lead">Follow four small log files through a complete run. At each step you see which code runs, who does the work (Python, MOCHI or SQLite), and where every file is.</p>
+
+<h2>The example</h2>
+<p>This is the same data the automated tests use (<code>test_logs_backup.py</code>, class <code>Flow</code>), so everything below is checked on every build.</p>
+<div class="grid">
+<div class="card"><h3>SQL Server returns</h3>
+<table><tr><th>barcode</th><th>last_update</th></tr>
+<tr><td>BC001</td><td>2026-08-03 10:00</td></tr>
+<tr><td>BC002</td><td>2026-07-30 09:00</td></tr>
+<tr><td>BC404</td><td>2026-08-01 00:00</td></tr></table></div>
+<div class="card"><h3>Files in the source folder</h3>
+<ul class="small">
+<li><code>BURNIN/unit1_BC001_log.txt</code></li>
+<li><code>ESS/unit2_BC002.txt</code></li>
+<li><code>ESS/BC0011_other.txt</code></li>
+<li><code>ESS/unit_BC001.csv</code></li>
+</ul></div>
+</div>
+
+<h2>Walk through the run</h2>
+<p>Use the buttons, the step numbers, or the ← → keys. Green chips are what this step just created; struck-through chips are what it removed.</p>
+<div class="stepper" data-src="run-steps" data-lanes="Source folders,Staging,Archives (MOCHI),index.db (SQLite)"></div>
+<script type="application/json" id="run-steps">[
+{"title":"Take the run lock","who":"<span class='badge py'>Python</span> <code>run()</code> → <code>lock_run(cfg)</code>",
+ "html":"<p>Opens <code>output_dir/.backup.lock</code> and asks the operating system for an exclusive lock (<code>msvcrt.locking</code> on Windows, <code>fcntl.flock</code> elsewhere). A second run started at the same time is refused with <i>another backup run is in progress</i>.</p><p class='muted small'>Why an OS lock and not a 'lock file exists' check? The OS releases it when the process dies, even after a crash or power cut, so it can never go stale.</p>",
+ "lanes":{"Source folders":["BURNIN/unit1_BC001_log.txt","ESS/unit2_BC002.txt","ESS/BC0011_other.txt","ESS/unit_BC001.csv"],"Archives (MOCHI)":["+.backup.lock (locked)"]},"hot":["Archives (MOCHI)"]},
+{"title":"Find mochi.exe","who":"<span class='badge py'>Python</span> <code>check_mochi(cfg)</code> → <span class='badge rs'>Rust</span> <code>mochi --version</code>",
+ "html":"<p>Before anything moves, Python makes sure the engine can be started. It tries each known place in order and runs <code>mochi --version</code>; the first that answers <code>mochi 0.9.x</code> wins and its full path is remembered for the rest of the run.</p><p>If none works, a real run stops here with a list of every place it looked. <b>Nothing has moved yet</b>, so stopping is safe. A dry run only warns.</p><p><a href='python-rust.html#how-python-finds-mochi-exe'>Search order, interactive →</a></p>",
+ "lanes":{"Source folders":["BURNIN/unit1_BC001_log.txt","ESS/unit2_BC002.txt","ESS/BC0011_other.txt","ESS/unit_BC001.csv"],"Archives (MOCHI)":[".backup.lock (locked)"]},"hot":[]},
+{"title":"Create folders, open the index, resume leftovers","who":"<span class='badge py'>Python</span> <code>prepare_folders</code>, <code>open_index</code> <span class='badge db'>SQLite</span>",
+ "html":"<p>Creates <code>output_dir</code>, <code>staging_dir</code> and the index's folder if missing (never the source folder: a missing source is a wrong setting). Opens <code>index.db</code>, creating the 4 tables on first use, and refuses an index of another format.</p><p>If <code>.staging/manifest.jsonl</code> exists, an earlier run was interrupted: <b>that batch is finished first</b> (commit, verify, index, delete), before any new work. Here there is none.</p>",
+ "lanes":{"Source folders":["BURNIN/unit1_BC001_log.txt","ESS/unit2_BC002.txt","ESS/BC0011_other.txt","ESS/unit_BC001.csv"],"Staging":["+.staging/ (empty)"],"Archives (MOCHI)":[".backup.lock (locked)"],"index.db (SQLite)":["+4 empty tables"]},"hot":["index.db (SQLite)","Staging"]},
+{"title":"Work out the date window and query SQL Server","who":"<span class='badge py'>Python</span> <code>query_window</code>, <code>query_candidates</code> → <span class='badge sql'>SQL Server</span>",
+ "html":"<p>The window ends at <i>today − lookback_days</i> (default 2). It starts one day before the end of the last <b>successful</b> run, read from <code>scan_session</code>; on the very first run it has no start. The tests set <code>date_range</code> to a fixed window instead.</p><p>One read-only <code>SELECT DISTINCT serial_no, last_update … WHERE last_update &gt;= %s AND last_update &lt; %s</code>, with the dates passed as parameters (never pasted into the SQL text). Result: <b>3 candidates</b>.</p>",
+ "lanes":{"Source folders":["BURNIN/unit1_BC001_log.txt","ESS/unit2_BC002.txt","ESS/BC0011_other.txt","ESS/unit_BC001.csv"],"Staging":[".staging/ (empty)"],"Archives (MOCHI)":[".backup.lock (locked)"],"index.db (SQLite)":["4 empty tables"]},"hot":[]},
+{"title":"Scan the subfolders","who":"<span class='badge py'>Python</span> <code>scan</code> → <code>walk_files</code>, <code>has_extension</code>, <code>find_barcodes</code>",
+ "html":"<p>Walks <code>BURNIN</code>, <code>ESS</code>, … and every folder below them, reading only file <b>names</b>. A file matches when its extension is allowed <b>and</b> its name contains <b>exactly one</b> candidate barcode with <code>_ . -</code> or the name's start/end on both sides.</p><table class='small'><tr><td><code>unit1_BC001_log.txt</code></td><td><span class='badge ok'>match</span> BC001 → month 2026-08</td></tr><tr><td><code>unit2_BC002.txt</code></td><td><span class='badge ok'>match</span> BC002 → month 2026-07</td></tr><tr><td><code>BC0011_other.txt</code></td><td><span class='badge bad'>no</span> BC0011 is not BC001 (no delimiter after BC001)</td></tr><tr><td><code>unit_BC001.csv</code></td><td><span class='badge bad'>no</span> .csv is not an allowed extension</td></tr></table><p>BC404 has no files. Nothing moves in this step.</p>",
+ "lanes":{"Source folders":["BURNIN/unit1_BC001_log.txt ✓","ESS/unit2_BC002.txt ✓","ESS/BC0011_other.txt","ESS/unit_BC001.csv"],"Staging":[".staging/ (empty)"],"Archives (MOCHI)":[".backup.lock (locked)"],"index.db (SQLite)":["4 empty tables"]},"hot":["Source folders"]},
+{"title":"Ask the operator (UI only)","who":"<span class='badge py'>Python</span> <code>confirm(volumes)</code> callback from <code>backup_ui.py</code>",
+ "html":"<p>The logic calls the <code>confirm</code> function the UI passed in, with the plan: <code>{'2026-07': (1 barcode, 1 file, 7 bytes), '2026-08': (1, 1, 10)}</code>. The UI draws a table and asks <i>Archive 2 barcodes (2 files) into 2 monthly archives?</i></p><p>Answer <b>No</b> → <code>run()</code> returns <code>status='cancelled'</code>: <b>nothing moved, nothing written to the index</b>. With <code>--yes</code>, or when run without the UI, there is no question.</p>",
+ "lanes":{"Source folders":["BURNIN/unit1_BC001_log.txt ✓","ESS/unit2_BC002.txt ✓","ESS/BC0011_other.txt","ESS/unit_BC001.csv"],"Staging":[".staging/ (empty)"],"Archives (MOCHI)":[".backup.lock (locked)"],"index.db (SQLite)":["4 empty tables"]},"hot":[]},
+{"title":"Record the session","who":"<span class='badge db'>SQLite</span> <code>start_session</code>, <code>session_barcode</code> rows",
+ "html":"<p>Inserts a <code>scan_session</code> row with status <code>running</code>, and one <code>session_barcode</code> row per new barcode: BC001 and BC002 as <code>matched</code>, BC404 as <code>no_files_found</code>. If anything later raises, the session is marked <code>failed</code>.</p>",
+ "lanes":{"Source folders":["BURNIN/unit1_BC001_log.txt ✓","ESS/unit2_BC002.txt ✓","ESS/BC0011_other.txt","ESS/unit_BC001.csv"],"Staging":[".staging/ (empty)"],"Archives (MOCHI)":[".backup.lock (locked)"],"index.db (SQLite)":["+scan_session #1 running","+3 session_barcode rows"]},"hot":["index.db (SQLite)"]},
+{"title":"Stage: write the manifest, then move","who":"<span class='badge py'>Python</span> <code>stage</code>",
+ "html":"<p>Order matters here. For each batch of up to 2,000 files:</p><ol><li>write their lines to <code>manifest.jsonl</code>, then <code>flush</code> + <code>fsync</code> so the lines are <b>physically on disk</b>;</li><li>only then <code>os.rename</code> each file to <code>.staging/&lt;month&gt;/&lt;path&gt;</code>.</li></ol><p>A rename on the same drive is instant and atomic: the file is in the old place or the new one, never both, never neither. A target path that already exists is <b>never overwritten</b>.</p>",
+ "lanes":{"Source folders":["-BURNIN/unit1_BC001_log.txt","-ESS/unit2_BC002.txt","ESS/BC0011_other.txt","ESS/unit_BC001.csv"],"Staging":["+manifest.jsonl (synced first)","+2026-08/BURNIN/unit1_BC001_log.txt","+2026-07/ESS/unit2_BC002.txt"],"Archives (MOCHI)":[".backup.lock (locked)"],"index.db (SQLite)":["scan_session #1 running","3 session_barcode rows"]},"hot":["Staging","Source folders"]},
+{"title":"Commit each month with MOCHI","who":"<span class='badge py'>Python</span> <code>finish_staged</code> → <code>commit_month</code> (worker threads) → <span class='badge rs'>Rust</span> <code>mochi create</code>",
+ "html":"<p>Months are independent, so they run side by side on worker threads. For a new month Python runs:</p><pre><code>mochi --json --no-local-history create E:/archive/2026/2026-08.mochi .staging/2026-08/BURNIN</code></pre><p>(<code>append</code> instead of <code>create</code> when the archive exists.) MOCHI makes <b>one commit</b>. At the same time, Python computes the BLAKE3 hash of every staged file on other threads.</p><p>Exit code 0 = durable, 2 = committed with a warning (always on Windows: <i>DEGRADED (not an error)</i>). Anything else raises: the month stays in staging.</p>",
+ "lanes":{"Source folders":["ESS/BC0011_other.txt","ESS/unit_BC001.csv"],"Staging":["manifest.jsonl","2026-08/BURNIN/unit1_BC001_log.txt","2026-07/ESS/unit2_BC002.txt"],"Archives (MOCHI)":[".backup.lock (locked)","+2026/2026-08.mochi (commit 0)","+2026/2026-07.mochi (commit 0)"],"index.db (SQLite)":["scan_session #1 running","3 session_barcode rows"]},"hot":["Archives (MOCHI)"]},
+{"title":"Verify: trust, but check","who":"<span class='badge rs'>Rust</span> <code>mochi list</code>, <code>mochi verify --level content</code> + <span class='badge py'>Python</span> hash compare",
+ "html":"<p>Python does not just believe the exit code. Two independent checks:</p><ol><li><code>mochi list</code> returns every file in the archive head with its <code>content_hash</code>. Python compares it with <b>its own</b> BLAKE3 of each staged file. Any difference → the month fails and stays in staging.</li><li><code>mochi verify --level content</code> re-reads and checks the whole archive.</li></ol><p>Both must pass before anything is deleted.</p>",
+ "lanes":{"Source folders":["ESS/BC0011_other.txt","ESS/unit_BC001.csv"],"Staging":["manifest.jsonl","2026-08/BURNIN/unit1_BC001_log.txt","2026-07/ESS/unit2_BC002.txt"],"Archives (MOCHI)":[".backup.lock (locked)","2026/2026-08.mochi ✓ verified","2026/2026-07.mochi ✓ verified"],"index.db (SQLite)":["scan_session #1 running","3 session_barcode rows"]},"hot":["Archives (MOCHI)","Staging"]},
+{"title":"Index the month (one transaction)","who":"<span class='badge py'>Python</span> <code>index_month</code> on the main thread <span class='badge db'>SQLite</span>",
+ "html":"<p>Back on the main thread, as each month's job finishes: one SQLite transaction inserts or updates the month's <code>file_storage_volume</code> row (path, size, head commit) and one <code>scanned_log_entry</code> per file (barcode, path, BLAKE3, commit seq). It is an <b>upsert</b>, so running it twice gives the same result.</p>",
+ "lanes":{"Source folders":["ESS/BC0011_other.txt","ESS/unit_BC001.csv"],"Staging":["manifest.jsonl","2026-08/BURNIN/unit1_BC001_log.txt","2026-07/ESS/unit2_BC002.txt"],"Archives (MOCHI)":[".backup.lock (locked)","2026/2026-08.mochi ✓","2026/2026-07.mochi ✓"],"index.db (SQLite)":["scan_session #1 running","3 session_barcode rows","+2 file_storage_volume","+2 scanned_log_entry"]},"hot":["index.db (SQLite)"]},
+{"title":"Only now: delete the staged copies","who":"<span class='badge py'>Python</span> <code>finish_staged</code>",
+ "html":"<p>The archive is verified and the index committed, so the staged copies are no longer the only copy. They are deleted, month by month. A month that failed earlier keeps all of its staged files; other months still finish.</p>",
+ "lanes":{"Source folders":["ESS/BC0011_other.txt","ESS/unit_BC001.csv"],"Staging":["manifest.jsonl","-2026-08/BURNIN/unit1_BC001_log.txt","-2026-07/ESS/unit2_BC002.txt"],"Archives (MOCHI)":[".backup.lock (locked)","2026/2026-08.mochi ✓","2026/2026-07.mochi ✓"],"index.db (SQLite)":["scan_session #1 running","3 session_barcode rows","2 file_storage_volume","2 scanned_log_entry"]},"hot":["Staging"]},
+{"title":"Clean up and finish","who":"<span class='badge py'>Python</span> <code>finish_staged</code>, <code>complete_session</code>, <code>db.close()</code>, lock released",
+ "html":"<p>Removes the manifest and empty staging folders. Any file in staging that is <b>not</b> in the manifest is never deleted: it is reported and counted as an error. The session becomes <code>success</code>, the index is closed and the lock released.</p><p>The run returns a summary dict; the UI draws it. Status: <b>committed (LOCAL_COMMITTED)</b>. Remember that one archive on one disk is not a backup: <code>--export</code> makes the independent copy.</p>",
+ "lanes":{"Source folders":["ESS/BC0011_other.txt","ESS/unit_BC001.csv"],"Staging":["-manifest.jsonl","-.staging/"],"Archives (MOCHI)":["-.backup.lock (unlocked)","2026/2026-08.mochi ✓","2026/2026-07.mochi ✓"],"index.db (SQLite)":["scan_session #1 success","3 session_barcode rows","2 file_storage_volume","2 scanned_log_entry"]},"hot":["index.db (SQLite)"]}
+]</script>
+
+<h2>Crash simulator</h2>
+<p>Pick the moment the power goes out. The panel shows what is on disk and what the next run does. This table is the heart of the design: every row is covered by code, and most by a test.</p>
+<div class="toggle-row" id="crash-pick" role="radiogroup" aria-label="Crash moment"></div>
+<div class="result" id="crash-out" style="margin-top:10px" aria-live="polite"></div>
+<script>
+(function () {
+  var cases = [
+    ["During the scan", "ok", "Nothing has moved. The source folders are untouched and the index has no running session for these files.",
+     "A normal run.", "—"],
+    ["While writing the manifest", "ok", "Manifest lines are synced <b>before</b> their files move, so a half-written last line belongs to a file that never moved. <code>read_manifest</code> skips a broken last line.",
+     "Resumes the staged files listed in the manifest; files still in the source are found again by the scan.", "<code>read_manifest</code>"],
+    ["While moving files to staging", "ok", "Every file in staging is listed in the manifest. A listed file that never moved is still in the source (it is skipped by the resume because <code>staged_path(...).is_file()</code> is false).",
+     "Finishes the staged files first, then runs normally; the scan picks up the rest.", "<code>test_crash_after_staging_is_resumed</code>"],
+    ["During the mochi commit", "warn", "MOCHI never publishes a half-written commit: the archive still shows its previous head. It may leave an <b>uncommitted tail</b> of bytes at the end of the file.",
+     "Retries the commit. If MOCHI refuses with <code>UNCOMMITTED_TAIL</code>, the run stops with the files safe in staging and a person repairs the tail (docs/operations.md, Troubleshooting).", "<code>test_failed_commit_keeps_staging</code> (a commit that fails)"],
+    ["After commit, before the index", "ok", "Files are in the archive <b>and</b> in staging. Nothing is lost; the risk is storing them twice.",
+     "In resume mode <code>commit_month</code> first lists the archive head: if every staged file is already there <b>with the same BLAKE3</b>, it makes <b>no new commit</b>. Then it verifies, indexes and deletes.", "<code>test_crash_after_commit_before_index_makes_no_new_commit</code>"],
+    ["After the index, during deletes", "ok", "Some staged copies remain, but they are archived and indexed.",
+     "Same as above: no new commit (hashes match), the index upsert rewrites the same rows, the remaining copies are deleted.", "covered by the same resume path"],
+    ["A second run starts meanwhile", "ok", "The first run holds the OS lock on <code>.backup.lock</code>.",
+     "The second run is refused before it reads anything; the first is unaffected.", "<code>test_second_run_at_the_same_time_is_refused</code>"]
+  ];
+  var pick = document.getElementById("crash-pick"), out = document.getElementById("crash-out");
+  cases.forEach(function (c, i) {
+    var l = document.createElement("label");
+    l.innerHTML = "<input type='radio' name='crash' value='" + i + "'> " + c[0];
+    pick.appendChild(l);
+  });
+  function show(i) {
+    var c = cases[i];
+    out.className = "result " + c[1];
+    out.innerHTML = "<b>" + c[0] + "</b><dl class='kv' style='margin-top:6px'><dt>On disk</dt><dd>" + c[2] +
+      "</dd><dt>Next run</dt><dd>" + c[3] + "</dd><dt>Proven by</dt><dd>" + c[4] + "</dd></dl>";
+  }
+  pick.addEventListener("change", function (e) { show(+e.target.value); });
+  pick.querySelector("input").checked = true;
+  show(0);
+})();
+</script>
+
+<h2 id="matching-playground">Matching playground</h2>
+<p>Try the filename rule yourself. This box runs the same algorithm as <code>find_barcodes</code> and <code>has_extension</code> in <code>logs_backup.py</code>.</p>
+<div class="card">
+<label>File name<br><input type="text" id="m-name" value="unit1_BC001_log.txt"></label>
+<label style="display:block;margin-top:8px">Candidate barcodes (comma separated)<br><input type="text" id="m-codes" value="BC001, BC002, 12345"></label>
+<label style="display:block;margin-top:8px">Allowed extensions<br><input type="text" id="m-ext" value="txt, zip"></label>
+<p id="m-show" style="font-family:var(--mono);font-size:1.05rem;margin:12px 0 6px"></p>
+<div id="m-out" class="result" aria-live="polite"></div>
+<p class="small muted">Try: <code>x12345_a.txt</code> (no delimiter before), <code>BC001-BC002.txt</code> (two barcodes: ambiguous), <code>unit_BC001.TXT</code> (case of the extension does not matter), <code>BC001</code> (no extension).</p>
+</div>
+<script>
+(function () {
+  var DELIM = "_.-";
+  function find(name, codes) {
+    var starts = [0], ends = [], out = {}, i, s, e;
+    for (i = 0; i < name.length; i++) if (DELIM.indexOf(name[i]) >= 0) { starts.push(i + 1); ends.push(i); }
+    ends.push(name.length);
+    for (s = 0; s < starts.length; s++) for (e = 0; e < ends.length; e++) {
+      var a = starts[s], b = ends[e];
+      if (b > a && codes.has(name.slice(a, b))) out[name.slice(a, b) + "@" + a] = [a, b];
+    }
+    return out;
+  }
+  function esc(t) { return t.replace(/[&<>]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]; }); }
+  function run() {
+    var name = document.getElementById("m-name").value;
+    var codes = new Set(document.getElementById("m-codes").value.split(",").map(function (s) { return s.trim(); }).filter(Boolean));
+    var exts = document.getElementById("m-ext").value.split(",").map(function (s) { return s.trim().replace(/^\./, "").toLowerCase(); });
+    var hits = find(name, codes), keys = Object.keys(hits);
+    var distinct = new Set(keys.map(function (k) { return k.split("@")[0]; }));
+    var ext = name.indexOf(".") >= 0 ? name.split(".").pop().toLowerCase() : null;
+    var marked = "", pos = 0;
+    keys.map(function (k) { return hits[k]; }).sort(function (a, b) { return a[0] - b[0]; }).forEach(function (h) {
+      if (h[0] < pos) return;
+      marked += esc(name.slice(pos, h[0])) + "<mark class='hit'>" + esc(name.slice(h[0], h[1])) + "</mark>";
+      pos = h[1];
+    });
+    document.getElementById("m-show").innerHTML = marked + esc(name.slice(pos));
+    var out = document.getElementById("m-out");
+    if (ext === null || exts.indexOf(ext) < 0) {
+      out.className = "result bad";
+      out.innerHTML = "<b>Skipped:</b> extension " + (ext === null ? "missing" : "<code>." + esc(ext) + "</code> is not allowed") + ". Not counted as an error.";
+    } else if (distinct.size === 0) {
+      out.className = "result"; out.innerHTML = "<b>No match:</b> no candidate barcode with a delimiter or the name's start/end on both sides. Left in place.";
+    } else if (distinct.size > 1) {
+      out.className = "result warn"; out.innerHTML = "<b>Ambiguous:</b> " + distinct.size + " barcodes (" + esc(Array.from(distinct).join(", ")) + "). Left in place and counted as an error.";
+    } else {
+      out.className = "result ok"; out.innerHTML = "<b>Match:</b> " + esc(Array.from(distinct)[0]) + ". The file goes to the archive of that barcode's <code>last_update</code> month.";
+    }
+  }
+  ["m-name", "m-codes", "m-ext"].forEach(function (id) { document.getElementById(id).addEventListener("input", run); });
+  run();
+})();
+</script>
+<div class="callout senior"><span class="label">How the algorithm works</span>
+<p>Instead of a regular expression per barcode (slow with 100,000 barcodes) or an Aho-Corasick automaton (an extra library), <code>find_barcodes</code> lists every place a barcode <i>may</i> start (position 0 or after a delimiter) and <i>may</i> end (before a delimiter or at the end), and looks up each substring between them in a Python <code>set</code> (a hash table). File names are short and have few delimiters, so this is a handful of lookups per file, whatever the number of barcodes.</p></div>
+
+<h2>The date window</h2>
+<div class="table-wrap"><table>
+<tr><th>Case</th><th>Window queried</th><th>Why</th></tr>
+<tr><td><code>date_range</code> set in config</td><td>Exactly that range</td><td>Re-running a period on purpose; the tests use it.</td></tr>
+<tr><td>First run ever</td><td>Everything before <i>today − lookback_days</i></td><td>Catch up on the whole history.</td></tr>
+<tr><td>Later runs</td><td>From <i>(last successful end date − 1 day)</i> to <i>today − lookback_days</i></td><td>Covers any gap since the last success, whether runs are daily or monthly; the 1-day overlap catches late rows. Barcodes seen before are not recorded twice (<code>UNIQUE(barcode, last_update)</code>).</td></tr>
+</table></div>
+
+<h2>Check yourself</h2>
+<div class="quiz"><p class="q">Why is each manifest line written and fsync'ed before its file is renamed, not after?</p>
+<div class="opts">
+<button>To make the run faster.</button>
+<button data-right>So that after a crash, every file found in staging is listed, and the next run knows what it is and where it came from.</button>
+<button>Because MOCHI reads the manifest.</button>
+</div><p class="why">If the file moved first and the power went out before its line was written, staging would hold a file nobody knows about. Writing first means the worst case is a listed file that never moved, which the resume skips harmlessly. MOCHI never reads the manifest; only Python does.</p></div>
+<div class="quiz"><p class="q">A run crashes right after <code>mochi append</code> succeeded but before SQLite was updated. What does the next run do with those files?</p>
+<div class="opts">
+<button>Appends them again, so the archive has two copies.</button>
+<button>Deletes them from staging because they are already archived.</button>
+<button data-right>Lists the archive head, sees every file with the same BLAKE3, skips the commit, then verifies, indexes and deletes.</button>
+</div><p class="why">That is <code>commit_month(..., resume=True)</code>. Deleting without verifying and indexing would break the rule "deleted only after the next place is checked".</p></div>
+
+</main>
+</div>
+</body>
+</html>

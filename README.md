@@ -56,6 +56,7 @@ next to the `.exe`. See [Single-file .exe](docs/operations.md#single-file-exe-wi
 
 | Page | For |
 |---|---|
+| [docs/html/index.html](docs/html/index.html) | **Interactive developer guide** (open in a browser, works offline): architecture, how the Python code finds and talks to the MOCHI engine (Rust), a step-by-step run with a crash simulator, every function and test, and a reviewer checklist |
 | [docs/how-it-works.md](docs/how-it-works.md) | The flow, the date window, matching rules, what is on disk (archives, index, manifest), and why a crash loses nothing |
 | [docs/code-walkthrough.md](docs/code-walkthrough.md) | Reviewing the code: every function in run order, the logic/UI contract, the tests |
 | [docs/operations.md](docs/operations.md) | Install, config reference, running, getting files back, moving to another PC, troubleshooting |

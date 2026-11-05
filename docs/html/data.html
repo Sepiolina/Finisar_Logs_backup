@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Data on Disk</title>
+<meta name="description" content="What the backup leaves on disk: folder layout, staging and the manifest, inside a .mochi archive, the SQLite index tables, and every config.json setting.">
+<link rel="stylesheet" href="assets/site.css">
+<script src="assets/site.js"></script>
+</head>
+<body>
+<div class="layout">
+<aside class="side"><a class="brand" href="index.html">Finisar Logs Backup<small>Developer guide</small></a><nav></nav></aside>
+<main class="main">
+<div class="topbar"><button class="menu-btn">☰ Menu</button><span class="crumbs">How the parts connect › Data</span><button class="theme-btn">Theme</button></div>
+
+<h1>Data on disk &amp; SQLite</h1>
+<p class="lead">Everything the program reads or writes, where it lives, who writes it, and what each field means.</p>
+
+<h2>The folder layout</h2>
+<p>Click a line to see who writes it and when.</p>
+<div class="card">
+<pre id="tree" style="margin:0;cursor:pointer;line-height:1.9"></pre>
+<div class="result" id="tree-out" style="margin-top:10px" aria-live="polite">Click a line above.</div>
+</div>
+<script>
+(function () {
+  var lines = [
+    ["D:/logs/                                  (source_dir)", "Read by the scan; files are <b>renamed out</b> of here by <code>stage()</code>. Never created by the program: a missing source is a wrong setting.", "py"],
+    ["  BURNIN/ ESS/ JTAG/ STM/ Xray/           (subfolders)", "Scanned at every depth (<code>recursive: true</code>), without following links. Only file <b>names</b> are matched.", "py"],
+    ["  .staging/                               (staging_dir)", "Only exists during a run, or after an interrupted one. Same drive as the source, so moves are renames. Never scanned.", "py"],
+    ["    manifest.jsonl", "One JSON line per staged file, synced before the file moves. Read back by <code>read_manifest()</code>. Deleted once every listed month is archived.", "py"],
+    ["    2026-08/BURNIN/unit1_BC001_log.txt", "A staged file: <code>staging/&lt;month&gt;/&lt;relative_path&gt;</code>. Read by <code>mochi</code> and hashed by Python, deleted after verify + index.", "rs"],
+    ["E:/archive/                               (output_dir)", "Created if missing. Holds archives and the lock file. Never scanned.", "py"],
+    ["  .backup.lock", "Empty file locked by the OS during a run (<code>lock_run</code>). Safe to ignore or delete when no run is going.", "py"],
+    ["  2026/2026-08.mochi", "One archive per month. <b>Only <code>mochi.exe</code> writes it</b>; Python only asks MOCHI to create, append, list and verify.", "rs"],
+    ["E:/archive/index.db                       (db_path)", "SQLite index, written only by Python on the main thread. Its folder is created if missing.", "db"],
+    ["<config folder>/config.json", "Your settings. Read by <code>Config</code>. In <code>.gitignore</code>; never committed.", "py"],
+    ["<config folder>/backup.log", "Full run log with timestamps, written by <code>backup_ui.py</code> (not by <code>logs_backup.py</code> run alone).", "py"],
+    ["%TEMP%/logs_backup_freetds_request.conf", "A two-line FreeTDS config that tells <code>pymssql</code> which login encryption to use (<code>set_encryption</code>).", "py"]
+  ];
+  var tree = document.getElementById("tree"), out = document.getElementById("tree-out");
+  lines.forEach(function (l, i) {
+    var s = document.createElement("span");
+    s.textContent = l[0];
+    s.style.display = "block"; s.tabIndex = 0; s.setAttribute("role", "button");
+    s.style.color = "var(--" + (l[2] === "rs" ? "rs" : l[2] === "db" ? "db" : "ink") + ")";
+    function show() {
+      tree.querySelectorAll("span").forEach(function (o) { o.style.background = ""; });
+      s.style.background = "var(--accent-soft)";
+      out.innerHTML = "<code>" + l[0].split("(")[0].trim().replace(/</g, "&lt;") + "</code>: " + l[1];
+    }
+    s.addEventListener("click", show);
+    s.addEventListener("keydown", function (e) { if (e.key === "Enter") show(); });
+    tree.appendChild(s);
+  });
+})();
+</script>
+
+<h2 id="staging-and-the-manifest">Staging and the manifest</h2>
+<p><code>.staging/manifest.jsonl</code> is a text file with one JSON object per line ("JSON Lines"). Line 1 names the session; every other line is one staged file:</p>
+<pre><code>{"scan_session_id": 42}
+{"relative_path": "BURNIN/unit1_BC001_log.txt", "source_subfolder": "BURNIN", "barcode": "BC001", "original_size": 10, "volume_name": "2026-08"}
+{"relative_path": "ESS/unit2_BC002.txt", "source_subfolder": "ESS", "barcode": "BC002", "original_size": 7, "volume_name": "2026-07"}</code></pre>
+<div class="table-wrap"><table>
+<tr><th>Field</th><th>Meaning</th></tr>
+<tr><td><code>relative_path</code></td><td>Path below <code>source_dir</code>, with <code>/</code>. Also the path inside the archive and in the index.</td></tr>
+<tr><td><code>source_subfolder</code></td><td>The top folder (<code>BURNIN</code>), even when the file was deeper.</td></tr>
+<tr><td><code>barcode</code></td><td>The one barcode found in the file name.</td></tr>
+<tr><td><code>original_size</code></td><td>Bytes, from the scan.</td></tr>
+<tr><td><code>volume_name</code></td><td>Archive month <code>YYYY-MM</code>, from the barcode's <code>last_update</code>.</td></tr>
+</table></div>
+<div class="callout senior"><span class="label">Why JSON Lines</span>
+<p>Appending a line never rewrites earlier ones, and a crash can only damage the <b>last</b> line, which <code>read_manifest</code> skips. Lines are written in batches of 2,000 (<code>MANIFEST_BATCH</code>) with one <code>fsync</code> per batch: fewer syncs, same guarantee, because a batch's files move only after its lines are synced.</p></div>
+
+<h2 id="inside-a-mochi-archive">Inside a .mochi archive</h2>
+<p>A <code>.mochi</code> file is an <b>append-only chain of commits</b>. Each run adds one commit to each month it touched; earlier commits are never rewritten. The newest commit is the <b>head</b>, and it shows the whole month as it is now.</p>
+<div class="card">
+<div class="tools"><button id="c-add">Run again with a late file →</button><button id="c-reset">Reset</button></div>
+<div id="chain" style="display:flex;gap:10px;flex-wrap:wrap;margin-top:8px"></div>
+<p class="small muted" id="chain-note"></p>
+</div>
+<script>
+(function () {
+  var commits, chain = document.getElementById("chain"), note = document.getElementById("chain-note");
+  var adds = [["ESS/late_BC001.txt"], ["BURNIN/line2/2026-08/unit4_BC001_log.txt"], ["JTAG/unit9_BC077.txt"]];
+  function reset() { commits = [["BURNIN/unit1_BC001_log.txt"]]; draw(); }
+  function draw() {
+    chain.innerHTML = "";
+    var all = [];
+    commits.forEach(function (c, i) {
+      all = all.concat(c);
+      var head = i === commits.length - 1;
+      var d = document.createElement("div");
+      d.className = "card";
+      d.style.cssText = "margin:0;min-width:200px;flex:1;" + (head ? "border-color:var(--rs)" : "opacity:.8");
+      d.innerHTML = "<b>commit " + i + "</b>" + (head ? " <span class='badge rs'>head</span>" : "") +
+        "<div class='small muted'>adds:</div>" + c.map(function (p) { return "<span class='chip new'>" + p + "</span>"; }).join("") +
+        "<div class='small muted' style='margin-top:6px'>head shows " + all.length + " file(s)</div>";
+      chain.appendChild(d);
+    });
+    note.innerHTML = "<code>mochi list</code> shows the head: " + all.map(function (p) { return "<code>" + p + "</code>"; }).join(", ") + ". SQLite stores <code>head_seq = " + (commits.length - 1) + "</code> for this month.";
+    document.getElementById("c-add").disabled = commits.length > adds.length;
+  }
+  document.getElementById("c-add").addEventListener("click", function () { commits.push(adds[commits.length - 1]); draw(); });
+  document.getElementById("c-reset").addEventListener("click", reset);
+  reset();
+})();
+</script>
+<ul>
+<li>Paths inside are <code>&lt;SUBFOLDER&gt;/&lt;path below it&gt;</code>; a later file in an existing folder is <b>added</b> to it, the earlier files stay.</li>
+<li>Each file keeps its original modification time (a rename does not change it).</li>
+<li>MOCHI compresses (Zstandard) and deduplicates by itself; the backup tool does not configure either.</li>
+<li>A commit is <b>published atomically</b>: a reader sees the old head or the new one, never half of a commit.</li>
+</ul>
+
+<h2 id="the-sqlite-index">The SQLite index</h2>
+<p>One file, <code>index.db</code>, four tables, <code>PRAGMA user_version = 2</code>. The schema matches the earlier tool <i>Finisar_move_log_files</i>, so existing queries keep working. Click a table.</p>
+<div class="card arch">
+<svg viewBox="0 0 860 300" role="img" aria-label="Four tables: scan_session has many session_barcode and many scanned_log_entry rows; file_storage_volume has many scanned_log_entry rows.">
+<defs><marker id="a3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--ink-3)"/></marker></defs>
+<path class="edge" d="M150 120 V 190" marker-end="url(#a3)"/><text class="edge-label" x="158" y="160">1 run → many barcodes</text>
+<path class="edge" d="M260 70 C 380 70 380 210 440 210" marker-end="url(#a3)"/><text class="edge-label" x="300" y="120">1 run → many files</text>
+<path class="edge" d="M720 120 C 720 180 680 210 660 210" marker-end="url(#a3)"/><text class="edge-label" x="700" y="170">1 month → many files</text>
+<g class="node" data-k="s"><rect x="40" y="25" width="220" height="95" rx="10" fill="var(--db-soft)" stroke="var(--db)"/><text x="150" y="52" text-anchor="middle">scan_session</text><text class="sub" x="150" y="72" text-anchor="middle">one row per run</text><text class="sub" x="150" y="90" text-anchor="middle">status · window · totals</text></g>
+<g class="node" data-k="b"><rect x="40" y="190" width="220" height="90" rx="10" fill="var(--db-soft)" stroke="var(--db)"/><text x="150" y="217" text-anchor="middle">session_barcode</text><text class="sub" x="150" y="237" text-anchor="middle">one row per barcode seen</text><text class="sub" x="150" y="255" text-anchor="middle">matched / no_files_found</text></g>
+<g class="node" data-k="v"><rect x="600" y="25" width="220" height="95" rx="10" fill="var(--db-soft)" stroke="var(--db)"/><text x="710" y="52" text-anchor="middle">file_storage_volume</text><text class="sub" x="710" y="72" text-anchor="middle">one row per month archive</text><text class="sub" x="710" y="90" text-anchor="middle">path · head · entry_count</text></g>
+<g class="node" data-k="e"><rect x="440" y="170" width="220" height="110" rx="10" fill="var(--db-soft)" stroke="var(--db)"/><text x="550" y="197" text-anchor="middle">scanned_log_entry</text><text class="sub" x="550" y="217" text-anchor="middle">one row per archived file</text><text class="sub" x="550" y="235" text-anchor="middle">barcode · path · BLAKE3</text><text class="sub" x="550" y="253" text-anchor="middle">commit_seq · size</text></g>
+</svg>
+<div class="result" id="db-out" aria-live="polite">Click a table.</div>
+</div>
+<script>
+(function () {
+  var t = {
+    s: ["scan_session", [["id", "run number"], ["started_at / completed_at", "<code>epoch:&lt;seconds&gt;</code>"], ["status", "<code>running</code> → <code>success</code> or <code>failed</code>"], ["query_from_date / query_to_date", "the window; <code>resumed</code> for a session created to record an orphaned staging batch (ignored by <code>query_window</code>)"], ["total_barcodes / total_files_moved / total_errors", "the run's totals"]],
+      "Written by <code>start_session</code> and <code>complete_session</code>. The last <code>success</code> row's <code>query_to_date</code> decides where the next window starts."],
+    b: ["session_barcode", [["scan_session_id", "the run that first saw it"], ["barcode, last_update", "from SQL Server; <b>UNIQUE together</b>, so a barcode is recorded once even though windows overlap by a day"], ["status", "<code>matched</code> or <code>no_files_found</code>"]],
+      "Written once per run, inside one transaction, before staging. <code>INSERT OR IGNORE</code>."],
+    v: ["file_storage_volume", [["path", "full path of the .mochi file"], ["volume_name", "<code>YYYY-MM</code>"], ["file_size", "bytes of the archive after the commit"], ["head_commit_id / head_seq", "MOCHI's head after this run (from <code>mochi list</code>)"], ["entry_count", "recounted from <code>scanned_log_entry</code> each time"], ["created_at / updated_at", "timestamps"]],
+      "Inserted for a new month, updated for an existing one, by <code>index_month</code>."],
+    e: ["scanned_log_entry", [["barcode", "indexed: find files by barcode quickly"], ["relative_path", "path inside the archive, e.g. <code>BURNIN/unit1_BC001_log.txt</code>"], ["source_subfolder", "<code>BURNIN</code>"], ["content_hash", "BLAKE3 hex, the same value <code>b3sum</code> prints"], ["commit_seq", "which commit stored this version"], ["original_size", "bytes"], ["file_storage_volume_id", "which month; <b>UNIQUE with relative_path</b>"]],
+      "Upserted by <code>index_month</code>: a re-run after a crash rewrites the same row instead of adding a duplicate."]
+  };
+  var out = document.getElementById("db-out"), nodes = document.querySelectorAll(".arch .node");
+  nodes.forEach(function (n) {
+    n.setAttribute("tabindex", "0"); n.setAttribute("role", "button");
+    function pick() {
+      nodes.forEach(function (m) { m.classList.toggle("sel", m === n); });
+      var d = t[n.getAttribute("data-k")];
+      out.innerHTML = "<b><code>" + d[0] + "</code></b><table class='small' style='margin:.5em 0'>" + d[1].map(function (r) { return "<tr><td><code>" + r[0] + "</code></td><td>" + r[1] + "</td></tr>"; }).join("") + "</table>" + d[2];
+    }
+    n.addEventListener("click", pick);
+    n.addEventListener("keydown", function (e) { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); pick(); } });
+  });
+})();
+</script>
+<h3>Useful queries</h3>
+<div class="tabs">
+<div role="tablist" aria-label="Queries">
+<button role="tab" aria-controls="q1" id="tq1">Find a barcode</button>
+<button role="tab" aria-controls="q2" id="tq2">Recent runs</button>
+<button role="tab" aria-controls="q3" id="tq3">Months</button>
+</div>
+<div role="tabpanel" id="q1" aria-labelledby="tq1"><pre><code>SELECT e.relative_path, v.path, e.content_hash
+FROM scanned_log_entry e
+JOIN file_storage_volume v ON v.id = e.file_storage_volume_id
+WHERE e.barcode = 'BC001';</code></pre>
+<p>Then extract: <code>mochi get E:/archive/2026/2026-08.mochi BURNIN/unit1_BC001_log.txt -C D:/restore</code> (MOCHI checks the hash before writing).</p></div>
+<div role="tabpanel" id="q2" aria-labelledby="tq2"><pre><code>SELECT id, status, query_from_date, query_to_date, total_files_moved, total_errors
+FROM scan_session ORDER BY id DESC LIMIT 10;</code></pre></div>
+<div role="tabpanel" id="q3" aria-labelledby="tq3"><pre><code>SELECT volume_name, entry_count, file_size, head_seq FROM file_storage_volume ORDER BY volume_name;</code></pre></div>
+</div>
+<div class="callout warn"><span class="label">Refused, not changed</span>
+<p><code>open_index</code> refuses an index with another <code>user_version</code>, or the old format's columns (<code>sha256</code>, <code>chunk_start_byte</code>), and leaves it untouched. Move it aside and a new one is created. Silent migration of a bookkeeping database is a classic way to lose track of data.</p></div>
+
+<h2 id="config-json">config.json</h2>
+<p>Every setting, its default, and the code that reads it (<code>Config.__init__</code>).</p>
+<div class="table-wrap"><table>
+<tr><th>Key</th><th>Default</th><th>Meaning</th></tr>
+<tr><td><code>source_dir</code></td><td>required</td><td>Folder holding the subfolders.</td></tr>
+<tr><td><code>output_dir</code></td><td>required</td><td>Where <code>YYYY/YYYY-MM.mochi</code> go. Created if missing.</td></tr>
+<tr><td><code>db_path</code></td><td>required</td><td>SQLite index file; its folder is created.</td></tr>
+<tr><td><code>staging_dir</code></td><td><code>source_dir/.staging</code></td><td>Must be on the same drive as <code>source_dir</code> (checked with <code>st_dev</code> before staging).</td></tr>
+<tr><td><code>subfolders</code></td><td><code>BURNIN, ESS, JTAG, STM, Xray</code></td><td>Each must be one plain folder name: no <code>/ \ :</code>, not <code>.</code> or <code>..</code>.</td></tr>
+<tr><td><code>extensions</code></td><td><code>txt, zip</code></td><td>Compared without case; a leading dot is ignored.</td></tr>
+<tr><td><code>recursive</code></td><td><code>true</code></td><td>Scan folders inside each subfolder. Must be a real JSON boolean.</td></tr>
+<tr><td><code>lookback_days</code></td><td><code>2</code></td><td>The newest N days are left for later.</td></tr>
+<tr><td><code>date_range</code></td><td><code>null</code></td><td><code>["YYYY-MM-DD", "YYYY-MM-DD"]</code> to back-fill a fixed window.</td></tr>
+<tr><td><code>mochi</code></td><td><code>null</code></td><td>Full path to mochi.exe. <code>null</code> or <code>"mochi"</code> = search (<a href="python-rust.html#how-python-finds-mochi-exe">order</a>).</td></tr>
+<tr><td><code>sql_server</code></td><td>none</td><td><code>server</code>, <code>port</code> (1433; ignored for <code>HOST\NAME</code>), <code>database</code>, <code>user</code>, <code>password</code> (<code>null</code> = asked), <code>encryption</code> (<code>request</code> / <code>require</code> / <code>off</code>). Each overridden by <code>DB_SERVER</code>, <code>DB_PORT</code>, <code>DB_NAME</code>, <code>DB_USER</code>, <code>DB_PASSWORD</code>, <code>DB_ENCRYPTION</code>.</td></tr>
+<tr><td><code>email</code></td><td>none</td><td><code>{"api_base_url": "http://host:port", "to": "a@b.c"}</code></td></tr>
+</table></div>
+<p class="small muted">Environment only: <code>DB_RETRY_ATTEMPTS</code> (3), <code>DB_RETRY_BASE_DELAY_MS</code> (2000, doubled each retry), <code>DB_REQUEST_TIMEOUT_MS</code> (30000).</p>
+<div class="callout junior"><span class="label">The backslash trap</span>
+<p>In JSON, <code>\b</code> is a backspace and <code>\t</code> a tab. So <code>"E:\backup"</code> silently becomes <code>E:</code> + backspace + <code>ackup</code>. <code>Config</code> refuses any path containing a control character and says to write <code>E:/backup</code>. Test: <code>test_backspace_in_a_path_is_refused</code>.</p></div>
+
+</main>
+</div>
+</body>
+</html>

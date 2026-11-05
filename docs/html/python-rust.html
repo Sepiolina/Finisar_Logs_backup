@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python and MOCHI</title>
+<meta name="description" content="How the Python backup code finds mochi.exe (the Rust MOCHI engine), calls it, reads its JSON answers and exit codes, and checks its work.">
+<link rel="stylesheet" href="assets/site.css">
+<script src="assets/site.js"></script>
+</head>
+<body>
+<div class="layout">
+<aside class="side"><a class="brand" href="index.html">Finisar Logs Backup<small>Developer guide</small></a><nav></nav></aside>
+<main class="main">
+<div class="topbar"><button class="menu-btn">☰ Menu</button><span class="crumbs">How the parts connect › Python ↔ MOCHI</span><button class="theme-btn">Theme</button></div>
+
+<h1>Python ↔ MOCHI (Rust)</h1>
+<p class="lead">How the Python code finds the MOCHI engine, talks to it, and checks that it did its job. All of it lives in one section of <code>logs_backup.py</code>, marked <code># ---- MOCHI</code>.</p>
+
+<h2>It is a program, not a library</h2>
+<p>MOCHI is written in Rust and built into a normal executable, <code>mochi.exe</code>. Python does <b>not</b> load Rust code into its own process. It starts <code>mochi.exe</code> as a <b>child process</b>, exactly like typing a command in a terminal, waits for it to finish, and reads three things back.</p>
+<div class="card arch">
+<svg viewBox="0 0 860 250" role="img" aria-label="Python process sends arguments to the mochi.exe process; mochi returns an exit code, JSON on standard output, and text on standard error.">
+  <defs><marker id="a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--ink-3)"/></marker></defs>
+  <rect x="20" y="30" width="260" height="190" rx="12" fill="var(--py-soft)" stroke="var(--py)" stroke-width="1.5"/>
+  <text x="150" y="58" text-anchor="middle" style="font:700 15px var(--sans);fill:var(--ink)">Python process</text>
+  <text x="150" y="80" text-anchor="middle" style="font:12px var(--mono);fill:var(--ink-2)">logs_backup.mochi(cfg, ...)</text>
+  <text x="150" y="104" text-anchor="middle" style="font:12px var(--sans);fill:var(--ink-2)">subprocess.run([...],</text>
+  <text x="150" y="120" text-anchor="middle" style="font:12px var(--sans);fill:var(--ink-2)">capture_output=True)</text>
+  <text x="150" y="160" text-anchor="middle" style="font:12px var(--sans);fill:var(--ink-2)">json.loads(stdout)</text>
+  <text x="150" y="178" text-anchor="middle" style="font:12px var(--sans);fill:var(--ink-2)">returncode in (0, 2)?</text>
+  <rect x="580" y="30" width="260" height="190" rx="12" fill="var(--rs-soft)" stroke="var(--rs)" stroke-width="1.5"/>
+  <text x="710" y="58" text-anchor="middle" style="font:700 15px var(--sans);fill:var(--ink)">mochi.exe process</text>
+  <text x="710" y="80" text-anchor="middle" style="font:12px var(--sans);fill:var(--ink-2)">Rust: crates/mochi-cli</text>
+  <text x="710" y="98" text-anchor="middle" style="font:12px var(--sans);fill:var(--ink-2)">→ mochi-core → mochi-format</text>
+  <text x="710" y="140" text-anchor="middle" style="font:12px var(--sans);fill:var(--ink-2)">reads staged files,</text>
+  <text x="710" y="156" text-anchor="middle" style="font:12px var(--sans);fill:var(--ink-2)">writes / reads the .mochi file</text>
+  <path d="M280 75 H 578" stroke="var(--ink-3)" stroke-width="1.5" marker-end="url(#a2)"/>
+  <text x="430" y="68" text-anchor="middle" style="font:12px var(--mono);fill:var(--ink)">arguments: --json create A.mochi DIR</text>
+  <path d="M580 130 H 282" stroke="var(--ink-3)" stroke-width="1.5" marker-end="url(#a2)"/>
+  <text x="430" y="123" text-anchor="middle" style="font:12px var(--mono);fill:var(--ink)">stdout: one JSON object</text>
+  <path d="M580 165 H 282" stroke="var(--ink-3)" stroke-width="1.5" marker-end="url(#a2)"/>
+  <text x="430" y="158" text-anchor="middle" style="font:12px var(--mono);fill:var(--ink)">exit code: 0 · 1 · 2 · 3 · 4</text>
+  <path d="M580 200 H 282" stroke="var(--ink-3)" stroke-width="1.5" stroke-dasharray="4 4" marker-end="url(#a2)"/>
+  <text x="430" y="193" text-anchor="middle" style="font:12px var(--mono);fill:var(--ink-2)">stderr: text (used only if no JSON)</text>
+</svg>
+</div>
+<div class="grid">
+<div class="card"><h3>What goes in</h3><p>Only command-line <b>arguments</b>: the command, the archive path, input folders. Nothing is sent on standard input. File data never passes through Python: MOCHI reads the staged files from disk itself.</p></div>
+<div class="card"><h3>What comes out</h3><p>An <b>exit code</b> (the verdict), one <b>JSON object</b> on standard output (the details), and maybe text on standard error. With <code>--json</code>, MOCHI prints errors as JSON too: <code>{"error": {"code": "…", "message": "…"}}</code>.</p></div>
+</div>
+<div class="callout junior"><span class="label">Why this is easy to review</span>
+<p>Every interaction is something you can reproduce by hand in a terminal. If you doubt what Python sees, run the same command yourself: <code>mochi --json list E:/archive/2026/2026-08.mochi</code>.</p></div>
+<div class="callout senior"><span class="label">Trade-off</span>
+<p>A Python extension module (PyO3) would avoid process start-up and JSON parsing, but would tie this tool to one MOCHI build and one Python version, and put a compiled binary inside the Python package. A run here issues about four MOCHI commands per month touched; the cost of starting a process is milliseconds against seconds of disk work. The README calls this out as a deliberate difference from the earlier Rust tool: <i>MOCHI through its command line (mochi --json), not the Rust library</i>.</p></div>
+
+<h2 id="how-python-finds-mochi-exe">How Python finds mochi.exe</h2>
+<p><code>mochi_places()</code> builds a list of places to try, and <code>check_mochi()</code> tries them <b>in order</b> by running <code>&lt;place&gt; --version</code>. The first one that exits 0 and prints a line starting with <code>mochi </code> wins. Its full path is stored in <code>cfg.mochi</code> so later commands never search again.</p>
+<p>Switch places on and off to see which one is used:</p>
+<div class="card">
+<div id="find-toggles" style="display:grid;gap:6px"></div>
+<div style="margin-top:12px" class="result" id="find-out" aria-live="polite"></div>
+</div>
+<script>
+(function () {
+  var places = [
+    ["cfg", "\"mochi\" in config.json set to a full path", "C:/tools/mochi.exe", "Only this place is tried. Use it to pin an exact build."],
+    ["hkcu", "Registry: HKCU …\\App Paths\\mochi.exe", "%LOCALAPPDATA%\\MOCHI\\bin\\mochi.exe", "Written by the MOCHI setup 0.9.15+ (per user)."],
+    ["hklm", "Registry: HKLM …\\App Paths\\mochi.exe", "C:\\Program Files\\MOCHI\\bin\\mochi.exe", "MOCHI setup 0.9.15+ (per machine)."],
+    ["inst", "Registry: MOCHI install location + bin", "&lt;install dir&gt;\\bin\\mochi.exe", "MOCHI setup 0.9.14, which had no App Paths key."],
+    ["path", "PATH", "where mochi", "Anything on the PATH (shutil.which)."],
+    ["setup", "%LOCALAPPDATA%\\MOCHI\\bin", "mochi.exe", "The setup's own folder, if the registry was not written."],
+    ["cargo", "~/.cargo/bin", "mochi.exe", "Where <code>cargo install</code> puts it."],
+    ["here", "Next to this program", "FinisarLogsBackup.exe's folder", "Copy mochi.exe beside the .exe or the .py files."],
+    ["checkout", "../MOCHI/target/release (or ../mochi/…)", "D:/GitHub/MOCHI/target/release/mochi.exe", "A MOCHI checkout beside this repo, built with <code>cargo build --release -p mochi-cli</code>."]
+  ];
+  var box = document.getElementById("find-toggles"), out = document.getElementById("find-out");
+  places.forEach(function (p, i) {
+    var row = document.createElement("div");
+    row.className = "toggle-row";
+    row.innerHTML = "<label style='flex:1;min-width:240px'><input type='checkbox' data-i='" + i + "'" + (p[0] === "path" ? " checked" : "") + "> <span><b>" + (i + 1) + ".</b> " + p[1] + "<br><span class='muted small'>" + p[3] + "</span></span></label>" +
+      (p[0] === "cfg" ? "" : "<label title='The file exists but --version fails (wrong program, broken build)'><input type='checkbox' data-broken='" + i + "'> broken</label>");
+    box.appendChild(row);
+  });
+  function update() {
+    var on = {}, broken = {};
+    box.querySelectorAll("[data-i]").forEach(function (c) { on[c.getAttribute("data-i")] = c.checked; });
+    box.querySelectorAll("[data-broken]").forEach(function (c) { broken[c.getAttribute("data-broken")] = c.checked; });
+    var order = on[0] ? [0] : places.map(function (_, i) { return i; }).slice(1);
+    var tried = [];
+    for (var k = 0; k < order.length; k++) {
+      var i = order[k];
+      if (!on[i]) { tried.push(places[i][1] + ": not there"); continue; }
+      if (broken[i]) { tried.push(places[i][1] + ": '--version' gave exit 1"); continue; }
+      out.className = "result ok";
+      out.innerHTML = "<b>Uses place " + (i + 1) + ":</b> " + places[i][1] + " <span class='muted'>(" + places[i][2] + ")</span>" +
+        (tried.length ? "<br><span class='small muted'>Tried first: " + tried.join(" · ") + "</span>" : "") +
+        (i === 0 ? "<br><span class='small'>A configured path is the <b>only</b> place tried: if it is wrong, nothing else is searched.</span>" : "");
+      return;
+    }
+    out.className = "result bad";
+    out.innerHTML = "<b>Not found.</b> A real run stops <b>before anything moves</b> with: <code>the mochi program was not found. Looked at: …</code> and one line per place tried. A dry run only warns." +
+      (on[0] ? "<br><span class='small'>The configured path failed, so no other place was tried.</span>" : "");
+  }
+  box.addEventListener("change", update);
+  update();
+})();
+</script>
+<details class="fn"><summary><code>mochi_places(configured)</code> <span class="what">the list, in code</span></summary><div class="body">
+<pre><code>if configured and configured != "mochi":      # "mochi" (old example config) means: find it
+    return [str(configured)]
+here = program_dir()                            # .exe folder when frozen, else this file's folder
+places = [*registry_mochi(), shutil.which("mochi"),
+          setup and Path(setup) / "MOCHI" / "bin" / MOCHI_EXE,
+          Path.home() / ".cargo" / "bin" / MOCHI_EXE, here / MOCHI_EXE,
+          here.parent / "MOCHI" / "target" / "release" / MOCHI_EXE,
+          here.parent / "mochi" / "target" / "release" / MOCHI_EXE]
+return list(dict.fromkeys(str(p) for p in places if p))   # keep order, drop repeats</code></pre>
+<p><code>registry_mochi()</code> returns <code>[]</code> on anything but Windows. It reads the default value of <code>Software\Microsoft\Windows\CurrentVersion\App Paths\mochi.exe</code> (current user, then machine) and <code>Software\The MOCHI Project contributors\MOCHI</code> (the install folder, to which it adds <code>bin\mochi.exe</code>). Tests pass a fake registry object instead of <code>winreg</code>.</p>
+<p>When no place works and only <code>mochi-desktop.exe</code> is installed, the error adds a hint: that setup version did not include the command-line program.</p>
+</div></details>
+<div class="callout warn"><span class="label">Gotcha seen in practice</span>
+<p>The <code>--version</code> check matters: a file named <code>mochi.exe</code> that is the wrong program, or a build that cannot start, is skipped rather than trusted. And on a PC where the MOCHI setup is installed, the registry entry is found <b>before</b> PATH: a test that wants "not found" must switch the registry lookup off (<code>test_mochi_is_found_without_a_config_path</code> does).</p></div>
+
+<h2>Where mochi.exe comes from</h2>
+<div class="tabs">
+<div role="tablist" aria-label="Ways to get mochi.exe">
+<button role="tab" aria-controls="g1" id="tg1">MOCHI setup (recommended)</button>
+<button role="tab" aria-controls="g2" id="tg2">Build from source</button>
+<button role="tab" aria-controls="g3" id="tg3">Pin a path</button>
+</div>
+<div role="tabpanel" id="g1" aria-labelledby="tg1"><p>The MOCHI Windows setup 0.9.15 or newer installs <code>bin\mochi.exe</code> next to the desktop app and registers it under <i>App Paths</i>. Nothing to configure: place 2 or 3 finds it.</p></div>
+<div role="tabpanel" id="g2" aria-labelledby="tg2"><p>In a MOCHI checkout (Rust 1.89+; the repo pins 1.91 in <code>rust-toolchain.toml</code>):</p>
+<pre><code>cargo build --release -p mochi-cli      # -> target/release/mochi(.exe)</code></pre>
+<p>If the checkout sits beside this repo (<code>D:/GitHub/MOCHI</code> next to <code>D:/GitHub/Finisar_Logs_backup</code>), place 9 finds it. <code>cargo install --path crates/mochi-cli</code> puts it in <code>~/.cargo/bin</code> (place 7).</p></div>
+<div role="tabpanel" id="g3" aria-labelledby="tg3"><pre><code>"mochi": "C:/tools/mochi-0.9.15/mochi.exe"</code></pre><p>Write Windows paths with <code>/</code>: in JSON, <code>"C:\tools"</code> contains <code>\t</code>, a tab character. <code>Config</code> refuses paths with control characters for this reason.</p></div>
+</div>
+
+<h2>Every command Python sends</h2>
+<p>All calls go through one function, <code>mochi(cfg, *args)</code>, which always adds two options:</p>
+<pre><code>[cfg.mochi, "--json", "--no-local-history", *args]</code></pre>
+<dl class="kv">
+<dt><code>--json</code></dt><dd>Machine-readable output: one JSON object on standard output, errors included.</dd>
+<dt><code>--no-local-history</code></dt><dd>MOCHI normally records each archive's last-seen head and its check results in a per-user state folder (<code>%LOCALAPPDATA%\mochi</code>). This tool keeps its own record in SQLite, so it asks MOCHI to record and consult nothing there.</dd>
+</dl>
+<div class="tabs">
+<div role="tablist" aria-label="MOCHI commands">
+<button role="tab" aria-controls="c0" id="tc0">--version</button>
+<button role="tab" aria-controls="c1" id="tc1">create / append</button>
+<button role="tab" aria-controls="c2" id="tc2">list</button>
+<button role="tab" aria-controls="c3" id="tc3">verify</button>
+<button role="tab" aria-controls="c4" id="tc4">an error</button>
+</div>
+<div role="tabpanel" id="c0" aria-labelledby="tc0">
+<p><b>Who:</b> <code>check_mochi</code>, once per run (and in <code>--check-sql</code>). <b>Not</b> through <code>mochi()</code>: no <code>--json</code>.</p>
+<pre><code>$ mochi --version
+mochi 0.9.15</code></pre>
+<p>Accepted when the exit code is 0 and the output starts with <code>mochi </code>. The UI shows <code>mochi 0.9.15 (C:\…\mochi.exe)</code>.</p></div>
+<div role="tabpanel" id="c1" aria-labelledby="tc1">
+<p><b>Who:</b> <code>commit(cfg, month)</code>. <code>create</code> when the month's archive does not exist yet, <code>append</code> when it does. Inputs are the folders <code>.staging/&lt;month&gt;/&lt;SUB&gt;</code>; MOCHI names each input after its last part, so <code>.staging/2026-08/BURNIN</code> becomes <code>BURNIN/</code> in the archive, and an append merges into the existing <code>BURNIN/</code>.</p>
+<pre><code>$ mochi --json --no-local-history append E:/archive/2026/2026-08.mochi D:/logs/.staging/2026-08/BURNIN D:/logs/.staging/2026-08/ESS
+{"command": "append", "archive": "E:/archive/2026/2026-08.mochi", "status": "…",
+ "seq": 1, "commit_id": "9f2c…", "durability": "directory_unconfirmed",
+ "durability_note": "directory flush ran, but Windows does not document it as durable",
+ "added": {"files": 2, "directories": 0, "bytes": 3125}, "exit_code": 2, …}</code></pre>
+<p><b>Python reads:</b> only <code>durability</code>. If it is not <code>"durable"</code>, it logs <code>2026-08: DEGRADED (not an error): &lt;durability_note&gt;</code>. Exit 2 is accepted: the data is committed.</p></div>
+<div role="tabpanel" id="c2" aria-labelledby="tc2">
+<p><b>Who:</b> <code>head_files(cfg, archive)</code>, after every commit, and before a commit when resuming.</p>
+<pre><code>$ mochi --json --no-local-history list E:/archive/2026/2026-08.mochi
+{"schema": "…", "archive_id": "…", "seq": 1, "commit_id": "9f2c…",
+ "entries": [
+   {"path": "BURNIN", "kind": "directory", …},
+   {"path": "BURNIN/unit1_BC001_log.txt", "kind": "file", "size": 10,
+    "content_hash": "c3f1…64 hex digits…"}, …]}</code></pre>
+<p><b>Python reads:</b> <code>{path: content_hash}</code> for entries whose <code>kind</code> is <code>"file"</code>, plus <code>(seq, commit_id)</code>, which are stored in SQLite as the archive's head.</p></div>
+<div role="tabpanel" id="c3" aria-labelledby="tc3">
+<p><b>Who:</b> <code>commit_month</code>, last step before a month counts as done.</p>
+<pre><code>$ mochi --json --no-local-history verify E:/archive/2026/2026-08.mochi --level content</code></pre>
+<p><b>Python reads:</b> only the exit code. 0 or 2 passes; 1 (a verification failure) or anything else raises, and the month stays in staging. MOCHI's report has more detail (per-dimension results); it is visible by running the command by hand.</p></div>
+<div role="tabpanel" id="c4" aria-labelledby="tc4">
+<pre><code>$ mochi --json --no-local-history append E:/archive/2026/2026-08.mochi …
+{"error": {"code": "UNCOMMITTED_TAIL", "message": "…"}}       exit code 3</code></pre>
+<p><b>Python does:</b> raises <code>BackupError("mochi append E:/…: exit 3 {'code': 'UNCOMMITTED_TAIL', …}")</code>. If the output is not JSON (a crash, a clap argument error), it uses the text from standard error instead. The month's files stay in staging.</p></div>
+</div>
+
+<h2>Exit codes: MOCHI's verdict and Python's reaction</h2>
+<div class="table-wrap"><table>
+<tr><th>Exit</th><th>MOCHI means</th><th>Python does</th></tr>
+<tr><td><b>0</b></td><td>Done, nothing to report.</td><td><span class="badge ok">pass</span> continue</td></tr>
+<tr><td><b>2</b></td><td>Done, with a warning: for writes, data is committed but the folder entry is not confirmed durable (<b>always</b> on Windows in MOCHI 1.0); for checks, a dimension is unknown or degraded.</td><td><span class="badge ok">pass</span> continue; log <i>DEGRADED (not an error)</i> for writes</td></tr>
+<tr><td><b>1</b></td><td>A verification violation: integrity failure, damaged frame, no valid head, unresolved tail…</td><td><span class="badge bad">fail</span> raise; month stays in staging</td></tr>
+<tr><td><b>3</b></td><td>Operational error: bad argument, destination exists, uncommitted tail, I/O error…</td><td><span class="badge bad">fail</span> raise; month stays in staging</td></tr>
+<tr><td><b>4</b></td><td>Refused: a feature this build does not support.</td><td><span class="badge bad">fail</span> raise; month stays in staging</td></tr>
+</table></div>
+<p class="small muted">Source: MOCHI <code>docs/c14-cli.md</code> and <code>crates/mochi-cli/src/exit.rs</code>. In Python: <code>if p.returncode not in (0, 2): raise BackupError(...)</code>.</p>
+
+<h2>Trust, but check: the BLAKE3 handshake</h2>
+<p>A non-zero exit is not the only thing that can go wrong. What if MOCHI stored the wrong bytes, or missed a file? Python checks the result with <b>its own</b> computation, independent of MOCHI's code paths:</p>
+<ol>
+<li>While MOCHI commits, Python hashes every staged file with the <code>blake3</code> library (worker threads, 500 files per task).</li>
+<li>After the commit, <code>mochi list</code> gives MOCHI's <code>content_hash</code> for every file in the head.</li>
+<li>Every staged path must be in the head with the <b>same</b> hash. One mismatch fails the month.</li>
+<li>Then <code>mochi verify --level content</code> re-reads the archive end to end.</li>
+</ol>
+<div class="callout senior"><span class="label">Why the two hashes can be compared</span>
+<p>MOCHI uses domain-separated BLAKE3 for its internal hashes (chunks, objects, commit IDs: <code>BLAKE3(separator ‖ data)</code>), but its <b>file content hash is plain <code>BLAKE3(file bytes)</code></b> (<code>crates/mochi-format/src/digest.rs</code>, scope <code>FileContent</code>). That is exactly what Python's <code>blake3.blake3(data).hexdigest()</code> and the <code>b3sum</code> tool print, so anyone can check a file against the index by hand.</p></div>
+
+<h2>Timeline of one month's commit</h2>
+<p>Who is busy when, inside <code>commit_month</code>. Several months run this at the same time on different worker threads.</p>
+<div class="stepper" data-src="seq-steps" data-lanes="Python main thread,Python worker threads,mochi.exe,Disk"></div>
+<script type="application/json" id="seq-steps">[
+{"title":"Submit the month","who":"<code>finish_staged</code>","html":"<p>The main thread submits <code>commit_month(cfg, '2026-08', entries)</code> to a thread pool and goes on to submit the other months. It then waits for each month's result in month order.</p>","lanes":{"Python main thread":["+pool.submit(commit_month, …)"],"Python worker threads":["+commit_month 2026-08 starts"]},"hot":["Python main thread"]},
+{"title":"Hash and commit, in parallel","who":"<code>hash_all</code> + <code>commit</code>","html":"<p><code>hash_all</code> starts hashing staged files on the pool's threads (lazily, in chunks of 500) while <code>commit</code> starts <code>mochi append</code> and waits for it. Both read the same staged files; neither writes them.</p>","lanes":{"Python main thread":["waiting for 2026-08"],"Python worker threads":["+BLAKE3 of staged files…","+subprocess.run(mochi append)"],"mochi.exe":["+reading staged files","+writing a new commit"],"Disk":["staging (read)","+2026-08.mochi (append)"]},"hot":["Python worker threads","mochi.exe"]},
+{"title":"MOCHI finishes","who":"exit 2 + JSON","html":"<p>MOCHI publishes the commit atomically and exits with 2 on Windows (<code>durability: directory_unconfirmed</code>). Python logs <i>DEGRADED (not an error)</i> and collects the hashes.</p>","lanes":{"Python main thread":["waiting for 2026-08"],"Python worker threads":["hashes ready","+exit 2, durability_note"],"mochi.exe":["-process ended"],"Disk":["2026-08.mochi: commit 1 published"]},"hot":["Python worker threads"]},
+{"title":"Compare with the head","who":"<code>head_files</code> → <code>mochi list</code>","html":"<p>A second MOCHI process lists the head. For every staged path, the head's <code>content_hash</code> must equal Python's hash.</p>","lanes":{"Python main thread":["waiting for 2026-08"],"Python worker threads":["+compare {path: hash}"],"mochi.exe":["+list (read only)"],"Disk":["2026-08.mochi (read)"]},"hot":["Python worker threads","mochi.exe"]},
+{"title":"Full verification","who":"<code>mochi verify --level content</code>","html":"<p>A third process re-reads the whole archive. Exit 0/2: the month's job returns <code>(hashes, (seq, commit_id))</code>. Any error is raised inside the job and re-raised on the main thread by <code>job.result()</code>.</p>","lanes":{"Python main thread":["waiting for 2026-08"],"Python worker threads":["+verify passed → return"],"mochi.exe":["+verify (read only)"],"Disk":["2026-08.mochi (read)"]},"hot":["mochi.exe"]},
+{"title":"Index, then delete (main thread only)","who":"<code>index_month</code>, then <code>unlink</code>","html":"<p>Only the main thread touches SQLite and deletes files. One SQLite transaction records the month; then its staged copies are deleted. If indexing fails, the staged copies stay.</p><p class='small muted'>Keeping SQLite on one thread avoids sharing a connection across threads (Python's sqlite3 refuses that by default) and keeps 'index before delete' a simple sequence.</p>","lanes":{"Python main thread":["+index_month (one transaction)","+delete staged copies"],"Python worker threads":["idle / other months"],"Disk":["+index.db updated","-staging/2026-08/…"]},"hot":["Python main thread","Disk"]}
+]</script>
+
+<h2>Where the Rust code lives (for the curious)</h2>
+<div class="table-wrap"><table>
+<tr><th>MOCHI crate</th><th>Role</th><th>Touched by this tool?</th></tr>
+<tr><td><code>crates/mochi-cli</code></td><td>The <code>mochi</code> binary: argument parsing (clap), JSON rendering, exit codes. A thin client.</td><td>Yes: this is what Python runs.</td></tr>
+<tr><td><code>crates/mochi-core</code></td><td>Archive operations: import, commit, publication, verify, restore.</td><td>Indirectly, through the CLI.</td></tr>
+<tr><td><code>crates/mochi-format</code></td><td>Byte format, framing, digests. Pure, no I/O.</td><td>Indirectly; defines <code>content_hash</code>.</td></tr>
+<tr><td><code>apps/mochi-desktop</code></td><td>Desktop app (Tauri).</td><td>No. Only used to tell "only the desktop app is installed".</td></tr>
+</table></div>
+<div class="callout junior"><span class="label">Rust words, decoded</span>
+<p><b>crate</b> = package/module. <b>cargo</b> = Rust's build tool and package manager (like npm or pip). <b>--release</b> = optimized build, output in <code>target/release/</code>. <b>clap</b> = the library MOCHI uses to parse command-line arguments; when arguments are invalid it prints plain text to standard error and exits 3, which is why Python falls back to standard error when the output is not JSON.</p></div>
+
+<h2>Check yourself</h2>
+<div class="quiz"><p class="q">MOCHI exits with code 2 after an <code>append</code> on Windows. What happens to the month?</p>
+<div class="opts"><button>It fails and stays in staging.</button><button data-right>It continues: the data is committed; Python logs "DEGRADED (not an error)" and goes on to list and verify.</button><button>Python retries the append.</button></div>
+<p class="why">Exit 2 for a write means "committed, with a durability warning". On Windows MOCHI 1.0 always reports the folder entry as unconfirmed. The month is still listed, hash-checked and verified before anything is deleted.</p></div>
+<div class="quiz"><p class="q"><code>"mochi": "mochi"</code> is in an old config.json. What does Python do?</p>
+<div class="opts"><button>Runs only the program called "mochi" on PATH.</button><button data-right>Treats it as unset and searches every place in order.</button><button>Refuses the config.</button></div>
+<p class="why"><code>mochi_places</code>: <code>if configured and configured != "mochi"</code>. The old example config had this value, so it means "find it".</p></div>
+
+</main>
+</div>
+</body>
+</html>
