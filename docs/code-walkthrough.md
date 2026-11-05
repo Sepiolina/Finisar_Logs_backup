@@ -106,8 +106,11 @@ header and, for each batch of 2,000 entries:
    refusing a path that already exists.
 
 A file that cannot be moved (locked, permissions) is logged and counted, stays
-in the source folder, and a later run picks it up. Renames run on one thread:
-measured, threads made them slower.
+in the source folder, and a later run picks it up. Renames run on `cfg.threads`
+threads: one on a local disk (measured, threads made them slower there), 16 on
+a network drive, where each rename mostly waits on the network
+(`is_network_path`, overridable with `file_threads`). Progress is reported every
+100 files.
 
 `read_manifest(cfg)` reads it back. A broken first line means there is nothing
 safe to resume. A broken last line (a crash mid-write) is skipped.

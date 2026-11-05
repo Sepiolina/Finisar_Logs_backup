@@ -37,6 +37,8 @@ log = logging.getLogger("logs_backup")
 DELIMITERS = "_.-"  # characters allowed on each side of a barcode in a filename
 MANIFEST_BATCH = 2000  # manifest lines synced before the matching files are moved
 WORKERS = min(os.cpu_count() or 1, 8)  # hashing threads, and months committed side by side
+NETWORK_FILE_THREADS = 16  # renames/deletes at once on a network drive: each waits on a round trip
+PROGRESS_EVERY = 100  # files between progress updates while staging
 
 SCHEMA_VERSION = 2
 SCHEMA = """
@@ -135,6 +137,12 @@ class Config:
         self.db_path = Path(raw["db_path"])
         self.subfolders = raw.get("subfolders", ["BURNIN", "ESS", "JTAG", "STM", "Xray"])
         self.extensions = {e.lstrip(".").lower() for e in raw.get("extensions", ["txt", "zip"])}
+        # Renames and deletes at once. None: 16 on a network drive (they wait on the network), else 1.
+        self.file_threads = raw.get("file_threads")
+        if self.file_threads is not None and not (isinstance(self.file_threads, int)
+                                                  and not isinstance(self.file_threads, bool)
+                                                  and 1 <= self.file_threads <= 64):
+            raise BackupError('"file_threads" in config.json must be a whole number from 1 to 64, or null')
         self.recursive = raw.get("recursive", True)  # scan folders inside each subfolder too
         if not isinstance(self.recursive, bool):
             raise BackupError('"recursive" in config.json must be true or false')
@@ -154,6 +162,13 @@ class Config:
         for sub in self.subfolders:
             if not sub or sub in (".", "..") or any(c in sub for c in "/\\:"):
                 raise BackupError(f"subfolder {sub!r} must be a single plain folder name")
+
+    @property
+    def threads(self):
+        """Threads for renames and deletes in source_dir."""
+        if self.file_threads is None:
+            self.file_threads = NETWORK_FILE_THREADS if is_network_path(self.source_dir) else 1
+        return self.file_threads
 
     @property
     def manifest(self):
@@ -380,6 +395,27 @@ def scan(cfg, dates, report=quiet):
     return entries, errors, seen
 
 
+def is_network_path(path):
+    """True for a UNC path (//server/share) or a mapped network drive on Windows."""
+    text = str(path).replace("\\", "/")
+    if text.startswith("//"):
+        return True
+    if os.name != "nt":
+        return False
+    import ctypes
+    drive = os.path.splitdrive(os.path.abspath(path))[0]
+    return bool(drive) and ctypes.windll.kernel32.GetDriveTypeW(drive + "\\") == 4  # DRIVE_REMOTE
+
+
+def each(threads, fn, items):
+    """fn over items, in order; on `threads` threads when that is more than one."""
+    if threads <= 1:
+        yield from map(fn, items)
+        return
+    with ThreadPoolExecutor(threads) as pool:
+        yield from pool.map(fn, items)
+
+
 def staged_path(cfg, entry):
     return cfg.staging_dir / entry["volume_name"] / entry["relative_path"]
 
@@ -390,13 +426,28 @@ def stage(cfg, sid, entries, report=quiet):
     """Moves files into staging/<YYYY-MM>/<SUB>/; each manifest line is synced before its file moves.
 
     Returns the number of files that could not be moved (they stay in the source).
-    Renames run on one thread: measured, threads made them slower (they queue on the folder)."""
+    Renames run on cfg.threads threads: one on a local disk (measured, threads made them slower
+    there), several on a network drive, where each rename mostly waits on the network."""
     errors = 0
     cfg.staging_dir.mkdir(parents=True, exist_ok=True)
     if os.stat(cfg.staging_dir).st_dev != os.stat(cfg.source_dir).st_dev:
         raise BackupError(f"staging_dir {cfg.staging_dir} must be on the same drive as source_dir (files move by rename)")
     for d in {staged_path(cfg, e).parent for e in entries}:
         d.mkdir(parents=True, exist_ok=True)
+
+    def move(e):
+        src, dst = cfg.source_dir / e["relative_path"], staged_path(cfg, e)
+        try:
+            # Never overwrite: it may be the only copy. Windows' rename already refuses an
+            # existing target, so the extra check (a network round trip) is only needed elsewhere.
+            if os.name != "nt" and dst.exists():
+                raise FileExistsError(dst)
+            os.rename(src, dst)
+            return 0
+        except OSError as err:  # stays in the source; a later run picks it up
+            log.warning("not staged %s: %s", src, err)
+            return 1
+
     with open(cfg.manifest, "w", encoding="utf-8") as manifest:
         manifest.write(json.dumps({"scan_session_id": sid}) + "\n")
         for i in range(0, len(entries), MANIFEST_BATCH):
@@ -404,16 +455,10 @@ def stage(cfg, sid, entries, report=quiet):
             manifest.writelines(json.dumps(e) + "\n" for e in batch)
             manifest.flush()
             os.fsync(manifest.fileno())  # the batch is listed on disk before any of it moves
-            for e in batch:
-                src, dst = cfg.source_dir / e["relative_path"], staged_path(cfg, e)
-                try:
-                    if dst.exists():  # never overwrite: it may be the only copy
-                        raise FileExistsError(dst)
-                    os.rename(src, dst)
-                except OSError as err:  # stays in the source; a later run picks it up
-                    log.warning("not staged %s: %s", src, err)
-                    errors += 1
-            report("stage", "", i + len(batch), len(entries))
+            for n, failed in enumerate(each(cfg.threads, move, batch), i + 1):
+                errors += failed
+                if n % PROGRESS_EVERY == 0 or n == i + len(batch):
+                    report("stage", "", n, len(entries))
     return errors
 
 
@@ -619,8 +664,9 @@ def finish_staged(db, cfg, report=quiet, resume=False):
         log.warning("staging references missing session %s; recording into a new one", sid)
         sid = start_session(db, "resumed", "resumed")
     months = defaultdict(list)
-    for e in listed:
-        if staged_path(cfg, e).is_file():  # listed but never moved: still in the source
+    present = each(cfg.threads, lambda e: staged_path(cfg, e).is_file(), listed)
+    for e, moved in zip(listed, present):
+        if moved:  # listed but never moved: still in the source
             months[e["volume_name"]].append(e)
 
     archived, failures = [], []
@@ -635,8 +681,8 @@ def finish_staged(db, cfg, report=quiet, resume=False):
                 log.error("%s kept in staging: %s", month, e)
                 failures.append(e)
                 continue
-            for e in months[month]:
-                staged_path(cfg, e).unlink()
+            for _ in each(cfg.threads, lambda e: staged_path(cfg, e).unlink(), months[month]):
+                pass
             archived += months[month]
             log.info("%s: %d files committed (LOCAL_COMMITTED), verified and indexed", month, len(months[month]))
             report("commit", month, len(plan(archived)), len(months))
