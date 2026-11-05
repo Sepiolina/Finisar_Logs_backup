@@ -63,10 +63,24 @@ save little.
 | Check the head before committing only when resuming | Saves one `mochi list` (~2.5 s) per month per run | yes |
 | Stream the scan instead of listing every folder first | Lower memory, same speed | yes |
 | Hash in chunks of 500 files per task | 300,000 files: peak memory 1.15 GB → 0.69 GB | yes |
-| Renames and deletes on 4–16 threads | **Slower** here: 50,000 renames took 0.8 s on 1 thread, 2–3 s on 4–8 threads | no |
+| Renames and deletes on 4–16 threads | **Slower** here: 50,000 renames took 0.8 s on 1 thread, 2–3 s on 4–8 threads | local disk: no; network drive: yes (below) |
 
-Threaded renames may behave differently on a Windows network share or a slow
-disk. That is not measured. The code uses one thread, which was fastest here.
+### On a network drive
+
+A run on a shared network drive staged about 11 files/s (12,000 files in 18
+minutes), and its scan listed about 230 files/s, against 25,000 files/s on the
+local SSD above. Each rename is a few network round trips, and one thread
+spends nearly all of its time waiting for them. So when `source_dir` is a
+network drive (a mapped drive letter or `//server/share`), renames, the
+"is it staged?" checks and the deletes after the commit run on 16 threads
+(`file_threads` in config.json changes this). On Windows the rename itself refuses
+to overwrite, so the separate "does the target exist?" check, one more round
+trip per file, is skipped there.
+
+The fastest setup is still to run the backup **on the file server itself**,
+against its local disk: then nothing crosses the network. Antivirus that scans
+each file as it is renamed also slows staging down; excluding `source_dir`,
+staging and `output_dir` from real-time scanning helps.
 
 ## Measure on your own machine
 

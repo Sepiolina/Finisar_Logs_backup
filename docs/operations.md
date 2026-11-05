@@ -116,6 +116,7 @@ path last, for example `python backup_ui.py --dry-run D:/configs/line2.json`.
 | `staging_dir` | `source_dir/.staging` | Must be on the **same drive** as `source_dir`: files are moved there by rename. A run refuses to start staging otherwise. Created if missing. Never scanned, even inside a subfolder. |
 | `subfolders` | `BURNIN, ESS, JTAG, STM, Xray` | The folders scanned under `source_dir` |
 | `recursive` | `true` | `true`: also scan every folder inside each subfolder, at any depth, keeping those folders in the archive paths (`BURNIN/line2/unit1_BC001_log.txt`). `false`: only files directly in each subfolder. |
+| `file_threads` | `null`: automatic | How many files are renamed into staging, and deleted after the commit, at once. Automatic: **16 when `source_dir` is a network drive** (a mapped drive or `//server/share`), where each rename mostly waits on the network; 1 on a local disk, where one thread is fastest. Set 1–64 to override. |
 | `extensions` | `txt, zip` | Allowed file extensions |
 | `lookback_days` | `2` | The newest `N` days are left for the next run |
 | `date_range` | none | `["YYYY-MM-DD", "YYYY-MM-DD"]` to back-fill a fixed window instead |

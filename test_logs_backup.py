@@ -149,6 +149,56 @@ class ConfigFile(unittest.TestCase):
         self.assertTrue((tmp / "new" / "folder" / "index.db").is_file())
 
 
+class Staging(unittest.TestCase):
+    """stage() alone: no mochi needed."""
+
+    def config(self, **extra):
+        tmp = Path(tempfile.mkdtemp()).resolve()
+        self.addCleanup(shutil.rmtree, tmp)
+        raw = {"source_dir": str(tmp / "src"), "output_dir": str(tmp / "out"), "db_path": str(tmp / "index.db")}
+        (tmp / "config.json").write_text(json.dumps(dict(raw, **extra)))
+        return lb.Config(tmp / "config.json")
+
+    def test_file_threads_setting(self):
+        self.assertEqual(self.config(file_threads=8).threads, 8)
+        self.assertEqual(self.config().threads, 1)  # a local temp folder: one thread
+        for bad in (0, 65, 2.5, True, "4"):
+            with self.assertRaisesRegex(lb.BackupError, "file_threads"):
+                self.config(file_threads=bad)
+
+    def test_network_paths(self):
+        self.assertTrue(lb.is_network_path("//server/share/logs"))
+        self.assertTrue(lb.is_network_path(r"\\server\share\logs"))
+        self.assertFalse(lb.is_network_path(tempfile.gettempdir()))
+
+    def test_threaded_stage_moves_every_file_and_never_overwrites(self):
+        cfg = self.config(file_threads=8)
+        entries = []
+        for n in range(2500):  # more than one manifest batch
+            rel = f"ESS/unit_BC{n:04}.txt"
+            (cfg.source_dir / "ESS").mkdir(parents=True, exist_ok=True)
+            (cfg.source_dir / rel).write_text(str(n))
+            entries.append({"relative_path": rel, "source_subfolder": "ESS", "barcode": f"BC{n:04}",
+                            "original_size": len(str(n)), "volume_name": "2026-08"})
+        taken = lb.staged_path(cfg, entries[7])
+        taken.parent.mkdir(parents=True)
+        taken.write_text("already staged")
+        reports = []
+        logger = logging.getLogger("logs_backup")
+        self.addCleanup(logger.setLevel, logger.level)
+        logger.setLevel(logging.ERROR)
+        errors = lb.stage(cfg, 1, entries, lambda *args: reports.append(args))
+        self.assertEqual(errors, 1)
+        self.assertEqual(taken.read_text(), "already staged")  # not overwritten
+        self.assertTrue((cfg.source_dir / entries[7]["relative_path"]).is_file())  # left in the source
+        for n, e in enumerate(entries):
+            if n != 7:
+                self.assertEqual(lb.staged_path(cfg, e).read_text(), str(n))
+        self.assertEqual(reports[-1], ("stage", "", 2500, 2500))
+        self.assertGreater(len(reports), 20)  # updates every 100 files, not every 2,000
+        self.assertEqual(len(lb.read_manifest(cfg)[1]), 2500)
+
+
 @unittest.skipUnless(MOCHI, "mochi CLI not found (set MOCHI_BIN)")
 class Flow(unittest.TestCase):
     CANDIDATES = [("BC001", "2026-08-03 10:00:00"), ("BC002", "2026-07-30 09:00:00"), ("BC404", "2026-08-01 00:00:00")]
