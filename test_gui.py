@@ -1,6 +1,7 @@
 """Desktop app smoke tests, without a screen (QT_QPA_PLATFORM=offscreen). Need PySide6; the backup
 runs also need the `mochi` CLI (on PATH or in $MOCHI_BIN): python -m unittest -v test_gui"""
 import os
+import re
 import shutil
 import tempfile
 import threading
@@ -40,6 +41,8 @@ class Window(unittest.TestCase):
         query = unittest.mock.patch.object(lb, "query_candidates", lambda sql, a, b: self.candidates)
         query.start()
         self.addCleanup(query.stop)
+        gui.use_language("en")  # the assertions below read the English texts
+        self.addCleanup(gui.use_language, "th")
         self.handler = gui.WindowLog()
         self.window = gui.MainWindow(self.handler, self.tmp / "backup.log")
         self.addCleanup(self.window.close)
@@ -81,7 +84,7 @@ class Window(unittest.TestCase):
     def test_missing_setting_is_refused(self):
         page = self.window.settings_page
         page.source.setText("")
-        with unittest.mock.patch.object(gui.QMessageBox, "warning") as warned:
+        with unittest.mock.patch.object(gui, "warn") as warned:
             self.assertFalse(page.save())
         self.assertIn("log folder", warned.call_args[0][2])
 
@@ -133,6 +136,9 @@ class Window(unittest.TestCase):
                 page.a_start.click()
                 self.wait(lambda: page.job is None)
             self.assertEqual(len(page.stopped_cards), 1)
+            page.refresh()
+            page.refresh()  # refreshing again never shows a stopped run twice
+            self.assertEqual(len(page.stopped_area.findChildren(gui.QFrame, "card")), 1)
             self.assertIn("Stopped</b> with", page.banner.text())
         # As after closing the program and restarting the PC: a new window, the stopped run offered.
         self.window.close()
@@ -151,6 +157,54 @@ class Window(unittest.TestCase):
         self.assertEqual(list((self.tmp / "src").rglob("*_BC*")), [])
         files, _ = lb.head_files(lb.Config(lb.find_config()), self.tmp / "out/2026/2026-08.mochi")
         self.assertEqual(len(files), 301)
+
+
+@unittest.skipUnless(gui, "PySide6 not installed")
+class Thai(unittest.TestCase):
+    def test_every_text_has_a_thai_translation(self):
+        import ast
+        import gui_text
+        tree = ast.parse(Path(gui.__file__).read_text(encoding="utf-8"))
+        keys = {node.args[0].value for node in ast.walk(tree)
+                if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "tr"
+                and node.args and isinstance(node.args[0], ast.Constant)}
+        keys |= {name for _, name in gui.STEPS} | set(gui.HistoryPage.COLUMNS) | {"Backup: {mode}", "Preview: {mode}"}
+        missing = sorted(k for k in keys if k not in gui_text.TH)
+        self.assertEqual(missing, [])
+        for key, thai in gui_text.TH.items():  # the same {placeholders} on both sides
+            self.assertEqual(sorted(re.findall(r"{(\w+)}", key)), sorted(re.findall(r"{(\w+)}", thai)), key)
+
+    def test_window_in_thai(self):
+        qt = QApplication.instance() or QApplication([])
+        tmp = Path(tempfile.mkdtemp()).resolve()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        (tmp / "src/ESS").mkdir(parents=True)
+        (tmp / "src/ESS/unit_BC1.txt").write_text("x")
+        with unittest.mock.patch.dict(os.environ, {"FINISAR_BACKUP_HOME": str(tmp / "app")}), \
+                unittest.mock.patch.object(lb, "query_candidates", lambda *_: [("BC1", "2026-08-01 00:00:00")]):
+            lb.save_settings({"source_dir": str(tmp / "src"), "output_dir": str(tmp / "out"),
+                              "db_path": str(tmp / "out/index.db"), "subfolders": ["ESS"], "language": "th"})
+            gui.use_language(lb.load_settings()["language"])
+            window = gui.MainWindow(gui.WindowLog(), tmp / "backup.log")
+            self.addCleanup(window.close)
+            self.assertEqual([window.nav.item(i).text() for i in range(4)],
+                             ["สำรองข้อมูล", "ประวัติ", "การตั้งค่า", "เครื่องมือ"])
+            self.assertEqual(window.settings_page.language.currentData(), "th")
+            page = window.backup_page
+            page.a_preview.click()
+            end = time.monotonic() + 20
+            while page.job is not None and time.monotonic() < end:
+                qt.processEvents()
+                time.sleep(0.01)
+            self.assertIn("ตัวอย่าง", page.banner.text())
+            self.assertIn("จะเก็บเข้าไฟล์เก็บถาวร 1 ไฟล์", page.banner.text())
+            self.assertEqual(gui_text_tr_progress("batch 2/3 copying to local staging"),
+                             "ชุดที่ 2/3 กำลังคัดลอกมาพักบนเครื่องนี้")
+
+
+def gui_text_tr_progress(message):
+    import gui_text
+    return gui_text.tr_progress(message)
 
 
 if __name__ == "__main__":

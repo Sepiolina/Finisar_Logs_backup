@@ -73,6 +73,11 @@ On Windows: double-click `run_app.bat`, or `FinisarLogsBackup.exe` once built (b
 | **Settings** | Everything from the table under [Configure](#configure), with Browse buttons. **Save** checks the values first. |
 | **Tools** | **Run check** (finds `mochi`, one SQL Server connection), **Export to…** (see [Export](#export-a-copy-of-everything-to-restore-from)), open the log file or the settings folder |
 
+**Language.** The app is in Thai by default. **Settings → Language** (ภาษา) switches between ไทย and
+English; it applies the next time the program starts. Errors show a Thai headline with the original
+English detail under it, and the run log (`backup.log`, the Log box) stays in English so it can be
+sent to whoever supports the tool. The terminal version stays in English.
+
 **Settings are saved per Windows user** in `%APPDATA%\FinisarLogsBackup\settings.json` (the same
 keys as `config.json`). On the first start the app imports a `config.json` from the current folder
 or next to the program, if there is one; **Import config.json…** does it later. The run log is

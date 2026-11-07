@@ -23,7 +23,7 @@ import sys
 import threading
 from pathlib import Path
 
-from PySide6.QtCore import QDate, QElapsedTimer, QObject, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QDate, QElapsedTimer, QLocale, QObject, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QPalette
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QDateEdit, QDialog,
                                QDialogButtonBox, QFileDialog, QFormLayout, QFrame, QGridLayout, QHBoxLayout,
@@ -32,12 +32,15 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComb
                                QSizePolicy, QSpinBox, QStackedWidget, QTableWidget, QTableWidgetItem,
                                QVBoxLayout, QWidget)
 
+import gui_text
 import logs_backup as lb
+from gui_text import tr, tr_error, tr_progress
 
 log = logging.getLogger("logs_backup")
 
 STEPS = [("resume", "Finish the previous run"), ("query", "Ask SQL Server for barcodes"),
          ("scan", "Scan the log folders"), ("stage", "Stage files"), ("commit", "Commit, verify, index")]
+# The English texts are keys for gui_text.tr(): Thai (default) or English, per Settings → Language.
 
 STYLE = """
 * { font-size: 10pt; }
@@ -92,9 +95,11 @@ def space_html(rows):
     for r in rows:
         mark, color = (("✓", "#16a34a") if r["ok"] else ("?", "#64748b") if r["ok"] is None
                        else ("✗", "#dc2626") if r["required"] else ("⚠", "#d97706"))
-        free = "unknown" if r["free"] is None else size(r["free"])
-        lines.append(f'<span style="color:{color}">{mark}</span> {r["what"]}: <b>{free}</b> free, needs '
-                     f'{size(r["need"])} <span style="color:#64748b">({r["path"]})</span>')
+        free = tr("unknown") if r["free"] is None else size(r["free"])
+        lines.append(f'<span style="color:{color}">{mark}</span> '
+                     + tr("{what}: <b>{free}</b> free, needs {need}", what=tr(r["what"]), free=free,
+                          need=size(r["need"]))
+                     + f' <span style="color:#64748b">({r["path"]})</span>')
     return "<br>".join(lines)
 
 
@@ -142,6 +147,21 @@ def page(title, subtitle):
     scroll.setWidget(inner)
     outer.addWidget(scroll)
     return widget, box
+
+
+def ask(parent, title, text, yes="Yes", no="No"):
+    """A yes/no question with the buttons in the app's language. True for yes."""
+    box = QMessageBox(QMessageBox.Question, title, text, parent=parent)
+    go = box.addButton(tr(yes), QMessageBox.YesRole)
+    box.addButton(tr(no), QMessageBox.NoRole)
+    box.exec()
+    return box.clickedButton() == go
+
+
+def warn(parent, title, text, info=False):
+    box = QMessageBox(QMessageBox.Information if info else QMessageBox.Warning, title, text, parent=parent)
+    box.addButton(tr("OK"), QMessageBox.AcceptRole)
+    box.exec()
 
 
 def button(text, kind=None):
@@ -224,18 +244,19 @@ class Job(QObject):
 class ConfirmDialog(QDialog):
     def __init__(self, volumes, space=(), parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Archive these files?")
+        self.setWindowTitle(tr("Archive these files?"))
         self.setMinimumWidth(520)
         box = QVBoxLayout(self)
         barcodes = sum(v[0] for v in volumes.values())
         files = sum(v[1] for v in volumes.values())
         nbytes = sum(v[2] for v in volumes.values())
-        head = QLabel(f"<b>{files:,} files</b> ({barcodes:,} barcodes, {size(nbytes)}) will be archived "
-                      f"into {len(volumes)} monthly archive(s), then removed from the log folders.")
+        head = QLabel(tr("<b>{files} files</b> ({barcodes} barcodes, {size}) will be archived into {months} "
+                         "monthly archive(s), then removed from the log folders.", files=f"{files:,}",
+                         barcodes=f"{barcodes:,}", size=size(nbytes), months=len(volumes)))
         head.setWordWrap(True)
         box.addWidget(head)
         table = QTableWidget(len(volumes), 4)
-        table.setHorizontalHeaderLabels(["Month", "Barcodes", "Files", "Size"])
+        table.setHorizontalHeaderLabels([tr("Month"), tr("Barcodes"), tr("Files"), tr("Size")])
         table.verticalHeader().hide()
         table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         for row, (month, (bc, n, b)) in enumerate(volumes.items()):
@@ -247,16 +268,16 @@ class ConfirmDialog(QDialog):
         table.setMaximumHeight(min(320, 40 + 30 * len(volumes)))
         box.addWidget(table)
         if space:
-            title = QLabel("<b>Free space</b>")
+            title = QLabel(f"<b>{tr('Free space')}</b>")
             box.addWidget(title)
             room = QLabel(space_html(space))
             room.setWordWrap(True)
             room.setTextFormat(Qt.RichText)
             box.addWidget(room)
         buttons = QDialogButtonBox()
-        go = buttons.addButton("Archive", QDialogButtonBox.AcceptRole)
+        go = buttons.addButton(tr("Archive"), QDialogButtonBox.AcceptRole)
         go.setObjectName("primary")
-        buttons.addButton("Cancel", QDialogButtonBox.RejectRole)
+        buttons.addButton(tr("Cancel"), QDialogButtonBox.RejectRole)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         box.addWidget(buttons)
@@ -268,7 +289,7 @@ class StepRow:
     def __init__(self, grid, row, name):
         self.status = QLabel("○")
         self.status.setFixedWidth(18)
-        self.name = QLabel(name)
+        self.name = QLabel(tr(name))
         self.bar = QProgressBar()
         self.bar.setTextVisible(False)
         self.bar.setFixedHeight(8)
@@ -314,7 +335,7 @@ class StepRow:
         else:
             self.bar.setRange(0, 0)  # busy
             self.count.setText(f"{int(done):,}" if done else "")
-        self.detail.setText(message or "")
+        self.detail.setText(tr_progress(message or ""))
         if total and done and done >= total:
             self.finish("✓", "#16a34a")
 
@@ -337,7 +358,7 @@ class BackupPage(QWidget):
     def __init__(self, app):
         super().__init__()
         self.app, self.job = app, None
-        widget, box = page("Backup", "Archive test-station logs into monthly MOCHI archives.")
+        widget, box = page(tr("Backup"), tr("Archive test-station logs into monthly MOCHI archives."))
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(widget)
@@ -352,35 +373,35 @@ class BackupPage(QWidget):
 
         modes = QHBoxLayout()
         modes.setSpacing(16)
-        a, abox = card("A · Continue from the last run",
-                       "Picks up where the last successful run ended, up to today minus the lookback days. "
-                       "Use this for the regular backup.")
+        a, abox = card(tr("A · Continue from the last run"),
+                       tr("Picks up where the last successful run ended, up to today minus the lookback days. "
+                          "Use this for the regular backup."))
         self.continue_label = QLabel("…", objectName="window")
         abox.addWidget(self.continue_label)
         abox.addStretch(1)
         arow = QHBoxLayout()
-        self.a_preview, self.a_start = button("Preview"), button("Start backup", "primary")
+        self.a_preview, self.a_start = button(tr("Preview")), button(tr("Start backup"), "primary")
         arow.addWidget(self.a_preview)
         arow.addStretch(1)
         arow.addWidget(self.a_start)
         abox.addLayout(arow)
 
-        b, bbox = card("B · Custom date range",
-                       "Back-fill or redo any range of dates. Does not change where Continue starts.")
+        b, bbox = card(tr("B · Custom date range"),
+                       tr("Back-fill or redo any range of dates. Does not change where Continue starts."))
         dates = QHBoxLayout()
         today = QDate.currentDate()
         self.date_from, self.date_to = QDateEdit(today.addDays(-30)), QDateEdit(today.addDays(-2))
         for d in (self.date_from, self.date_to):
             d.setCalendarPopup(True)
             d.setDisplayFormat("yyyy-MM-dd")
-        dates.addWidget(QLabel("From"))
+        dates.addWidget(QLabel(tr("From")))
         dates.addWidget(self.date_from, 1)
-        dates.addWidget(QLabel("to"))
+        dates.addWidget(QLabel(tr("to")))
         dates.addWidget(self.date_to, 1)
         bbox.addLayout(dates)
         bbox.addStretch(1)
         brow = QHBoxLayout()
-        self.b_preview, self.b_start = button("Preview"), button("Start backup", "primary")
+        self.b_preview, self.b_start = button(tr("Preview")), button(tr("Start backup"), "primary")
         brow.addWidget(self.b_preview)
         brow.addStretch(1)
         brow.addWidget(self.b_start)
@@ -391,14 +412,14 @@ class BackupPage(QWidget):
 
         progress, pbox = card()
         head = QHBoxLayout()
-        self.run_title = QLabel("Progress", objectName="cardTitle")
+        self.run_title = QLabel(tr("Progress"), objectName="cardTitle")
         head.addWidget(self.run_title)
         head.addStretch(1)
         self.elapsed = QLabel("", objectName="muted")
         head.addWidget(self.elapsed)
-        self.stop_button = button("Stop", "danger")
+        self.stop_button = button(tr("Stop"), "danger")
         self.stop_button.setEnabled(False)
-        self.stop_button.setToolTip("Stops at the next safe point. Nothing is lost: the next run continues.")
+        self.stop_button.setToolTip(tr("Stops at the next safe point. Nothing is lost: the next run continues."))
         head.addWidget(self.stop_button)
         pbox.addLayout(head)
         grid = QGridLayout()
@@ -413,7 +434,7 @@ class BackupPage(QWidget):
         pbox.addWidget(self.banner)
         box.addWidget(progress)
 
-        logs, lbox = card("Log")
+        logs, lbox = card(tr("Log"))
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.setMaximumBlockCount(5000)
@@ -443,30 +464,32 @@ class BackupPage(QWidget):
             date_from, date_to = lb.continue_window(cfg)
             stopped = lb.stopped_runs(cfg)
         except Exception as e:
-            self.continue_label.setText("Fill in Settings first" if isinstance(e, KeyError) else f"({e})")
+            self.continue_label.setText(tr("Fill in Settings first") if isinstance(e, KeyError) else f"({e})")
             stopped = []
         else:
-            self.continue_label.setText(f"{date_from or 'the beginning'}  →  {date_to}")
+            self.continue_label.setText(f"{date_from or tr('the beginning')}  →  {date_to}")
         self.show_stopped(stopped)
 
     def show_stopped(self, stopped):
-        for frame, *_ in self.stopped_cards:
+        for frame, *_ in self.stopped_cards:  # gone at once (deleteLater alone waits for the event loop)
+            self.stopped_layout.removeWidget(frame)
+            frame.setParent(None)
             frame.deleteLater()
         self.stopped, self.stopped_cards = stopped, []
         for s in reversed(stopped):  # newest first
-            kind = "B · custom range" if s["custom"] else "A · continue"
-            frame, sbox = card(f"Stopped run ({kind}): continue where it left off")
+            kind = tr("B · custom range") if s["custom"] else tr("A · continue")
+            frame, sbox = card(tr("Stopped run ({kind}): continue where it left off", kind=kind))
             frame.setStyleSheet("QFrame#card { border: 1px solid #f59e0b; background: #fffbeb; }")
-            label = QLabel(f"<b>{s['left']:,} of {s['total']:,} files left</b> · dates "
-                           f"{s['window'][0] or '(start)'} → {s['window'][1]} · stopped {when_text(s['stopped_at'])}."
-                           "<br>Continue picks up exactly there, without asking SQL Server or scanning the log "
-                           "folders again. Files staged before the stop are checked and finished first.",
-                           objectName="muted")
+            label = QLabel(tr("<b>{left} of {total} files left</b> · dates {start} → {end} · stopped {when}.<br>"
+                              "Continue picks up exactly there, without asking SQL Server or scanning the log "
+                              "folders again. Files staged before the stop are checked and finished first.",
+                              left=f"{s['left']:,}", total=f"{s['total']:,}", start=s["window"][0] or tr("(start)"),
+                              end=s["window"][1], when=when_text(s["stopped_at"])), objectName="muted")
             label.setWordWrap(True)
             sbox.addWidget(label)
             row = QHBoxLayout()
-            discard, go_on = button("Discard"), button("Continue", "primary")
-            discard.setToolTip("Forget this run's plan. Its files stay in the log folders; a later run finds them.")
+            discard, go_on = button(tr("Discard")), button(tr("Continue"), "primary")
+            discard.setToolTip(tr("Forget this run's plan. Its files stay in the log folders; a later run finds them."))
             discard.clicked.connect(lambda _=False, sid=s["sid"]: self.discard(sid))
             go_on.clicked.connect(lambda _=False, sid=s["sid"]: self.start(False, False, continue_stopped=sid))
             row.addStretch(1)
@@ -480,14 +503,14 @@ class BackupPage(QWidget):
         self.stopped_area.setVisible(bool(stopped))
 
     def discard(self, sid):
-        if QMessageBox.question(self, "Discard the stopped run?",
-                                "Forget the plan of this stopped run? Nothing is deleted: its files stay in the "
-                                "log folders and a later run finds them (after a new scan).") != QMessageBox.Yes:
+        if not ask(self, tr("Discard the stopped run?"),
+                   tr("Forget the plan of this stopped run? Nothing is deleted: its files stay in the log folders "
+                      "and a later run finds them (after a new scan).")):
             return
         try:
             lb.discard_stopped_run(self.app.config(ask_password=False), sid)
         except Exception as e:
-            QMessageBox.warning(self, "Cannot discard", str(e))
+            warn(self, tr("Cannot discard"), tr_error(str(e)))
         self.refresh()
         self.app.history_page.refresh()
 
@@ -495,14 +518,14 @@ class BackupPage(QWidget):
         for row in self.rows.values():
             row.tick()
         if self.run_timer.isValid():
-            self.elapsed.setText("Elapsed " + clock(self.run_timer.elapsed()))
+            self.elapsed.setText(tr("Elapsed {time}", time=clock(self.run_timer.elapsed())))
 
     def set_running(self, running):
         buttons = [self.a_start, self.a_preview, self.b_start, self.b_preview]
         for b in buttons + [w for _, _, go_on, discard in self.stopped_cards for w in (go_on, discard)]:
             b.setEnabled(not running)
         self.stop_button.setEnabled(running)
-        self.stop_button.setText("Stop")
+        self.stop_button.setText(tr("Stop"))
         self.app.set_busy(running)
 
     def show_banner(self, text, color, background):
@@ -520,14 +543,14 @@ class BackupPage(QWidget):
         stopped_a = [s for s in self.stopped if not s["custom"]]
         if stopped_a and not dry_run and not continue_stopped and not custom:
             s = stopped_a[-1]
-            box = QMessageBox(QMessageBox.Question, "A stopped run can continue",
-                              f"The stopped continue run still has {s['left']:,} files to archive.\n\n"
-                              "Continue it (no new scan), or start a new continue run? The new run covers its "
-                              "dates and replaces it (its files are found again by the new scan). Stopped "
-                              "custom-range runs are kept either way.", parent=self)
-            go_on = box.addButton("Continue stopped run", QMessageBox.AcceptRole)
-            new = box.addButton("Start new run", QMessageBox.DestructiveRole)
-            box.addButton(QMessageBox.Cancel)
+            box = QMessageBox(QMessageBox.Question, tr("A stopped run can continue"),
+                              tr("The stopped continue run still has {left} files to archive.\n\nContinue it (no "
+                                 "new scan), or start a new continue run? The new run covers its dates and replaces "
+                                 "it (its files are found again by the new scan). Stopped custom-range runs are kept "
+                                 "either way.", left=f"{s['left']:,}"), parent=self)
+            go_on = box.addButton(tr("Continue stopped run"), QMessageBox.AcceptRole)
+            new = box.addButton(tr("Start new run"), QMessageBox.DestructiveRole)
+            box.addButton(tr("Cancel"), QMessageBox.RejectRole)
             box.exec()
             if box.clickedButton() == go_on:
                 continue_stopped = s["sid"]
@@ -536,11 +559,11 @@ class BackupPage(QWidget):
         try:
             cfg = self.app.config()
         except KeyError as e:
-            QMessageBox.warning(self, "Settings needed", f"Set {e} on the Settings page first.")
+            warn(self, tr("Settings needed"), tr("Set {name} on the Settings page first.", name=e))
             self.app.go("settings")
             return
         except Exception as e:
-            QMessageBox.warning(self, "Settings problem", str(e))
+            warn(self, tr("Settings problem"), tr_error(str(e)))
             return
         if cfg is None:  # password dialog cancelled
             return
@@ -550,17 +573,18 @@ class BackupPage(QWidget):
             try:
                 lb.check_window(window)
             except lb.BackupError as e:
-                QMessageBox.warning(self, "Date range", str(e))
+                warn(self, tr("Date range"), tr_error(str(e)))
                 return
         for row in self.rows.values():
             row.reset()
         self.banner.hide()
         what = "Preview" if dry_run else "Backup"
         kept = next((s for s in self.stopped if s["sid"] == continue_stopped), None)
-        mode = (f"continue the stopped run {kept['window'][0] or '(start)'} → {kept['window'][1]}" if kept
-                else f"{window[0]} → {window[1]}" if window else "continue")
-        self.run_title.setText(f"{what}: {mode}")
-        log.info("---- %s started (%s)", what.lower(), mode)
+        mode = (tr("continue the stopped run {start} → {end}", start=kept["window"][0] or tr("(start)"),
+                   end=kept["window"][1]) if kept else f"{window[0]} → {window[1]}" if window else tr("continue"))
+        self.run_title.setText(tr(what + ": {mode}", mode=mode))
+        log.info("---- %s started (%s)", what.lower(),
+                 f"stopped run {kept['sid']}" if kept else f"{window[0]} .. {window[1]}" if window else "continue")
         self.job = Job(lambda job: lb.run(cfg, dry_run=dry_run, report=job.report, confirm=job.confirm,
                                           window=window, stop=job.stop, continue_stopped=continue_stopped))
         self.job.progress.connect(self.on_progress)
@@ -576,7 +600,7 @@ class BackupPage(QWidget):
         if self.job:
             self.job.stop.set()
             self.stop_button.setEnabled(False)
-            self.stop_button.setText("Stopping…")
+            self.stop_button.setText(tr("Stopping…"))
             log.info("stop requested: stopping at the next safe point (a commit in progress is finished first)")
 
     def on_progress(self, step, message, done, total):
@@ -606,27 +630,30 @@ class BackupPage(QWidget):
     def on_done(self, summary):
         status = summary["status"]
         self.end()
-        counts = (f"{summary['files_moved']:,} files committed ({summary['barcodes']:,} barcodes)"
-                  f" · {summary['errors']:,} errors")
+        counts = tr("{files} files committed ({barcodes} barcodes) · {errors} errors",
+                    files=f"{summary['files_moved']:,}", barcodes=f"{summary['barcodes']:,}",
+                    errors=f"{summary['errors']:,}")
         if summary.get("resumed"):
-            counts += f" · {summary['resumed']:,} files from the previous run"
+            counts += tr(" · {n} files from the previous run", n=f"{summary['resumed']:,}")
         if status == "done":
-            self.show_banner(f"<b>Done.</b> {counts}. Committed is not a backup on its own: keep an export on "
-                             "another drive (Tools).", "#14532d", "#dcfce7")
+            self.show_banner(tr("<b>Done.</b> {counts}. Committed is not a backup on its own: keep an export on "
+                                "another drive (Tools).", counts=counts), "#14532d", "#dcfce7")
         elif status == "stopped":
-            self.show_banner(f"<b>Stopped</b> with {summary.get('left', 0):,} files left. {counts}. Nothing is lost: "
-                             "you can close the program or shut down the PC, and run other backups meanwhile. "
-                             "Continue it any time with its <b>Continue</b> button above.", "#78350f", "#fef3c7")
+            self.show_banner(tr("<b>Stopped</b> with {left} files left. {counts}. Nothing is lost: you can close the "
+                                "program or shut down the PC, and run other backups meanwhile. Continue it any time "
+                                "with its <b>Continue</b> button above.", left=f"{summary.get('left', 0):,}",
+                                counts=counts), "#78350f", "#fef3c7")
         elif status == "cancelled":
-            self.show_banner("Cancelled. Nothing was moved or recorded.", "#334155", "#e2e8f0")
+            self.show_banner(tr("Cancelled. Nothing was moved or recorded."), "#334155", "#e2e8f0")
         else:  # dry run
             vols = summary["volumes"]
             files = sum(v[1] for v in vols.values())
-            months = ", ".join(f"{m}: {v[1]:,}" for m, v in vols.items()) or "none"
-            self.show_banner(f"<b>Preview.</b> {summary['candidates']:,} candidate barcodes, "
-                             f"{summary['scanned']:,} files scanned, <b>{files:,} files would be archived</b> "
-                             f"({months}). Nothing was moved."
-                             + (f"<br><br><b>Free space</b><br>{space_html(summary['space'])}"
+            months = ", ".join(f"{m}: {v[1]:,}" for m, v in vols.items()) or tr("none")
+            self.show_banner(tr("<b>Preview.</b> {candidates} candidate barcodes, {scanned} files scanned, <b>{files} "
+                                "files would be archived</b> ({months}). Nothing was moved.",
+                                candidates=f"{summary['candidates']:,}", scanned=f"{summary['scanned']:,}",
+                                files=f"{files:,}", months=months)
+                             + (f"<br><br><b>{tr('Free space')}</b><br>{space_html(summary['space'])}"
                                 if summary.get("space") else ""), "#1e3a8a", "#dbeafe")
         if status == "done" and self.app.cfg_email():
             lb.send_email(self.app.last_cfg, summary)
@@ -636,9 +663,9 @@ class BackupPage(QWidget):
             if row.active:
                 row.finish("✗", "#dc2626")
         self.end()
-        self.show_banner(f"<b>Failed:</b> {message}<br>Nothing is lost: files not committed yet are still in the "
-                         "log folders or in staging. Start again to continue. Details: Tools → Open log file.",
-                         "#7f1d1d", "#fee2e2")
+        self.show_banner(tr("<b>Failed:</b> {message}<br>Nothing is lost: files not committed yet are still in the "
+                            "log folders or in staging. Start again to continue. Details: Tools → Open log file.",
+                            message=tr_error(message)), "#7f1d1d", "#fee2e2")
 
 
 # ---------------------------------------------------------------- History page
@@ -649,7 +676,7 @@ class HistoryPage(QWidget):
     def __init__(self, app):
         super().__init__()
         self.app = app
-        widget, box = page("History", "Every run recorded in the index, newest first.")
+        widget, box = page(tr("History"), tr("Every run recorded in the index, newest first."))
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(widget)
@@ -657,12 +684,12 @@ class HistoryPage(QWidget):
         self.note = QLabel("", objectName="muted")
         top.addWidget(self.note)
         top.addStretch(1)
-        again = button("Refresh")
+        again = button(tr("Refresh"))
         again.clicked.connect(self.refresh)
         top.addWidget(again)
         box.addLayout(top)
         self.table = QTableWidget(0, len(self.COLUMNS))
-        self.table.setHorizontalHeaderLabels(self.COLUMNS)
+        self.table.setHorizontalHeaderLabels([tr(c) for c in self.COLUMNS])
         self.table.verticalHeader().hide()
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -678,7 +705,7 @@ class HistoryPage(QWidget):
         except AttributeError:
             return
         if not path.is_file():
-            self.note.setText("No runs yet.")
+            self.note.setText(tr("No runs yet."))
             return
         try:
             db = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
@@ -691,20 +718,20 @@ class HistoryPage(QWidget):
                               " total_files_moved, total_errors FROM scan_session ORDER BY id DESC LIMIT 500").fetchall()
             db.close()
         except sqlite3.Error as e:
-            self.note.setText(f"Cannot read the index: {e}")
+            self.note.setText(tr("Cannot read the index: {error}", error=e))
             return
-        self.note.setText(f"{len(rows)} run(s) · {path}")
+        self.note.setText(tr("{n} run(s) · {path}", n=len(rows), path=path))
         colors = {"success": "#16a34a", "failed": "#dc2626", "running": "#2563eb"}
         for sid, started, status, start, end, barcodes, files, errors in rows:
             r = self.table.rowCount()
             self.table.insertRow(r)
-            mode = "resumed" if end == "resumed" else "custom" if sid in custom else "continue"
+            mode = tr("resumed") if end == "resumed" else tr("custom") if sid in custom else tr("continue")
             if sid in waiting:
-                mode += " · can continue"
+                mode += tr(" · can continue")
             when = started
             if str(started).startswith("epoch:"):
                 when = dt.datetime.fromtimestamp(int(started[6:])).strftime("%Y-%m-%d %H:%M")
-            values = [str(sid), when, status, mode, "" if end == "resumed" else f"{start or '(start)'} → {end}",
+            values = [str(sid), when, tr(status), mode, "" if end == "resumed" else f"{start or tr('(start)')} → {end}",
                       f"{barcodes or 0:,}", f"{files or 0:,}", f"{errors or 0:,}"]
             for c, text in enumerate(values):
                 item = QTableWidgetItem(text)
@@ -724,18 +751,18 @@ class PathField(QWidget):
         row.setContentsMargins(0, 0, 0, 0)
         self.edit = QLineEdit()
         self.edit.setPlaceholderText(placeholder)
-        browse = button("Browse…")
+        browse = button(tr("Browse…"))
         browse.clicked.connect(lambda: self.browse(folder, filter_))
         row.addWidget(self.edit, 1)
         row.addWidget(browse)
 
     def browse(self, folder, filter_):
         if folder:
-            chosen = QFileDialog.getExistingDirectory(self, "Choose a folder", self.edit.text())
+            chosen = QFileDialog.getExistingDirectory(self, tr("Choose a folder"), self.edit.text())
         else:
-            chosen = QFileDialog.getSaveFileName(self, "Choose a file", self.edit.text(), filter_,
+            chosen = QFileDialog.getSaveFileName(self, tr("Choose a file"), self.edit.text(), filter_,
                                                  options=QFileDialog.DontConfirmOverwrite)[0] \
-                if "index" in filter_.lower() else QFileDialog.getOpenFileName(self, "Choose a file",
+                if "index" in filter_.lower() else QFileDialog.getOpenFileName(self, tr("Choose a file"),
                                                                                self.edit.text(), filter_)[0]
         if chosen:
             self.edit.setText(chosen.replace("\\", "/"))
@@ -751,103 +778,108 @@ class SettingsPage(QWidget):
     def __init__(self, app):
         super().__init__()
         self.app, self.dirty = app, False
-        widget, box = page("Settings", f"Saved for this Windows user in {lb.settings_path()}")
+        widget, box = page(tr("Settings"), tr("Saved for this Windows user in {path}", path=lb.settings_path()))
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(widget)
 
-        folders, fbox = card("Folders")
+        folders, fbox = card(tr("Folders"))
         form = QFormLayout()
         form.setLabelAlignment(Qt.AlignRight)
-        self.source = PathField("D:/logs  or  //server/share/logs")
+        self.source = PathField(tr("D:/logs  or  //server/share/logs"))
         self.output = PathField("E:/archive")
-        self.db = PathField("default: <archive folder>/index.db", folder=False, filter_="Index (*.db)")
-        form.addRow("Log folder (source)", self.source)
-        form.addRow("Archive folder", self.output)
-        form.addRow("Index file", self.db)
+        self.db = PathField(tr("default: <archive folder>/index.db"), folder=False, filter_="Index (*.db)")
+        form.addRow(tr("Log folder (source)"), self.source)
+        form.addRow(tr("Archive folder"), self.output)
+        form.addRow(tr("Index file"), self.db)
         self.subfolders = QLineEdit()
         self.subfolders.setPlaceholderText("BURNIN, ESS, JTAG, STM, Xray")
-        form.addRow("Subfolders to scan", self.subfolders)
+        form.addRow(tr("Subfolders to scan"), self.subfolders)
         self.extensions = QLineEdit()
         self.extensions.setPlaceholderText("txt, zip")
-        form.addRow("File extensions", self.extensions)
-        self.recursive = QCheckBox("Also scan folders inside each subfolder")
+        form.addRow(tr("File extensions"), self.extensions)
+        self.recursive = QCheckBox(tr("Also scan folders inside each subfolder"))
         form.addRow("", self.recursive)
         self.lookback = QSpinBox()
         self.lookback.setRange(0, 365)
-        self.lookback.setSuffix(" days")
-        form.addRow("Leave the newest", self.lookback)
+        self.lookback.setSuffix(tr(" days"))
+        form.addRow(tr("Leave the newest"), self.lookback)
         fbox.addLayout(form)
         box.addWidget(folders)
 
-        sql, sbox = card("SQL Server", "Read only: one query returns the barcodes of the date range.")
+        sql, sbox = card("SQL Server", tr("Read only: one query returns the barcodes of the date range."))
         form = QFormLayout()
         form.setLabelAlignment(Qt.AlignRight)
         self.server = QLineEdit()
-        self.server.setPlaceholderText("sqlhost  or  HOST\\INSTANCE")
+        self.server.setPlaceholderText(tr("sqlhost  or  HOST\\INSTANCE"))
         self.port = QSpinBox()
         self.port.setRange(0, 65535)
-        self.port.setSpecialValueText("1433 (default)")
+        self.port.setSpecialValueText(tr("1433 (default)"))
         self.database = QLineEdit()
         self.database.setPlaceholderText("ForthUtilities")
         self.user = QLineEdit()
         self.password = QLineEdit()
         self.password.setEchoMode(QLineEdit.Password)
-        self.password.setPlaceholderText("asked when a run starts, unless remembered")
-        self.remember = QCheckBox("Remember the password (encrypted for this Windows user)")
+        self.password.setPlaceholderText(tr("asked when a run starts, unless remembered"))
+        self.remember = QCheckBox(tr("Remember the password (encrypted for this Windows user)"))
         if not lb.can_protect():
             self.remember.setEnabled(False)
-            self.remember.setToolTip("Only available on Windows")
+            self.remember.setToolTip(tr("Only available on Windows"))
         self.encryption = QComboBox()
         for label, value in (("Request (default)", "request"), ("Require", "require"),
                              ("Off (trusted network only)", "off")):
-            self.encryption.addItem(label, value)
-        form.addRow("Server", self.server)
-        form.addRow("Port", self.port)
-        form.addRow("Database", self.database)
-        form.addRow("User", self.user)
-        form.addRow("Password", self.password)
+            self.encryption.addItem(tr(label), value)
+        form.addRow(tr("Server"), self.server)
+        form.addRow(tr("Port"), self.port)
+        form.addRow(tr("Database"), self.database)
+        form.addRow(tr("User"), self.user)
+        form.addRow(tr("Password"), self.password)
         form.addRow("", self.remember)
-        form.addRow("Encryption", self.encryption)
+        form.addRow(tr("Encryption"), self.encryption)
         sbox.addLayout(form)
         box.addWidget(sql)
 
-        perf, pbox = card("Network drive and speed",
-                          "Automatic suits most setups: on a network drive files are copied to local staging, "
-                          "16 at a time; on a local disk they are moved one at a time.")
+        perf, pbox = card(tr("Network drive and speed"),
+                          tr("Automatic suits most setups: on a network drive files are copied to local staging, "
+                             "16 at a time; on a local disk they are moved one at a time."))
         form = QFormLayout()
         form.setLabelAlignment(Qt.AlignRight)
         self.mode = QComboBox()
         for label, value in (("Automatic", None), ("Copy to local staging (network drive)", "copy"),
                              ("Move by rename (local disk)", "move")):
-            self.mode.addItem(label, value)
-        self.staging = PathField("automatic")
+            self.mode.addItem(tr(label), value)
+        self.staging = PathField(tr("automatic"))
         self.threads = QSpinBox()
         self.threads.setRange(0, 64)
-        self.threads.setSpecialValueText("Automatic")
+        self.threads.setSpecialValueText(tr("Automatic"))
         self.batch = QSpinBox()
         self.batch.setRange(100, 1_000_000)
         self.batch.setSingleStep(1000)
-        self.batch.setSuffix(" files")
-        self.batch.setToolTip("Stop waits for at most one batch's commit. Smaller: quicker stop, more commits.")
-        form.addRow("Staging", self.mode)
-        form.addRow("Staging folder", self.staging)
-        form.addRow("Files at once", self.threads)
-        form.addRow("Batch size", self.batch)
+        self.batch.setSuffix(tr(" files"))
+        self.batch.setToolTip(tr("Stop waits for at most one batch's commit. Smaller: quicker stop, more commits."))
+        form.addRow(tr("Staging"), self.mode)
+        form.addRow(tr("Staging folder"), self.staging)
+        form.addRow(tr("Files at once"), self.threads)
+        form.addRow(tr("Batch size"), self.batch)
         pbox.addLayout(form)
         box.addWidget(perf)
 
-        other, obox = card("Other")
+        other, obox = card(tr("Other"))
         form = QFormLayout()
         form.setLabelAlignment(Qt.AlignRight)
-        self.mochi = PathField("found automatically", folder=False, filter_="mochi (mochi.exe mochi)")
+        self.mochi = PathField(tr("found automatically"), folder=False, filter_="mochi (mochi.exe mochi)")
         self.email_url = QLineEdit()
-        self.email_url.setPlaceholderText("optional: http://host:port")
+        self.email_url.setPlaceholderText(tr("optional: http://host:port"))
         self.email_to = QLineEdit()
-        self.email_to.setPlaceholderText("optional: a@b.c")
-        form.addRow("mochi program", self.mochi)
-        form.addRow("Email report API", self.email_url)
-        form.addRow("Email report to", self.email_to)
+        self.email_to.setPlaceholderText(tr("optional: a@b.c"))
+        self.language = QComboBox()
+        for code, name in gui_text.LANGUAGES.items():
+            self.language.addItem(name, code)
+        self.language.setToolTip(tr("The language changes the next time the program starts."))
+        form.addRow(tr("mochi program"), self.mochi)
+        form.addRow(tr("Email report API"), self.email_url)
+        form.addRow(tr("Email report to"), self.email_to)
+        form.addRow(tr("Language") + (" / Language" if gui_text.language() != "en" else ""), self.language)
         obox.addLayout(form)
         box.addWidget(other)
 
@@ -855,10 +887,10 @@ class SettingsPage(QWidget):
         self.state = QLabel("", objectName="muted")
         actions.addWidget(self.state)
         actions.addStretch(1)
-        importer = button("Import config.json…")
+        importer = button(tr("Import config.json…"))
         importer.clicked.connect(self.import_file)
         actions.addWidget(importer)
-        save = button("Save settings", "primary")
+        save = button(tr("Save settings"), "primary")
         save.clicked.connect(self.save)
         actions.addWidget(save)
         box.addLayout(actions)
@@ -878,7 +910,7 @@ class SettingsPage(QWidget):
     def touch(self, *_):
         if not self.loading:
             self.dirty = True
-            self.state.setText("Unsaved changes")
+            self.state.setText(tr("Unsaved changes"))
 
     loading = False
 
@@ -900,8 +932,8 @@ class SettingsPage(QWidget):
         self.password.setText("")
         remembered = bool(sql.get("password_dpapi"))
         self.remember.setChecked(remembered)
-        self.password.setPlaceholderText("remembered (type to change)" if remembered
-                                         else "asked when a run starts, unless remembered")
+        self.password.setPlaceholderText(tr("remembered (type to change)") if remembered
+                                         else tr("asked when a run starts, unless remembered"))
         enc = str(sql.get("encryption") or "request").lower()
         enc = {"false": "off", "true": "require"}.get(enc, enc)
         self.encryption.setCurrentIndex(max(self.encryption.findData(enc), 0))
@@ -913,6 +945,7 @@ class SettingsPage(QWidget):
         email = raw.get("email") or {}
         self.email_url.setText(email.get("api_base_url") or "")
         self.email_to.setText(email.get("to") or "")
+        self.language.setCurrentIndex(max(self.language.findData(raw.get("language") or "th"), 0))
         self.loading, self.dirty = False, False
         self.state.setText("")
 
@@ -939,6 +972,7 @@ class SettingsPage(QWidget):
                "lookback_days": self.lookback.value(), "staging_mode": self.mode.currentData(),
                "staging_dir": self.staging.text() or None, "file_threads": self.threads.value() or None,
                "batch_files": self.batch.value(), "mochi": self.mochi.text() or None, "date_range": None,
+               "language": self.language.currentData(),
                "email": ({"api_base_url": self.email_url.text().strip(), "to": self.email_to.text().strip()}
                          if self.email_url.text().strip() and self.email_to.text().strip() else None)}
         return {k: v for k, v in raw.items() if v is not None or k in ("date_range",)}
@@ -949,47 +983,54 @@ class SettingsPage(QWidget):
             lb.Config(raw=dict(raw, sql_server={k: v for k, v in raw["sql_server"].items() if k != "password_dpapi"}))
         except KeyError as e:
             names = {"source_dir": "the log folder", "output_dir": "the archive folder", "db_path": "the index file"}
-            QMessageBox.warning(self, "Missing setting", f"Please set {names.get(e.args[0], e.args[0])}.")
+            warn(self, tr("Missing setting"), tr("Please set {name}.", name=tr(names.get(e.args[0], e.args[0]))))
             return False
         except lb.BackupError as e:
-            QMessageBox.warning(self, "Settings problem", str(e))
+            warn(self, tr("Settings problem"), tr_error(str(e)))
             return False
         try:
             lb.save_settings(raw)
         except OSError as e:
-            QMessageBox.warning(self, "Cannot save", str(e))
+            warn(self, tr("Cannot save"), str(e))
             return False
+        changed_language = raw.get("language") != (self.app.settings or {}).get("language", "th")
         self.app.settings = raw
         self.load(raw)
-        self.state.setText("Saved")
+        self.state.setText(tr("Saved"))
+        if changed_language:
+            warn(self, tr("Language"), tr("The language changes the next time the program starts."), info=True)
         self.app.settings_saved()
         return True
 
     def ask_save(self):
-        answer = QMessageBox.question(self, "Unsaved settings", "Save the changed settings before starting?",
-                                      QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel)
-        if answer == QMessageBox.Save:
+        box = QMessageBox(QMessageBox.Question, tr("Unsaved settings"), tr("Save the changed settings before starting?"),
+                          parent=self)
+        save = box.addButton(tr("Save"), QMessageBox.AcceptRole)
+        drop = box.addButton(tr("Don't save"), QMessageBox.DestructiveRole)
+        box.addButton(tr("Cancel"), QMessageBox.RejectRole)
+        box.exec()
+        if box.clickedButton() == save:
             return self.save()
-        if answer == QMessageBox.Discard:
+        if box.clickedButton() == drop:
             self.load(self.app.settings)
             return True
         return False
 
     def import_file(self):
-        path = QFileDialog.getOpenFileName(self, "Import config.json", str(lb.program_dir()), "JSON (*.json)")[0]
+        path = QFileDialog.getOpenFileName(self, tr("Import config.json"), str(lb.program_dir()), "JSON (*.json)")[0]
         if not path:
             return
         try:
             raw = lb.load_settings(path)
         except lb.BackupError as e:
-            QMessageBox.warning(self, "Cannot import", str(e))
+            warn(self, tr("Cannot import"), str(e))
             return
         self.load(raw)
         password = (raw.get("sql_server") or {}).get("password")
         if password:
             self.password.setText(password)
         self.dirty = True
-        self.state.setText("Imported: check and save")
+        self.state.setText(tr("Imported: check and save"))
 
 
 # ---------------------------------------------------------------- Tools page
@@ -998,14 +1039,14 @@ class ToolsPage(QWidget):
     def __init__(self, app):
         super().__init__()
         self.app, self.job = app, None
-        widget, box = page("Tools", None)
+        widget, box = page(tr("Tools"), None)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(widget)
 
-        check, cbox = card("Check the setup", "Finds the mochi program and makes one SQL Server connection. "
-                                              "Changes nothing.")
-        self.check_button = button("Run check", "primary")
+        check, cbox = card(tr("Check the setup"),
+                           tr("Finds the mochi program and makes one SQL Server connection. Changes nothing."))
+        self.check_button = button(tr("Run check"), "primary")
         self.check_result = QLabel("", objectName="muted")
         self.check_result.setWordWrap(True)
         self.check_result.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -1016,28 +1057,30 @@ class ToolsPage(QWidget):
         cbox.addWidget(self.check_result)
         box.addWidget(check)
 
-        export, ebox = card("Export a restorable copy",
-                            "Copies the archives, the index and the settings (without the password) to another "
-                            "drive, every file checked. Archives unchanged since the last export are skipped.")
+        export, ebox = card(tr("Export a restorable copy"),
+                            tr("Copies the archives, the index and the settings (without the password) to another "
+                               "drive, every file checked. Archives unchanged since the last export are skipped."))
         row = QHBoxLayout()
-        self.export_button = button("Export to…", "primary")
+        self.export_button = button(tr("Export to…"), "primary")
+        self.export_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)  # button-sized, not full width
         row.addWidget(self.export_button)
         self.export_bar = QProgressBar()
         self.export_bar.setTextVisible(False)
         self.export_bar.setFixedHeight(8)
         self.export_bar.hide()
         row.addWidget(self.export_bar, 1)
+        row.addStretch(0)
         ebox.addLayout(row)
         self.export_result = QLabel("", objectName="muted")
         self.export_result.setWordWrap(True)
         ebox.addWidget(self.export_result)
         box.addWidget(export)
 
-        files, xbox = card("Files")
+        files, xbox = card(tr("Files "))
         row = QHBoxLayout()
-        open_log = button("Open log file")
+        open_log = button(tr("Open log file"))
         open_log.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.app.log_path))))
-        open_dir = button("Open settings folder")
+        open_dir = button(tr("Open settings folder"))
         open_dir.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(lb.settings_dir()))))
         row.addWidget(open_log)
         row.addWidget(open_dir)
@@ -1053,13 +1096,13 @@ class ToolsPage(QWidget):
         try:
             cfg = self.app.config()
         except Exception as e:
-            self.check_result.setText(f"Settings: {e}")
+            self.check_result.setText(tr("Settings: {error}", error=e))
             return
         if cfg is None:
             return
 
         self.check_button.setEnabled(False)
-        self.check_result.setText("Checking…")
+        self.check_result.setText(tr("Checking…"))
         self.job = Job(lambda job: self.check_work(cfg))
         self.job.done.connect(self.check_done)
         self.job.failed.connect(self.check_done)
@@ -1076,16 +1119,19 @@ class ToolsPage(QWidget):
             lines.append("✓ SQL Server: " + lb.check_sql(cfg.sql))
         except lb.BackupError as e:
             lines.append("✗ SQL Server: " + str(e))
-        where = lambda p: "network drive" if lb.is_network_path(p) else "local disk"  # noqa: E731
-        lines.append(f"Log folder: {cfg.source_dir} ({where(cfg.source_dir)}), {cfg.threads} file(s) at once")
-        lines.append(f"Staging: {cfg.mode}, in {cfg.staging_dir} ({where(cfg.staging_dir)})")
-        lines.append(f"Archives: {cfg.output_dir} ({where(cfg.output_dir)})")
+        where = lambda p: tr("network drive") if lb.is_network_path(p) else tr("local disk")  # noqa: E731
+        lines.append(tr("Log folder: {path} ({where}), {threads} file(s) at once", path=cfg.source_dir,
+                        where=where(cfg.source_dir), threads=cfg.threads))
+        lines.append(tr("Staging: {mode}, in {path} ({where})", mode=tr(cfg.mode), path=cfg.staging_dir,
+                        where=where(cfg.staging_dir)))
+        lines.append(tr("Archives: {path} ({where})", path=cfg.output_dir, where=where(cfg.output_dir)))
+        lines.append(tr("Index: {path} ({where})", path=cfg.db_path, where=where(cfg.db_path))
+                     + (tr("; checked and copied to {path} before each run", path=lb.local_data_dir() / "index-snapshots")
+                        if lb.is_network_path(cfg.db_path) else ""))
         for name, path in (("staging", cfg.staging_dir), ("archives", cfg.output_dir), ("index", cfg.db_path)):
             free = lb.free_space(path)
-            lines.append(f"Free space for {name}: " + ("unknown (not reachable)" if free is None else size(free)))
-        lines.append(f"Index: {cfg.db_path} ({where(cfg.db_path)})"
-                     + (f"; checked and copied to {lb.local_data_dir() / 'index-snapshots'} before each run"
-                        if lb.is_network_path(cfg.db_path) else ""))
+            lines.append(tr("Free space for {name}: {free}", name=tr(name),
+                            free=tr("unknown (not reachable)") if free is None else size(free)))
         return "\n".join(lines)
 
     def check_done(self, text):
@@ -1094,19 +1140,19 @@ class ToolsPage(QWidget):
 
     def export(self):
         if self.app.busy:
-            QMessageBox.information(self, "Busy", "Wait for the running backup to end first.")
+            warn(self, tr("Busy"), tr("Wait for the running backup to end first."), info=True)
             return
         try:
             cfg = self.app.config(ask_password=False)
         except Exception as e:
-            self.export_result.setText(f"Settings: {e}")
+            self.export_result.setText(tr("Settings: {error}", error=e))
             return
-        target = QFileDialog.getExistingDirectory(self, "Export to (another drive)")
+        target = QFileDialog.getExistingDirectory(self, tr("Export to (another drive)"))
         if not target:
             return
         self.export_button.setEnabled(False)
         self.export_bar.show()
-        self.export_result.setText("Exporting…")
+        self.export_result.setText(tr("Exporting…"))
         self.export_target = target
         self.job = Job(lambda job: lb.export(cfg, target, report=job.report))
         self.job.progress.connect(self.export_progress)
@@ -1122,15 +1168,15 @@ class ToolsPage(QWidget):
     def export_done(self, items):
         self.export_button.setEnabled(True)
         self.export_bar.hide()
-        parts = [f"{item}: {files:,} files, {size(nbytes)}, {copied:,} copied now"
-                 for item, (files, nbytes, copied) in items.items()]
-        self.export_result.setText(f"Exported to {self.export_target}. " + " · ".join(parts)
-                                   + ". How to restore: RESTORE.txt in that folder.")
+        parts = [tr("{item}: {files} files, {size}, {copied} copied now", item=tr(item), files=f"{files:,}",
+                    size=size(nbytes), copied=f"{copied:,}") for item, (files, nbytes, copied) in items.items()]
+        self.export_result.setText(tr("Exported to {target}. {parts}. How to restore: RESTORE.txt in that folder.",
+                                      target=self.export_target, parts=" · ".join(parts)))
 
     def export_failed(self, text):
         self.export_button.setEnabled(True)
         self.export_bar.hide()
-        self.export_result.setText(f"Export failed: {text}")
+        self.export_result.setText(tr("Export failed: {error}", error=tr_error(text)))
 
 
 # ---------------------------------------------------------------- main window
@@ -1140,7 +1186,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self, log_handler, log_path):
         super().__init__()
-        self.setWindowTitle("Finisar Log Backup")
+        self.setWindowTitle(tr("Finisar Log Backup"))
         self.resize(1100, 820)
         self.busy, self.close_when_done = False, False
         self.session_password, self.last_cfg = None, None
@@ -1148,7 +1194,7 @@ class MainWindow(QMainWindow):
         try:
             self.settings = lb.load_settings()
         except lb.BackupError as e:
-            QMessageBox.warning(self, "Settings", str(e))
+            warn(self, tr("Settings"), str(e))
             self.settings = None
         imported = False
         if self.settings is None:  # first start: take over a config.json if there is one
@@ -1175,10 +1221,10 @@ class MainWindow(QMainWindow):
         brand = QLabel("Finisar Log Backup", objectName="brand")
         brand.setWordWrap(True)
         sbox.addWidget(brand)
-        sbox.addWidget(QLabel("MOCHI archives", objectName="brandSub"))
+        sbox.addWidget(QLabel(tr("MOCHI archives"), objectName="brandSub"))
         self.nav = QListWidget(objectName="nav")
         for _, label in self.PAGES:
-            self.nav.addItem(QListWidgetItem(label))
+            self.nav.addItem(QListWidgetItem(tr(label)))
         sbox.addWidget(self.nav, 1)
         self.status = QLabel("", objectName="brandSub")
         self.status.setWordWrap(True)
@@ -1201,7 +1247,7 @@ class MainWindow(QMainWindow):
         self.settings_page.load(self.settings)
         if imported:
             self.settings_page.dirty = True
-            self.settings_page.state.setText("Imported from config.json: check and save")
+            self.settings_page.state.setText(tr("Imported from config.json: check and save"))
         complete = all(self.settings.get(k) for k in ("source_dir", "output_dir", "db_path"))
         self.go("backup" if complete and not imported else "settings")
         self.backup_page.refresh()
@@ -1226,7 +1272,8 @@ class MainWindow(QMainWindow):
     def update_status(self):
         s = self.settings
         if s.get("source_dir"):
-            self.status.setText(f"Logs: {s.get('source_dir')}\nArchive: {s.get('output_dir')}")
+            self.status.setText(tr("Logs: {source}\nArchive: {output}", source=s.get("source_dir"),
+                                   output=s.get("output_dir")))
 
     def set_busy(self, busy):
         self.busy = busy
@@ -1245,12 +1292,16 @@ class MainWindow(QMainWindow):
             if self.session_password:
                 cfg.sql["password"] = self.session_password
             elif ask_password:
-                text, ok = QInputDialog.getText(self, "SQL Server password",
-                                                f"Password for {cfg.sql['user']} on {cfg.sql['server']}:",
-                                                QLineEdit.Password)
-                if not ok:
+                dialog = QInputDialog(self)
+                dialog.setWindowTitle(tr("SQL Server password"))
+                dialog.setLabelText(tr("Password for {user} on {server}:", user=cfg.sql["user"],
+                                       server=cfg.sql["server"]))
+                dialog.setTextEchoMode(QLineEdit.Password)
+                dialog.setOkButtonText(tr("OK"))
+                dialog.setCancelButtonText(tr("Cancel"))
+                if not dialog.exec():
                     return None
-                self.session_password = cfg.sql["password"] = text
+                self.session_password = cfg.sql["password"] = dialog.textValue()
         self.last_cfg = cfg
         return cfg
 
@@ -1258,10 +1309,9 @@ class MainWindow(QMainWindow):
         if not self.busy:
             event.accept()
             return
-        answer = QMessageBox.question(self, "A backup is running",
-                                      "Stop the backup and close when it has stopped?\n"
-                                      "Nothing is lost: the next run continues where it stopped.")
-        if answer == QMessageBox.Yes:
+        if ask(self, tr("A backup is running"),
+               tr("Stop the backup and close when it has stopped?\nNothing is lost: the next run continues where it "
+                  "stopped.")):
             self.close_when_done = True
             self.backup_page.request_stop()
         event.ignore()
@@ -1299,8 +1349,19 @@ def style_app(app):
     app.setStyleSheet(STYLE)
 
 
+def use_language(code):
+    """Thai (default) or English for the whole app; Thai also gives Thai month names in the calendar."""
+    gui_text.set_language(code)
+    QLocale.setDefault(QLocale(QLocale.Thai, QLocale.Thailand) if gui_text.language() == "th"
+                       else QLocale(QLocale.English, QLocale.UnitedStates))
+
+
 def main(argv=None):
     app = QApplication(argv if argv is not None else sys.argv)
+    try:
+        use_language((lb.load_settings() or {}).get("language") or "th")
+    except lb.BackupError:
+        use_language("th")
     style_app(app)
     handler, path = setup_logging()
     window = MainWindow(handler, path)
