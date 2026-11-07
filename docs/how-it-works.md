@@ -28,9 +28,9 @@ flowchart TD
 
 | Case | Window |
 |---|---|
-| `date_range` set in the config | Exactly that range. |
-| First run ever | Everything before `today - lookback_days`. |
-| Later runs | From the last successful run's end date minus 1 day, up to `today - lookback_days`. |
+| Custom range (the app's **B**, or `date_range` in the settings) | Exactly that range. It is recorded in `custom_window_session`, so it never moves where a continuing run starts. |
+| First continuing run ever | Everything before `today - lookback_days`. |
+| Later continuing runs (the app's **A**) | From the last successful continuing run's end date minus 1 day, up to `today - lookback_days`. |
 
 Because the start comes from the index, runs can be daily, weekly or whenever
 you like. A run always covers the gap since the last success, and the 1-day
@@ -141,7 +141,9 @@ leaves the original where it was.
 
 | Moment of the crash | State afterwards | What the next run does |
 |---|---|---|
-| During the scan | Nothing moved | Normal run |
+| During the scan (or Stop) | Nothing moved | Normal run |
+| Stop between batches | Earlier batches are archived; the stopped run is marked `failed` | Continue covers its dates again; archived files are gone from the source, the rest are found |
+| Stop while staging | Like a crash while staging: the batch's staged files are listed in the manifest | Finishes them first (Finish the previous run), then scans for the rest |
 | While staging | Manifest lines are synced **before** their files move, so every file in staging is listed. A listed file that never moved is still in the source. | Finishes the staged files. Files still in the source are picked up by the scan. |
 | During `mochi` commit | MOCHI publishes nothing half-written. The next `append` may refuse with `UNCOMMITTED_TAIL` (see [operations.md](operations.md#troubleshooting)). | Retries the commit, or stops and asks a person to repair the tail |
 | After commit, before index | Files are in the archive **and** in staging | Sees every staged file already in the archive head with the same hash, so it makes **no new commit**, then indexes and deletes |
@@ -156,6 +158,11 @@ Also:
 - **Verify before delete.** A month's staged copies are deleted only after: every
   staged file's BLAKE3 equals the archive head's hash for that path, `mochi verify
   --level content` passes, and the SQLite transaction committed.
+- **Batches.** A run works through its files in batches of `batch_files` (10,000): each is
+  staged, committed, verified, indexed and cleaned up before the next starts, so a stop or a
+  crash leaves at most one batch to finish.
+- **Stop never interrupts `mochi`.** Stop is checked between files and before each month's
+  commit; a commit that started is finished, verified and indexed first.
 - **Months are independent.** A month that fails keeps all its staged files. Other
   months still finish. The run then reports failure and the next run resumes only
   what is left.

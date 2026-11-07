@@ -6,6 +6,7 @@ import os
 import shutil
 import sqlite3
 import tempfile
+import threading
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -99,9 +100,13 @@ class ConfigFile(unittest.TestCase):
         old_cwd = os.getcwd()
         self.addCleanup(os.chdir, old_cwd)
         os.chdir(here)
-        with unittest.mock.patch.object(lb, "__file__", str(program / "logs_backup.py")):
-            with self.assertRaisesRegex(lb.BackupError, "no config.json found"):
+        home = tmp / "app-settings"
+        with unittest.mock.patch.object(lb, "__file__", str(program / "logs_backup.py")), \
+                unittest.mock.patch.dict(os.environ, {"FINISAR_BACKUP_HOME": str(home)}):
+            with self.assertRaisesRegex(lb.BackupError, "no settings found"):
                 lb.find_config()
+            lb.save_settings({"source_dir": "D:/logs"})  # what the desktop app saved: used last
+            self.assertEqual(lb.find_config(), home / "settings.json")
             (program / "config.json").write_text("{}")
             self.assertEqual(lb.find_config().resolve(), (program / "config.json").resolve())  # next to the program
             (here / "config.json").write_text("{}")
@@ -170,6 +175,34 @@ class Staging(unittest.TestCase):
         self.assertTrue(lb.is_network_path("//server/share/logs"))
         self.assertTrue(lb.is_network_path(r"\\server\share\logs"))
         self.assertFalse(lb.is_network_path(tempfile.gettempdir()))
+
+    def test_settings_dict_and_saved_password(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp)
+        raw = {"source_dir": str(tmp / "src"), "output_dir": str(tmp / "out"), "db_path": str(tmp / "i.db"),
+               "sql_server": {"user": "u", "password_dpapi": "c2VjcmV0"}}
+        with unittest.mock.patch.object(lb, "unprotect", lambda token: "pw:" + token):
+            cfg = lb.Config(raw=raw)  # the desktop app: no file
+        self.assertEqual(cfg.sql["password"], "pw:c2VjcmV0")
+        self.assertEqual(cfg.batch_files, lb.BATCH_FILES)
+        with self.assertRaises(KeyError):
+            lb.Config(raw=dict(raw, source_dir=""))
+        with self.assertRaisesRegex(lb.BackupError, "batch_files"):
+            lb.Config(raw=dict(raw, batch_files=5, sql_server={}))
+        path = lb.save_settings(dict(raw, sql_server={}), tmp / "app" / "settings.json")
+        self.assertEqual(lb.load_settings(path)["db_path"], raw["db_path"])
+        self.assertIsNone(lb.load_settings(tmp / "none.json"))
+        if not lb.can_protect():
+            with self.assertRaisesRegex(lb.BackupError, "only available on Windows"):
+                lb.protect("secret")
+        else:
+            self.assertEqual(lb.unprotect(lb.protect("secret ü")), "secret ü")
+
+    def test_check_window(self):
+        self.assertEqual(lb.check_window(["2026-01-01", "2026-01-31"]), ("2026-01-01", "2026-01-31"))
+        for bad in (["2026-01-31", "2026-01-01"], ["2026-13-01", "2026-12-31"], ["x"]):
+            with self.assertRaises(lb.BackupError):
+                lb.check_window(bad)
 
     def test_parallel_scan_finds_the_same_files(self):
         cfg = self.config()
@@ -384,6 +417,106 @@ class Flow(unittest.TestCase):
         self.assertEqual(self.run_backup()["resumed"], 2)
         self.assertEqual(len(self.head("2026-08")[0]), 1)
         self.assertFalse(moved_to.exists())
+
+    def many(self, n, month_of=lambda i: "2026-08"):
+        """n more matching files, BC1000.. ; returns their candidates."""
+        rows = []
+        for i in range(n):
+            self.write(f"ESS/line{i % 5}/unit_BC{1000 + i}.txt", f"log {i}".encode())
+            rows.append((f"BC{1000 + i}", f"{month_of(i)}-10 08:00:00"))
+        return rows
+
+    def settings(self, **extra):
+        raw = json.loads((self.tmp / "config.json").read_text())
+        (self.tmp / "config.json").write_text(json.dumps(dict(raw, **extra)))
+        mochi = self.cfg.mochi
+        self.cfg = lb.Config(self.tmp / "config.json")
+        self.cfg.mochi = mochi
+
+    def test_batches_archive_everything_one_commit_each(self):
+        self.settings(batch_files=100)
+        self.CANDIDATES = self.CANDIDATES + self.many(250)
+        reports = []
+        summary = lb.run(self.cfg, lambda *_: self.CANDIDATES, report=lambda *a: reports.append(a))
+        self.assertEqual(summary["files_moved"], 252)
+        self.assertEqual(len(self.head("2026-08")[0]), 251)
+        self.assertEqual(self.head("2026-08")[1], 2)  # 2026-07 is one file; 251 in 2026-08: 3 batches, 3 commits
+        stage = [r for r in reports if r[0] == "stage"]
+        self.assertEqual(stage[-1][2:], (252, 252))  # counted over the whole run, not per batch
+        self.assertIn("batch 3/3", stage[-1][1])
+        self.assertEqual(connect(self, self.cfg.db_path).execute(
+            "SELECT status, total_files_moved FROM scan_session").fetchall(), [("success", 252)])
+
+    def test_stop_while_staging_then_continue(self):
+        self.settings(batch_files=100)
+        self.CANDIDATES = self.CANDIDATES + self.many(250)
+        stop = threading.Event()
+
+        def report(step, message="", done=0, total=None):
+            if step == "stage" and done >= 150:
+                stop.set()  # the Stop button, during the second batch
+
+        summary = lb.run(self.cfg, lambda *_: self.CANDIDATES, report=report, stop=stop)
+        self.assertEqual(summary["status"], "stopped")
+        self.assertEqual(summary["files_moved"], 100)  # the first batch was finished
+        self.assertTrue(self.cfg.manifest.exists())  # the second batch waits in staging
+        db = connect(self, self.cfg.db_path)
+        self.assertEqual(db.execute("SELECT status FROM scan_session").fetchall(), [("failed",)])
+        summary = self.run_backup()  # continue: resumes the staged part, scans for the rest
+        self.assertEqual(summary["status"], "done")
+        self.assertEqual(summary["resumed"] + summary["files_moved"] + 100, 252)
+        self.assertEqual(len(self.head("2026-08")[0]), 251)
+        self.assertFalse(self.cfg.staging_dir.exists())
+        left = [p for p in self.cfg.source_dir.rglob("*_BC1*")]
+        self.assertEqual(left, [])
+
+    def test_stop_while_resuming_keeps_the_rest_for_later(self):
+        db = lb.open_index(self.cfg.db_path)
+        self.addCleanup(db.close)
+        entries, _, _ = lb.scan(self.cfg, dict(self.CANDIDATES))
+        lb.stage(self.cfg, lb.start_session(db, "", "x"), entries)  # an interrupted run's batch: 2 months
+        stop = threading.Event()
+        stop.set()
+        summary = lb.run(self.cfg, lambda *_: self.CANDIDATES, stop=stop)
+        self.assertEqual((summary["status"], summary["resumed"]), ("stopped", 0))
+        self.assertTrue(self.cfg.manifest.exists())
+        self.assertTrue((self.cfg.staging_dir / "2026-08/BURNIN/unit1_BC001_log.txt").is_file())
+        self.assertEqual(self.run_backup()["resumed"], 2)
+        self.assertFalse(self.cfg.staging_dir.exists())
+
+    def test_stop_while_scanning_moves_nothing(self):
+        self.CANDIDATES = self.CANDIDATES + self.many(500)
+        stop = threading.Event()
+
+        def report(step, *_):
+            if step == "query":
+                stop.set()
+
+        summary = lb.run(self.cfg, lambda *_: self.CANDIDATES, report=report, stop=stop)
+        self.assertEqual((summary["status"], summary["files_moved"]), ("stopped", 0))
+        self.assertTrue((self.cfg.source_dir / "BURNIN/unit1_BC001_log.txt").is_file())
+        self.assertFalse(self.cfg.manifest.exists())
+        self.assertEqual(connect(self, self.cfg.db_path).execute("SELECT COUNT(*) FROM scan_session").fetchone()[0], 0)
+
+    def test_custom_range_does_not_move_where_continue_starts(self):
+        self.settings(date_range=None, lookback_days=2)
+        asked = []
+
+        def candidates(date_from, date_to):
+            asked.append((date_from, date_to))
+            return self.CANDIDATES
+
+        lb.run(self.cfg, candidates)  # continue, first run: everything up to today - 2 days
+        to = (lb.dt.datetime.now(lb.dt.timezone.utc).date() - lb.dt.timedelta(days=2)).isoformat()
+        self.assertEqual(asked[-1], (None, to))
+        lb.run(self.cfg, candidates, window=("2025-01-01", "2025-01-31"))  # back-fill an old month
+        self.assertEqual(asked[-1], ("2025-01-01", "2025-01-31"))
+        start = (lb.dt.date.fromisoformat(to) - lb.dt.timedelta(days=1)).isoformat()
+        self.assertEqual(lb.continue_window(self.cfg), (start, to))  # from the last continuing run
+        lb.run(self.cfg, candidates)
+        self.assertEqual(asked[-1], (start, to))
+        with self.assertRaisesRegex(lb.BackupError, "starts after it ends"):
+            lb.run(self.cfg, candidates, window=("2025-02-01", "2025-01-01"))
 
     def test_callbacks_report_steps_and_cancel_moves_nothing(self):
         steps = []

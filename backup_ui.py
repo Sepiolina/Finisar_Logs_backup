@@ -9,6 +9,7 @@ move) and draws what it gets back.
 import argparse
 import logging
 import sys
+import threading
 from pathlib import Path
 
 from rich.console import Console
@@ -104,7 +105,8 @@ def print_summary(summary):
     if status == "cancelled":
         console.print(Panel("Cancelled. Nothing was moved or recorded.", border_style="yellow"))
         return
-    label = {"done": "[green]committed (LOCAL_COMMITTED)", "dry_run": "[cyan]would archive"}[status]
+    label = {"done": "[green]committed (LOCAL_COMMITTED)", "dry_run": "[cyan]would archive",
+             "stopped": "[yellow]committed before the stop"}[status]
     if summary["volumes"]:
         console.print(volume_table(summary["volumes"], label))
     date_from, date_to = summary["window"]
@@ -114,14 +116,16 @@ def print_summary(summary):
              f"To archive  {summary['matched_files']:,} files ({summary['matched_barcodes']:,} barcodes)"]
     if summary["resumed"]:
         lines.append(f"Resumed     {summary['resumed']:,} files left in staging by an earlier run")
-    if status == "done":
+    if status in ("done", "stopped"):
         lines.append(f"Committed   {summary['files_moved']:,} files ({summary['barcodes']:,} barcodes)")
     else:
         lines.append("Dry run: nothing moved")
+    if status == "stopped":
+        lines.append("[yellow]Stopped. Nothing is lost: run again to continue where it stopped.")
     lines.append(f"Errors      {summary['errors']:,}")
     if status == "done":
         lines.append("[dim]Committed is not a backup: keep an independent copy (--export DIR to another drive).")
-    style = "yellow" if summary["errors"] else ("green" if status == "done" else "cyan")
+    style = "yellow" if summary["errors"] or status == "stopped" else ("green" if status == "done" else "cyan")
     console.print(Panel("\n".join(lines), title="Finisar log backup", border_style=style))
 
 
@@ -182,6 +186,31 @@ def check_sql(cfg):
     console.print(Panel(version, title="SQL Server: connected", border_style="green"))
 
 
+def run_stoppable(work):
+    """Runs work(stop) on a thread. Ctrl+C sets `stop`: the run ends at its next safe point
+    (never in the middle of a commit) and returns status "stopped"."""
+    stop, outcome = threading.Event(), {}
+
+    def target():
+        try:
+            outcome["summary"] = work(stop)
+        except BaseException as e:  # re-raised on the main thread
+            outcome["error"] = e
+
+    worker = threading.Thread(target=target, daemon=True)
+    worker.start()
+    while worker.is_alive():
+        try:
+            worker.join(0.2)
+        except KeyboardInterrupt:
+            if not stop.is_set():
+                console.print("[yellow]Stopping after the current step (a commit in progress is finished first)...")
+            stop.set()
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome["summary"]
+
+
 def main():
     parser = argparse.ArgumentParser(description="Finisar log backup (terminal UI)")
     parser.add_argument("config", nargs="?", help="config file (default: config.json in the current folder, else next to this program)")
@@ -225,7 +254,8 @@ def main():
     with Progress(*COLUMNS, console=console) as progress:
         steps = Steps(progress)
         try:
-            summary = lb.run(cfg, dry_run=args.dry_run, report=steps, confirm=ask_confirm(progress, args.yes))
+            summary = run_stoppable(lambda stop: lb.run(cfg, dry_run=args.dry_run, report=steps,
+                                                        confirm=ask_confirm(progress, args.yes), stop=stop))
         except Exception as e:
             steps.fail_running()
             progress.stop()

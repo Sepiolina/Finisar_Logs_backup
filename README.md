@@ -14,19 +14,38 @@ A file is always in the source folder, staging, or a verified archive (on a
 network drive the original stays in the source until its archive is verified). A run can stop at any point. The next run continues where it
 stopped, without losing or duplicating anything.
 
-## Quick start
+## Quick start: desktop app
 
 ```bash
 pip install -r requirements.txt
 ```
 
 ```bash
-cp config.example.json config.json
+python gui.py
 ```
 
-Edit `config.json`: the paths (write them with `/`, like `E:/archive`) and the
-`sql_server` login. Leave the password `null` and the UI asks for it each run.
-Put the `mochi` program on PATH, or set `"mochi"` in the config. Then:
+On Windows, double-click `run_app.bat`, or the built `FinisarLogsBackup.exe` (see below).
+
+1. **Settings** page: the log folder, the archive folder, the SQL Server login, then **Save**.
+   Everything is saved for the Windows user in `%APPDATA%\FinisarLogsBackup\settings.json`;
+   no config file to edit. The password can be remembered, encrypted for that Windows user.
+   An existing `config.json` is imported on the first start (or with **Import config.json…**).
+2. **Tools → Run check**: finds `mochi` and makes one SQL Server connection.
+3. **Backup** page, two separate ways to run:
+   - **A · Continue from the last run**: the regular backup. It picks up where the last
+     successful continuing run ended, up to today minus the lookback days.
+   - **B · Custom date range**: back-fill or redo any range. It never changes where A starts.
+
+   **Preview** shows what would be archived and moves nothing. **Start backup** asks before any
+   file moves. **Stop** ends the run at the next safe point (never inside a MOCHI commit); the
+   next run, either mode, continues where it stopped. Files are archived in batches (10,000 by
+   default), so a stop waits for at most one batch's commit.
+4. **History** lists every run; **Tools → Export** copies a restorable set to another drive.
+
+## Terminal and scheduled tasks
+
+`backup_ui.py` is the terminal version. It uses the same settings as the app (or a `config.json`
+in the current folder or next to the program, which wins). Ctrl+C stops it safely, like Stop.
 
 ```bash
 python backup_ui.py --check-sql
@@ -37,20 +56,18 @@ python backup_ui.py --dry-run
 ```
 
 ```bash
-python backup_ui.py
+python backup_ui.py --yes
 ```
-
-To copy everything needed to restore (archives, index, config) to another drive:
 
 ```bash
 python backup_ui.py --export E:/finisar_export
 ```
 
-On Windows, double-click `run_backup.bat`. Full steps are in [docs/operations.md](docs/operations.md).
-
-To build one `FinisarLogsBackup.exe` that runs on a PC without Python, run `build_exe.bat`. It sets up a
-virtual environment in `.venv`, runs the tests, and writes `dist\FinisarLogsBackup.exe`. Put `config.json`
-next to the `.exe`. See [Single-file .exe](docs/operations.md#single-file-exe-windows).
+To build `.exe` files that run on a PC without Python, run `build_exe.bat`. It sets up a virtual
+environment in `.venv`, runs the tests, and writes `dist\FinisarLogsBackup.exe` (the desktop app)
+and `dist\FinisarLogsBackupCLI.exe` (the terminal version, for scheduled tasks). See
+[Single-file .exe](docs/operations.md#single-file-exe-windows). Full steps are in
+[docs/operations.md](docs/operations.md).
 
 ## Documentation
 
@@ -67,11 +84,12 @@ next to the `.exe`. See [Single-file .exe](docs/operations.md#single-file-exe-wi
 | File | Role |
 |---|---|
 | `logs_backup.py` | **All backup logic**, in run order, no display code. `python logs_backup.py` runs it with plain log lines (for scheduled tasks). |
-| `backup_ui.py` | Terminal UI (`rich`): progress, a confirm prompt before files move, a summary. Makes no backup decisions. |
-| `test_logs_backup.py` | Tests: `MOCHI_BIN=/path/to/mochi python -m unittest -v` |
+| `gui.py` | **Desktop app** (PySide6): settings, the two run modes, progress with Stop, history, check and export. Makes no backup decisions. |
+| `backup_ui.py` | Terminal UI (`rich`): progress, a confirm prompt before files move, a summary, Ctrl+C to stop. Makes no backup decisions. |
+| `test_logs_backup.py`, `test_gui.py` | Tests: `MOCHI_BIN=/path/to/mochi python -m unittest -v` (the app's tests run without a screen) |
 | `bench.py` | Benchmark on generated files |
-| `config.example.json`, `run_backup.bat`, `requirements.txt` | Config template, Windows launcher (uses `.venv` if present), Python libraries (`blake3`, `pymssql`, `rich`) |
-| `build_exe.bat` | Windows: builds `dist\FinisarLogsBackup.exe` (one file, PyInstaller) in a `.venv` virtual environment |
+| `config.example.json`, `run_app.bat`, `run_backup.bat`, `requirements.txt` | Settings template for `config.json`, Windows launchers for the app and the terminal version (use `.venv` if present), Python libraries (`blake3`, `pymssql`, `rich`, `PySide6-Essentials`) |
+| `build_exe.bat` | Windows: builds `dist\FinisarLogsBackup.exe` (desktop app) and `dist\FinisarLogsBackupCLI.exe` (terminal), one file each (PyInstaller), in a `.venv` virtual environment |
 
 ## Same result as Finisar_move_log_files
 
@@ -90,6 +108,8 @@ Deliberate differences:
 - **Verify checks the whole month each run**, not only the new commit. This makes appends to big months a few seconds slower (see [performance](docs/performance.md)).
 - **Two kinds of staging.** On a local disk files move into `source_dir/.staging` by rename (same drive). On a network drive they are copied to `output_dir/.staging` on the local disk, and the originals are deleted only after their archive is verified (`"staging_mode"` in config.json).
 - **Added: a run lock**, so two runs started at once cannot share staging.
+- **Added: Stop and batches.** A run archives in batches (10,000 files by default) and can be stopped between files or before a commit; the next run continues.
+- **Added: custom date ranges** that do not move where the regular run continues (recorded in an extra `custom_window_session` table; the original tables are unchanged).
 - **Scans folders inside each subfolder too** (`"recursive": true`, the default), keeping them in the archive paths. The original read only files directly in each subfolder; `"recursive": false` does the same.
 
 A run ends **committed (LOCAL_COMMITTED)**. That is not a backup on its own:
