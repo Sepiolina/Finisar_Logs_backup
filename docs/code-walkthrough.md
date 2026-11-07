@@ -159,6 +159,10 @@ safe to resume. A broken last line (a crash mid-write) is skipped.
 | `export(cfg, target, report)` | `--export`: under the run lock, copies the archives (skipping ones unchanged since the last export, per `export-manifest.json`), the index via SQLite's backup API, the config without its password, and staging if present. Writes `RESTORE.txt`. Refuses a target inside `source_dir` or `output_dir`. |
 | `copy_checked(src, dst)` | Copies through a `.partial` file, hashing while reading. The copy is hashed again and must match before it replaces `dst`. |
 | `run(...)` / `_run(...)` | The whole run under the lock: resume leftovers, query, scan, then dry run / confirm, then record barcodes (and `custom_window_session` for a custom range), then per batch of `cfg.batch_files` (sorted by month): stage, finish. Marks the session `failed` if anything raises after it started, or when stopped. |
+| `save_plan`, `load_plan`, `drop_plan`, `stopped_run(cfg)`, `discard_stopped_run(cfg)` | The kept plan of a run (`pending_run`, `pending_file` in the index): written before anything moves, rows dropped as batches are staged, the whole plan dropped when the run ends `success` or a new run replaces it. `stopped_run` is what the app's Stopped run card shows. |
+| `_archive(...)`, `_continue_plan(...)` | The batch loop shared by a new run and a continued one; totals add up over the days of one run. `_continue_plan` checks the log folder can be reached, then runs the plan without query or scan. |
+| `verify_copies(cfg, months, known)` | Copy staging: hashes each staged copy and compares it with the journal (`read_journal`) written while copying; unverified copies are deleted and left out. The checked hashes go to `commit_month(known=...)`, so nothing is hashed twice. |
+| `keep_awake()` | Windows `SetThreadExecutionState`: no sleep while a run works. |
 | `check_stop(stop)`, `Stopped` | Raises `Stopped` once the stop event is set. Checked every 200 scanned files, per staged file (files not staged yet are skipped), between batches, and in `commit_month` before `mochi` starts. `finish_staged` lets months already committing finish and be indexed and cleaned up, then re-raises; the manifest stays for the next run. |
 | `query_window(db, cfg, window)`, `continue_window(cfg)`, `check_window(window)` | The date range: a custom one as given (checked: two dates, from ≤ to), else continuing from the last successful run that is not in `custom_window_session`. `continue_window` is what the app shows on card A; it does not create the index. |
 | `settings_dir()`, `load_settings()`, `save_settings()` | The app's settings file (`%APPDATA%\FinisarLogsBackup\settings.json`, or `$FINISAR_BACKUP_HOME`), written atomically. `find_config()` falls back to it after the `config.json` places. |
@@ -218,6 +222,12 @@ MOCHI_BIN=/path/to/mochi python -m unittest -v
 | `test_custom_range_does_not_move_where_continue_starts` | A custom range between two continuing runs does not change the second one's start; a reversed range is refused |
 | `Staging.test_settings_dict_and_saved_password` | `Config` from a dict, the remembered password decrypted, settings saved and read back, DPAPI refused off Windows |
 | `Staging.test_check_window` | Custom ranges must be two valid dates, from ≤ to |
+| `test_stopped_run_continues_next_day_without_a_new_scan` | Stop, a fresh `Config` (restart), Continue: no query, no scan, everything archived, one session with the totals of both days |
+| `test_continue_skips_files_removed_meanwhile` | Plan files deleted before Continue are skipped without errors |
+| `test_continue_with_the_log_folder_unreachable_keeps_the_plan` | Log folder missing: Continue refuses and the plan stays; once it is back, Continue finishes |
+| `test_new_run_replaces_a_stopped_plan_and_finds_its_files` | A new run drops the plan; its scan finds the files again |
+| `test_damaged_copy_is_redone_not_archived` | A staged copy damaged after copying is not archived; the original stays and the next run archives the right content |
+| `test_unjournaled_copies_are_redone` | Copies whose journal is lost are redone, not trusted |
 | `test_gui.Window.*` | The desktop app without a screen (see `test_gui.py` above) |
 | `test_sql_login_from_config_with_env_override` | Login read from `config.json`, `DB_*` variables win, a missing part is named |
 | `test_backspace_in_a_path_is_refused` | `"E:\backup"` in JSON is caught |
