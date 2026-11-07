@@ -37,15 +37,20 @@ On Windows, double-click `run_app.bat`, or the built `FinisarLogsBackup.exe` (se
    - **B · Custom date range**: back-fill or redo any range. It never changes where A starts.
 
    **Preview** shows what would be archived and moves nothing. **Start backup** asks before any
-   file moves. **Stop** ends the run at the next safe point (never inside a MOCHI commit); the
-   next run, either mode, continues where it stopped. Files are archived in batches (10,000 by
-   default), so a stop waits for at most one batch's commit.
+   file moves. **Stop** ends the run at the next safe point (never inside a MOCHI commit). You can
+   then close the program or shut down the PC: the run's plan is kept in the index, and the next
+   day a **Stopped run** card offers **Continue**, which picks up exactly there without asking
+   SQL Server or scanning the log folders again. Files are archived in batches (10,000 by
+   default), so a stop waits for at most one batch's commit. A power cut or a crash is handled
+   the same way.
 4. **History** lists every run; **Tools → Export** copies a restorable set to another drive.
 
 ## Terminal and scheduled tasks
 
 `backup_ui.py` is the terminal version. It uses the same settings as the app (or a `config.json`
 in the current folder or next to the program, which wins). Ctrl+C stops it safely, like Stop.
+If a stopped run can continue, it continues that one (so a scheduled task picks up where the
+last run stopped); `--new` starts a new run instead.
 
 ```bash
 python backup_ui.py --check-sql

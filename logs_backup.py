@@ -96,6 +96,13 @@ CREATE TABLE IF NOT EXISTS scanned_log_entry (
 CREATE INDEX IF NOT EXISTS idx_scanned_log_entry_barcode ON scanned_log_entry(barcode);
 -- Sessions run on a custom date range: "continue" ignores them when it picks its start date.
 CREATE TABLE IF NOT EXISTS custom_window_session (scan_session_id INTEGER PRIMARY KEY REFERENCES scan_session(id));
+-- A run's plan: the files it still has to stage. Kept when a run stops, so it can continue later
+-- (another day, after a restart) without asking SQL Server or scanning again.
+CREATE TABLE IF NOT EXISTS pending_run (scan_session_id INTEGER PRIMARY KEY REFERENCES scan_session(id),
+    query_from TEXT, query_to TEXT NOT NULL, custom INTEGER NOT NULL, total_files INTEGER NOT NULL,
+    created_at TEXT NOT NULL, stopped_at TEXT);
+CREATE TABLE IF NOT EXISTS pending_file (id INTEGER PRIMARY KEY,
+    scan_session_id INTEGER NOT NULL REFERENCES pending_run(scan_session_id), entry TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_session_barcode_session ON session_barcode(scan_session_id);
 """
 
@@ -111,6 +118,22 @@ class Stopped(Exception):
 def check_stop(stop):
     if stop is not None and stop.is_set():
         raise Stopped
+
+
+@contextlib.contextmanager
+def keep_awake():
+    """Windows: the PC does not go to sleep while a run works (a sleep mid-copy breaks the network
+    connection to the log folder). The screen may still turn off. Elsewhere: nothing."""
+    if os.name != "nt":
+        yield
+        return
+    import ctypes
+    kernel32 = ctypes.windll.kernel32
+    kernel32.SetThreadExecutionState(0x80000000 | 0x00000001)  # ES_CONTINUOUS | ES_SYSTEM_REQUIRED
+    try:
+        yield
+    finally:
+        kernel32.SetThreadExecutionState(0x80000000)
 
 
 def now():
@@ -316,6 +339,11 @@ class Config:
     @property
     def manifest(self):
         return self.staging_dir / "manifest.jsonl"
+
+    @property
+    def journal(self):
+        """Copy staging: one line per finished copy with the BLAKE3 of the bytes read from the source."""
+        return self.staging_dir / "copied.jsonl"
 
     def archive(self, month):
         return self.output_dir / month[:4] / f"{month}.mochi"
@@ -618,15 +646,19 @@ def staged_path(cfg, entry):
 
 # ---------------------------------------------------------------- stage
 
-def stage(cfg, sid, entries, report=quiet, stop=None):
+def stage(cfg, sid, entries, report=quiet, stop=None, skipped=None):
     """Puts files into staging/<YYYY-MM>/<SUB>/; the manifest lists each file before it is touched.
 
     cfg.mode "move": renamed there (staging is on the source drive); the staged file is the only copy.
     cfg.mode "copy": copied there (staging on a local disk); the original stays in the source until
     its archive is verified, then finish_staged deletes it if it did not change meanwhile.
     Returns the number of files not staged (they stay in the source; a later run picks them up).
-    A set `stop` ends it early: files not staged yet stay in the source, the staged ones are
-    finished by the next run (as a resumed batch).
+    A set `stop` ends it early: files not staged yet stay in the source (and are added to `skipped`,
+    a list, if given), the staged ones are finished by the next run (as a resumed batch).
+    A file no longer in the source (archived or removed since the scan) is skipped quietly; if the
+    whole log folder is gone (network down), it raises BackupError instead.
+    Copy staging hashes what it reads (BLAKE3) and writes it to the journal, so finish_staged can
+    check each local copy before it is committed (a copy damaged by a power cut is redone).
     Works on cfg.threads files at once: one on a local disk (measured, threads made renames slower
     there), several on a network drive, where each file mostly waits on the network."""
     errors, mode = 0, cfg.mode
@@ -643,6 +675,15 @@ def stage(cfg, sid, entries, report=quiet, stop=None):
     for d in {staged_path(cfg, e).parent for e in entries}:
         d.mkdir(parents=True, exist_ok=True)
 
+    copied = []  # (relative_path, blake3) of finished copies, journaled after each batch
+
+    def gone(src):
+        if not cfg.source_dir.is_dir():
+            raise BackupError(f"the log folder {cfg.source_dir} cannot be reached any more; stopped."
+                              " Nothing is lost: run again when it is back")
+        log.info("no longer in the source (skipped): %s", src)
+        return 0
+
     def move(e):
         src, dst = cfg.source_dir / e["relative_path"], staged_path(cfg, e)
         try:
@@ -652,6 +693,8 @@ def stage(cfg, sid, entries, report=quiet, stop=None):
                 raise FileExistsError(dst)
             os.rename(src, dst)
             return 0
+        except FileNotFoundError:
+            return gone(src)
         except OSError as err:  # stays in the source; a later run picks it up
             log.warning("not staged %s: %s", src, err)
             return 1
@@ -662,43 +705,91 @@ def stage(cfg, sid, entries, report=quiet, stop=None):
         try:
             if dst.exists():  # local: cheap
                 raise FileExistsError(dst)
-            shutil.copyfile(src, tmp)
-            if tmp.stat().st_size != e["original_size"]:  # changed since the scan: a later run takes it
-                raise OSError(f"changed since the scan ({tmp.stat().st_size} bytes, scanned {e['original_size']})")
+            digest, size = blake3.blake3(), 0
+            with open(src, "rb") as f, open(tmp, "wb") as out:
+                for chunk in iter(lambda: f.read(1 << 20), b""):
+                    digest.update(chunk)
+                    out.write(chunk)
+                    size += len(chunk)
+            if size != e["original_size"]:  # changed since the scan: a later run takes it
+                raise OSError(f"changed since the scan ({size} bytes, scanned {e['original_size']})")
             os.utime(tmp, ns=(e["mtime_ns"], e["mtime_ns"]))  # the archive keeps it; from the scan, no round trip
             os.replace(tmp, dst)
+            copied.append((e["relative_path"], digest.hexdigest()))
             return 0
+        except FileNotFoundError as err:
+            with contextlib.suppress(OSError):
+                tmp.unlink()
+            if err.filename and Path(err.filename) == src:
+                return gone(src)
+            log.warning("not staged %s: %s", src, err)
+            return 1
         except OSError as err:  # the original was not touched
             log.warning("not staged %s: %s", src, err)
             with contextlib.suppress(OSError):
                 tmp.unlink()
             return 1
 
-    with open(cfg.manifest, "w", encoding="utf-8") as manifest:
-        manifest.write(json.dumps({"scan_session_id": sid, "mode": mode}) + "\n")
+    journal = open(cfg.journal, "a", encoding="utf-8") if mode == "copy" else None
+    with open(cfg.manifest, "w", encoding="utf-8") as manifest, journal or contextlib.nullcontext():
+        manifest.write(json.dumps({"scan_session_id": sid, "mode": mode, "journal": mode == "copy"}) + "\n")
         for i in range(0, len(entries), MANIFEST_BATCH):
             batch = entries[i:i + MANIFEST_BATCH]
             manifest.writelines(json.dumps(e) + "\n" for e in batch)
             manifest.flush()
             os.fsync(manifest.fileno())  # the batch is listed on disk before any of it moves
             put = copy_in if mode == "copy" else move
-            for n, failed in enumerate(each(cfg.threads, lambda e: 0 if stop and stop.is_set() else put(e), batch),
-                                       i + 1):
-                errors += failed
-                if n % PROGRESS_EVERY == 0 or n == i + len(batch):
-                    report("stage", "copying to local staging" if mode == "copy" else "", n, len(entries))
+
+            def attempt(e):
+                if stop is not None and stop.is_set():
+                    if skipped is not None:
+                        skipped.append(e)
+                    return 0
+                return put(e)
+
+            try:
+                for n, failed in enumerate(each(cfg.threads, attempt, batch), i + 1):
+                    errors += failed
+                    if n % PROGRESS_EVERY == 0 or n == i + len(batch):
+                        report("stage", "copying to local staging" if mode == "copy" else "", n, len(entries))
+            finally:  # journal what was copied, even when the batch ends with an error
+                if journal:
+                    journal.writelines(json.dumps({"p": p, "h": h}) + "\n" for p, h in copied)
+                    journal.flush()
+                    os.fsync(journal.fileno())
+                    copied.clear()
             if stop is not None and stop.is_set():
+                if skipped is not None:
+                    skipped.extend(entries[i + len(batch):])
                 break
     return errors
 
 
+def read_journal(cfg):
+    """{relative_path: blake3} of the copies journaled in staging ({} if none). A truncated last line
+    is skipped: that copy counts as unverified and is redone."""
+    found = {}
+    try:
+        lines = cfg.journal.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return found
+    for line in lines:
+        try:
+            row = json.loads(line)
+            found[row["p"]] = row["h"]
+        except (ValueError, KeyError, TypeError):
+            pass
+    return found
+
+
 def read_manifest(cfg):
-    """(session id, entries, mode) or None. A truncated last line is skipped. Manifests written
-    before copy staging existed have no mode: they are "move"."""
+    """(session id, entries, mode, journaled) or None. A truncated last line is skipped. Manifests
+    written before copy staging existed have no mode: they are "move"; before copies were journaled,
+    journaled is False (their copies cannot be checked against the source)."""
     try:
         lines = cfg.manifest.read_text(encoding="utf-8").splitlines()
         head = json.loads(lines[0])
-        sid, mode = head["scan_session_id"], head.get("mode", "move")
+        sid, mode, journaled = head["scan_session_id"], head.get("mode", "move"), head.get("journal", False)
     except (OSError, IndexError, KeyError, ValueError):
         return None
     entries = []
@@ -707,7 +798,7 @@ def read_manifest(cfg):
             entries.append(json.loads(line))
         except ValueError:
             pass
-    return sid, entries, mode
+    return sid, entries, mode, journaled
 
 
 # ---------------------------------------------------------------- MOCHI
@@ -835,15 +926,17 @@ def commit(cfg, month):
         log.warning("%s: DEGRADED (not an error): %s", month, out.get("durability_note"))
 
 
-def commit_month(cfg, month, entries, resume=False, stop=None):
+def commit_month(cfg, month, entries, resume=False, stop=None, known=None):
     """Commits a month's staged files (one commit), then checks every file and the archive.
 
     Touches neither SQLite nor staging. Returns (hashes, head). A set `stop` is checked before
-    the commit starts; a running `mochi` is never interrupted (that could leave a broken tail)."""
+    the commit starts; a running `mochi` is never interrupted (that could leave a broken tail).
+    `known`: {path: blake3} of the staged files, already checked (copy staging): not hashed again."""
     check_stop(stop)
     archive, paths = cfg.archive(month), [e["relative_path"] for e in entries]
     with ThreadPoolExecutor(WORKERS) as pool:
-        hashing = hash_all(pool, [staged_path(cfg, e) for e in entries])  # runs while mochi commits
+        hashing = ([known[p] for p in paths] if known is not None
+                   else hash_all(pool, [staged_path(cfg, e) for e in entries]))  # runs while mochi commits
         if resume:
             # A crash between commit and index leaves the batch already committed:
             # commit only if the head does not hold every file with the same hash.
@@ -911,6 +1004,35 @@ def release(cfg, e, mode):
     return kept
 
 
+def verify_copies(cfg, months, known):
+    """Copy staging: each staged copy must hash to what was read from the source when it was copied
+    (the journal). A copy that does not (damaged by a power cut, the PC going to sleep, a disk
+    error) or that was never journaled is deleted and left out: its original is still in the
+    source, so a later run copies it again. Fills `known` with the checked hashes; returns how
+    many copies were redone."""
+    journal = read_journal(cfg)
+
+    def check(e):
+        want = journal.get(e["relative_path"])
+        return want if want and b3(staged_path(cfg, e)) == want else None
+
+    redone = 0
+    with ThreadPoolExecutor(WORKERS) as pool:
+        for month, es in months.items():
+            good = []
+            for e, h in zip(es, pool.map(check, es)):
+                if h:
+                    known[e["relative_path"]] = h
+                    good.append(e)
+                else:
+                    log.warning("copy of %s could not be verified (damaged or unfinished); deleted, the original"
+                                " stays in the source for the next run", e["relative_path"])
+                    staged_path(cfg, e).unlink()
+                    redone += 1
+            months[month] = good
+    return redone
+
+
 def finish_staged(db, cfg, report=quiet, resume=False, stop=None):
     """Archives whatever the manifest lists in staging. Returns a summary dict (with "archived", the
     archived entries), or None if nothing is staged.
@@ -921,7 +1043,7 @@ def finish_staged(db, cfg, report=quiet, resume=False, stop=None):
     manifest = read_manifest(cfg)
     if manifest is None:
         return None
-    sid, listed, mode = manifest
+    sid, listed, mode, journaled = manifest
     if not db.execute("SELECT 1 FROM scan_session WHERE id = ?", (sid,)).fetchone():
         log.warning("staging references missing session %s; recording into a new one", sid)
         sid = start_session(db, "resumed", "resumed")
@@ -932,10 +1054,15 @@ def finish_staged(db, cfg, report=quiet, resume=False, stop=None):
             months[e["volume_name"]].append(e)
 
     archived, failures, errors, stopped = [], [], 0, False
+    known = {}
+    if mode == "copy" and journaled:
+        errors += verify_copies(cfg, months, known)
     total = sum(len(es) for es in months.values())
     report("commit", "committing " + ", ".join(sorted(months)), 0, total)
     with ThreadPoolExecutor(min(WORKERS, max(len(months), 1))) as pool:
-        jobs = {m: pool.submit(commit_month, cfg, m, es, resume, stop) for m, es in months.items()}
+        jobs = {m: pool.submit(commit_month, cfg, m, es, resume, stop,
+                               {e["relative_path"]: known[e["relative_path"]] for e in es} if known else None)
+                for m, es in months.items() if es}
         for month, job in sorted(jobs.items()):  # SQLite and deletes stay on this thread
             try:
                 hashes, head = job.result()
@@ -960,6 +1087,8 @@ def finish_staged(db, cfg, report=quiet, resume=False, stop=None):
         raise Stopped
 
     cfg.manifest.unlink()
+    with contextlib.suppress(FileNotFoundError):
+        cfg.journal.unlink()
     leftovers = 0
     for d, _, files in sorted(os.walk(cfg.staging_dir), key=lambda w: -len(w[0])):
         for f in files:  # not in the manifest: never deleted
@@ -971,7 +1100,13 @@ def finish_staged(db, cfg, report=quiet, resume=False, stop=None):
         if not os.listdir(d):
             os.rmdir(d)
     barcodes = len({e["barcode"] for e in archived})
-    complete_session(db, sid, "success", barcodes, len(archived), leftovers + errors)
+    if resume:  # a batch left by an earlier run: add to that run's totals
+        with db:
+            db.execute("UPDATE scan_session SET completed_at = ?, total_files_moved = total_files_moved + ?,"
+                       " total_errors = total_errors + ?, total_barcodes = CASE WHEN query_to_date = 'resumed'"
+                       " THEN total_barcodes + ? ELSE total_barcodes END, status = CASE WHEN EXISTS (SELECT 1"
+                       " FROM pending_run WHERE scan_session_id = ?) THEN 'failed' ELSE 'success' END"
+                       " WHERE id = ?", (now(), len(archived), leftovers + errors, barcodes, sid, sid))
     return {"files_moved": len(archived), "barcodes": barcodes, "errors": leftovers + errors,
             "volumes": plan(archived), "archived": archived}
 
@@ -1011,7 +1146,8 @@ def plan(entries):
             for month, es in sorted(months.items())}
 
 
-def run(cfg, candidates_fn=None, dry_run=False, report=quiet, confirm=None, window=None, stop=None):
+def run(cfg, candidates_fn=None, dry_run=False, report=quiet, confirm=None, window=None, stop=None,
+        continue_stopped=False):
     """One backup run. Returns a summary dict whose "status" is "done", "dry_run", "cancelled" or "stopped".
 
     confirm(volumes) -> bool, if given, is asked after the scan and before any file moves;
@@ -1020,17 +1156,23 @@ def run(cfg, candidates_fn=None, dry_run=False, report=quiet, confirm=None, wind
     window: a custom (from, to) date range; None continues from the last run (see query_window).
     stop: a threading.Event; once set, the run stops at the next safe point (between files while
     scanning or staging, before the next month's commit) and returns status "stopped". Nothing is
-    lost: the next run finishes what was staged and scans the rest again."""
+    lost, and the run's plan (the files it still has to archive) is kept in the index.
+    continue_stopped: continue that stopped run (any day later, after a restart): no SQL query,
+    no scan. A new run (False) drops a kept plan once it is confirmed; its files are found again."""
     candidates_fn = candidates_fn or (lambda date_from, date_to: query_candidates(cfg.sql, date_from, date_to))
     if window:
         window = check_window(window)
-    with lock_run(cfg):
-        return _run(cfg, candidates_fn, dry_run, report, confirm, window, stop)
+    with lock_run(cfg), keep_awake():
+        return _run(cfg, candidates_fn, dry_run, report, confirm, window, stop, continue_stopped)
 
 
 def prepare_folders(cfg):
     """Creates the output, staging and index folders if they do not exist yet. The source folder is
-    never created: a missing one is a wrong setting, and the scan says so."""
+    never created: a missing one is a wrong setting or a network drive that is not connected. With
+    staging inside it (move staging), that stops the run; otherwise the scan finds nothing."""
+    if not cfg.source_dir.is_dir() and path_key(cfg.staging_dir).startswith(path_key(cfg.source_dir) + os.sep):
+        raise BackupError(f"the log folder {cfg.source_dir} cannot be reached (a network drive not connected?)."
+                          " Nothing was changed; try again when it is available")
     for name, folder in (("output_dir", cfg.output_dir), ("staging_dir", cfg.staging_dir),
                          ("db_path's folder", cfg.db_path.parent)):
         try:
@@ -1041,7 +1183,7 @@ def prepare_folders(cfg):
         log.warning("source_dir %s does not exist: nothing to scan", cfg.source_dir)
 
 
-def _run(cfg, candidates_fn, dry_run, report, confirm, window=None, stop=None):
+def _run(cfg, candidates_fn, dry_run, report, confirm, window=None, stop=None, continue_stopped=False):
     # Checked before anything moves: without mochi, staged files could not be committed.
     try:
         log.info("using %s", check_mochi(cfg))
@@ -1056,7 +1198,7 @@ def _run(cfg, candidates_fn, dry_run, report, confirm, window=None, stop=None):
              cfg.batch_files)
     db = open_index(cfg.db_path)
     try:
-        return _run_with_index(db, cfg, candidates_fn, dry_run, report, confirm, window, stop)
+        return _run_with_index(db, cfg, candidates_fn, dry_run, report, confirm, window, stop, continue_stopped)
     finally:
         db.close()  # an open connection keeps index.db locked on Windows
 
@@ -1068,16 +1210,147 @@ def _offset(report, step, offset, total, label=""):
     return batch_report
 
 
-def _stopped(info, resumed, archived, errors, sid=None):
-    log.info("run stopped: %d files archived in this run; the next run continues", len(archived))
+def _stopped(info, resumed, archived, errors, sid=None, left=0):
+    log.info("run stopped: %d files archived in this run, %d left; the next run continues", len(archived), left)
     return dict(info, status="stopped", resumed=resumed, files_moved=len(archived),
                 barcodes=len({e["barcode"] for e in archived}), volumes=plan(archived), errors=errors,
-                session_id=sid, unmatched=[])
+                session_id=sid, unmatched=[], left=left)
 
 
-def _run_with_index(db, cfg, candidates_fn, dry_run, report, confirm, window=None, stop=None):
+# ---------------------------------------------------------------- the kept plan of a stopped run
+
+def save_plan(db, sid, window, custom, entries):
+    """Records the files a run is about to archive. Returns their row ids, in the same order."""
+    with db:
+        db.execute("INSERT INTO pending_run (scan_session_id, query_from, query_to, custom, total_files, created_at)"
+                   " VALUES (?, ?, ?, ?, ?, ?)", (sid, window[0], window[1], int(custom), len(entries), now()))
+        first = db.execute("SELECT COALESCE(MAX(id), 0) FROM pending_file").fetchone()[0] + 1
+        db.executemany("INSERT INTO pending_file (id, scan_session_id, entry) VALUES (?, ?, ?)",
+                       [(first + i, sid, json.dumps(e)) for i, e in enumerate(entries)])
+    return list(range(first, first + len(entries)))
+
+
+def load_plan(db):
+    """The kept plan of a stopped run, or None: {sid, window, custom, total, stopped_at, created_at,
+    entries, ids}. There is at most one."""
+    row = db.execute("SELECT scan_session_id, query_from, query_to, custom, total_files, created_at, stopped_at"
+                     " FROM pending_run ORDER BY scan_session_id DESC LIMIT 1").fetchone()
+    if not row:
+        return None
+    rows = db.execute("SELECT id, entry FROM pending_file WHERE scan_session_id = ? ORDER BY id", (row[0],)).fetchall()
+    return {"sid": row[0], "window": (row[1], row[2]), "custom": bool(row[3]), "total": row[4],
+            "created_at": row[5], "stopped_at": row[6], "ids": [r[0] for r in rows],
+            "entries": [json.loads(r[1]) for r in rows]}
+
+
+def drop_plan(db, sid):
+    with db:
+        db.execute("DELETE FROM pending_file WHERE scan_session_id = ?", (sid,))
+        db.execute("DELETE FROM pending_run WHERE scan_session_id = ?", (sid,))
+
+
+def stopped_run(cfg):
+    """For display: the stopped run that can continue ({sid, window, custom, total, left, stopped_at}),
+    or None. Does not create the index."""
+    if not cfg.db_path.is_file():
+        return None
+    db = open_index(cfg.db_path)
+    try:
+        row = db.execute("SELECT r.scan_session_id, r.query_from, r.query_to, r.custom, r.total_files,"
+                         " COALESCE(r.stopped_at, r.created_at), (SELECT COUNT(*) FROM pending_file f"
+                         " WHERE f.scan_session_id = r.scan_session_id) FROM pending_run r"
+                         " ORDER BY r.scan_session_id DESC LIMIT 1").fetchone()
+    finally:
+        db.close()
+    if not row:
+        return None
+    return {"sid": row[0], "window": (row[1], row[2]), "custom": bool(row[3]), "total": row[4],
+            "stopped_at": row[5], "left": row[6]}
+
+
+def discard_stopped_run(cfg):
+    """Forgets the stopped run's plan (its files stay in the source; a later run finds them).
+    Batches already staged are still finished by the next run. Returns how many files it listed."""
+    with lock_run(cfg):
+        db = open_index(cfg.db_path)
+        try:
+            kept = load_plan(db)
+            if not kept:
+                return 0
+            drop_plan(db, kept["sid"])
+            log.info("stopped run %s discarded (%d files left in the source)", kept["sid"], len(kept["entries"]))
+            return len(kept["entries"])
+        finally:
+            db.close()
+
+
+def _archive(db, cfg, sid, entries, ids, report, stop, info, done_before, total, barcodes, errors):
+    """Archives a plan's files in batches of cfg.batch_files: stage, then commit, verify, index and
+    clean up, batch after batch. A batch's plan rows are dropped once it is staged (the manifest
+    tracks it from then on); files a stop skipped go back into the plan. Records the session's
+    totals (added to what earlier days of the same run recorded)."""
+    before = db.execute("SELECT total_files_moved, total_errors FROM scan_session WHERE id = ?", (sid,)).fetchone()
+    moved_before, errors_before = (before or (0, 0))
+    archived = []
+    try:
+        for n, i in enumerate(range(0, len(entries), cfg.batch_files)):
+            check_stop(stop)
+            batch, batch_ids = entries[i:i + cfg.batch_files], ids[i:i + cfg.batch_files]
+            label = f"batch {n + 1}/{-(-len(entries) // cfg.batch_files)}" if len(entries) > cfg.batch_files else ""
+            offset, skipped = done_before + i, []
+            errors += stage(cfg, sid, batch, _offset(report, "stage", offset, total, label), stop, skipped)
+            # Staged files are in the manifest now; files a stop skipped stay in the plan. (If staging
+            # raised, the whole batch stays: files already staged are then found gone, and skipped.)
+            keep = {id(e) for e in skipped}
+            with db:
+                db.executemany("DELETE FROM pending_file WHERE id = ?",
+                               [(pid,) for pid, e in zip(batch_ids, batch) if id(e) not in keep])
+            check_stop(stop)  # what was staged is finished by the next run
+            result = finish_staged(db, cfg, _offset(report, "commit", offset, total, label), stop=stop)
+            errors += result["errors"]
+            archived += result["archived"]
+    except Stopped:
+        left = db.execute("SELECT COUNT(*) FROM pending_file WHERE scan_session_id = ?", (sid,)).fetchone()[0]
+        with db:
+            db.execute("UPDATE pending_run SET stopped_at = ? WHERE scan_session_id = ?", (now(), sid))
+        complete_session(db, sid, "failed", barcodes, moved_before + len(archived), errors_before + errors)
+        return _stopped(info, info.get("resumed", 0), archived, errors, sid, left)
+    except Exception:
+        with db:
+            db.execute("UPDATE pending_run SET stopped_at = ? WHERE scan_session_id = ?", (now(), sid))
+        complete_session(db, sid, "failed", barcodes, moved_before + len(archived), errors_before + errors + 1)
+        raise
+    drop_plan(db, sid)
+    complete_session(db, sid, "success", barcodes, moved_before + len(archived), errors_before + errors)
+    return {**info, "status": "done", "session_id": sid, "errors": errors, "left": 0,
+            "files_moved": len(archived), "barcodes": len({e["barcode"] for e in archived}),
+            "volumes": plan(archived)}
+
+
+def _continue_plan(db, cfg, kept, report, stop, info):
+    """Continues a stopped run from its kept plan: no SQL query and no scan."""
+    if not cfg.source_dir.is_dir():
+        raise BackupError(f"the log folder {cfg.source_dir} cannot be reached; the stopped run is kept."
+                          " Try again when it is available")
+    sid, entries, total = kept["sid"], kept["entries"], kept["total"]
+    date_from, date_to = kept["window"]
+    log.info("continuing stopped run %s (%s .. %s): %d of %d files left", sid, date_from or "(start)", date_to,
+             len(entries), total)
+    with db:
+        db.execute("UPDATE scan_session SET status = 'running', completed_at = NULL WHERE id = ?", (sid,))
+    report("query", f"continuing the stopped run {date_from or '(start)'} .. {date_to}", 1, 1)
+    report("scan", f"{len(entries):,} files left (kept from the first scan)", total, total)
+    barcodes = db.execute("SELECT total_barcodes FROM scan_session WHERE id = ?", (sid,)).fetchone()
+    info.update(window=(date_from, date_to), volumes=plan(entries), matched_files=len(entries),
+                matched_barcodes=len({e["barcode"] for e in entries}), continued=True, unmatched=[])
+    return _archive(db, cfg, sid, entries, kept["ids"], report, stop, info, total - len(entries), total,
+                    barcodes[0] if barcodes else 0, 0)
+
+
+def _run_with_index(db, cfg, candidates_fn, dry_run, report, confirm, window=None, stop=None,
+                    continue_stopped=False):
     resumed, info = 0, {"window": (None, None), "candidates": 0, "scanned": 0, "volumes": {},
-                        "matched_barcodes": 0, "matched_files": 0}
+                        "matched_barcodes": 0, "matched_files": 0, "resumed": 0}
     try:
         for folder in cfg.staging_dirs() if not dry_run else ():
             leftover = cfg.with_staging(folder)
@@ -1092,7 +1365,16 @@ def _run_with_index(db, cfg, candidates_fn, dry_run, report, confirm, window=Non
             report("resume", f"{resumed} files", 1, 1)
         check_stop(stop)
     except Stopped:
-        return _stopped(info, resumed, [], 0)
+        kept = load_plan(db)
+        return _stopped(info, resumed, [], 0, left=len(kept["entries"]) if kept else 0)
+    info["resumed"] = resumed
+
+    kept = None if dry_run else load_plan(db)
+    if continue_stopped:
+        if kept:
+            return _continue_plan(db, cfg, kept, report, stop, info)
+        log.info("no stopped run to continue")
+        return dict(info, status="done", files_moved=0, barcodes=0, errors=0, session_id=None, unmatched=[], left=0)
 
     custom = bool(window or cfg.date_range)
     date_from, date_to = query_window(db, cfg, window)
@@ -1108,7 +1390,7 @@ def _run_with_index(db, cfg, candidates_fn, dry_run, report, confirm, window=Non
         return _stopped(dict(info, candidates=len(dates)), resumed, [], 0)
     volumes = plan(entries)
     matched = {e["barcode"] for e in entries}
-    info.update(candidates=len(dates), scanned=seen, volumes=volumes, resumed=resumed,
+    info.update(candidates=len(dates), scanned=seen, volumes=volumes,
                 matched_barcodes=len(matched), matched_files=len(entries))
     if dry_run:
         log.info("dry run: %d of %d candidate barcodes would be archived (%d files): %s",
@@ -1118,9 +1400,12 @@ def _run_with_index(db, cfg, candidates_fn, dry_run, report, confirm, window=Non
         return dict(info, status="cancelled", files_moved=0, barcodes=0, errors=errors)
     if stop is not None and stop.is_set():
         return _stopped(info, resumed, [], errors)
+    if kept:  # replaced by this run: its files are still in the source, and found by this scan if in range
+        log.info("dropping the plan of stopped run %s (%d files left): a new run was started",
+                 kept["sid"], len(kept["entries"]))
+        drop_plan(db, kept["sid"])
 
     sid = start_session(db, date_from or "", date_to)
-    archived = []
     try:
         if custom:
             with db:
@@ -1131,30 +1416,16 @@ def _run_with_index(db, cfg, candidates_fn, dry_run, report, confirm, window=Non
             db.executemany("INSERT OR IGNORE INTO session_barcode (scan_session_id, barcode, last_update, status)"
                            " VALUES (?, ?, ?, ?)",
                            [(sid, b, d, "matched" if b in matched else "no_files_found") for b, d in fresh])
-        # Batches of cfg.batch_files, a month at a time where possible (fewer commits): each is
-        # staged, committed, verified, indexed and cleaned up before the next one starts.
+        # Batches of cfg.batch_files, a month at a time where possible (fewer commits).
         entries.sort(key=lambda e: (e["volume_name"], e["relative_path"]))
-        batches = [entries[i:i + cfg.batch_files] for i in range(0, len(entries), cfg.batch_files)]
-        for n, batch in enumerate(batches):
-            check_stop(stop)
-            label = f"batch {n + 1}/{len(batches)}" if len(batches) > 1 else ""
-            offset = n * cfg.batch_files
-            errors += stage(cfg, sid, batch, _offset(report, "stage", offset, len(entries), label), stop)
-            check_stop(stop)  # what was staged is finished by the next run
-            result = finish_staged(db, cfg, _offset(report, "commit", offset, len(entries), label), stop=stop)
-            errors += result["errors"]
-            archived += result["archived"]
-    except Stopped:
-        complete_session(db, sid, "failed", len(fresh), len(archived), errors)  # "continue" redoes this window
-        return _stopped(info, resumed, archived, errors, sid)
+        ids = save_plan(db, sid, (date_from, date_to), custom, entries)
     except Exception:
-        complete_session(db, sid, "failed", moved=len(archived), errors=errors + 1)
+        complete_session(db, sid, "failed", errors=errors + 1)
         raise
-    complete_session(db, sid, "success", len(fresh), len(archived), errors)
-    unmatched = sorted({b for b, _ in fresh} - matched)
-    return {**info, "status": "done", "session_id": sid, "errors": errors, "unmatched": unmatched,
-            "files_moved": len(archived), "barcodes": len({e["barcode"] for e in archived}),
-            "volumes": plan(archived)}
+    summary = _archive(db, cfg, sid, entries, ids, report, stop, info, 0, len(entries), len(fresh), errors)
+    if summary["status"] == "done":
+        summary["unmatched"] = sorted({b for b, _ in fresh} - matched)
+    return summary
 
 
 # ---------------------------------------------------------------- export
@@ -1284,13 +1555,15 @@ def main():
     parser.add_argument("config", nargs="?", help="config file (default: config.json in the current folder, else next to this program)")
     parser.add_argument("--dry-run", action="store_true", help="query and scan only; move nothing")
     parser.add_argument("--export", metavar="DIR", help="copy archives, index and config to DIR, then stop")
+    parser.add_argument("--new", action="store_true", help="start a new run even if a stopped one could continue")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     cfg = Config(find_config(args.config))
     if args.export:
         export(cfg, args.export)
         return
-    summary = run(cfg, dry_run=args.dry_run)
+    resume = not args.dry_run and not args.new and stopped_run(cfg) is not None
+    summary = run(cfg, dry_run=args.dry_run, continue_stopped=resume)
     log.info("%s: %s", summary["status"], json.dumps({k: v for k, v in summary.items() if k != "unmatched"}))
     if summary["status"] == "done" and cfg.email:
         send_email(cfg, summary)

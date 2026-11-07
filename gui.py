@@ -79,6 +79,13 @@ QScrollArea { border: none; background: transparent; }
 """
 
 
+def when_text(stamp):
+    """"epoch:1730000000" (as the index stores times) as local date and time."""
+    if str(stamp or "").startswith("epoch:"):
+        return dt.datetime.fromtimestamp(int(stamp[6:])).strftime("%Y-%m-%d %H:%M")
+    return str(stamp or "")
+
+
 def size(n):
     for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
         if n < 1024 or unit == "TiB":
@@ -316,6 +323,22 @@ class BackupPage(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(widget)
 
+        self.stopped_card, sbox = card("Stopped run: continue where it left off")
+        self.stopped_card.setStyleSheet("QFrame#card { border: 1px solid #f59e0b; background: #fffbeb; }")
+        self.stopped_label = QLabel("", objectName="muted")
+        self.stopped_label.setWordWrap(True)
+        sbox.addWidget(self.stopped_label)
+        srow = QHBoxLayout()
+        self.discard_button, self.continue_button = button("Discard"), button("Continue", "primary")
+        self.discard_button.setToolTip("Forget this run's plan. Its files stay in the log folders; a later run finds them.")
+        srow.addStretch(1)
+        srow.addWidget(self.discard_button)
+        srow.addWidget(self.continue_button)
+        sbox.addLayout(srow)
+        self.stopped_card.hide()
+        self.stopped = None
+        box.addWidget(self.stopped_card)
+
         modes = QHBoxLayout()
         modes.setSpacing(16)
         a, abox = card("A · Continue from the last run",
@@ -391,6 +414,8 @@ class BackupPage(QWidget):
         self.a_preview.clicked.connect(lambda: self.start(dry_run=True, custom=False))
         self.b_start.clicked.connect(lambda: self.start(dry_run=False, custom=True))
         self.b_preview.clicked.connect(lambda: self.start(dry_run=True, custom=True))
+        self.continue_button.clicked.connect(lambda: self.start(dry_run=False, custom=False, continue_stopped=True))
+        self.discard_button.clicked.connect(self.discard)
         self.stop_button.clicked.connect(self.request_stop)
         self.clock = QTimer(self, interval=1000)
         self.clock.timeout.connect(self.tick)
@@ -403,14 +428,39 @@ class BackupPage(QWidget):
         self.log_view.appendHtml(f'<span style="color:{color}">{text.replace("&", "&amp;").replace("<", "&lt;")}</span>')
 
     def refresh(self):
-        """Shows the window a Continue run would use now."""
+        """Shows the window a Continue run would use now, and a stopped run that can continue."""
         try:
             cfg = self.app.config(ask_password=False)
             date_from, date_to = lb.continue_window(cfg)
+            self.stopped = lb.stopped_run(cfg)
         except Exception as e:
             self.continue_label.setText("Fill in Settings first" if isinstance(e, KeyError) else f"({e})")
+            self.stopped = None
+            self.stopped_card.hide()
             return
         self.continue_label.setText(f"{date_from or 'the beginning'}  →  {date_to}")
+        if self.stopped:
+            s = self.stopped
+            when = when_text(s["stopped_at"])
+            kind = "custom range" if s["custom"] else "continue"
+            self.stopped_label.setText(
+                f"<b>{s['left']:,} of {s['total']:,} files left</b> · {kind} {s['window'][0] or '(start)'} → "
+                f"{s['window'][1]} · stopped {when}.<br>Continue picks up exactly there, without asking SQL "
+                "Server or scanning the log folders again. Files staged before the stop are checked and "
+                "finished first.")
+        self.stopped_card.setVisible(bool(self.stopped))
+
+    def discard(self):
+        if QMessageBox.question(self, "Discard the stopped run?",
+                                "Forget the plan of the stopped run? Nothing is deleted: its files stay in the "
+                                "log folders and a later run finds them (after a new scan).") != QMessageBox.Yes:
+            return
+        try:
+            lb.discard_stopped_run(self.app.config(ask_password=False))
+        except Exception as e:
+            QMessageBox.warning(self, "Cannot discard", str(e))
+        self.refresh()
+        self.app.history_page.refresh()
 
     def tick(self):
         for row in self.rows.values():
@@ -419,7 +469,8 @@ class BackupPage(QWidget):
             self.elapsed.setText("Elapsed " + clock(self.run_timer.elapsed()))
 
     def set_running(self, running):
-        for b in (self.a_start, self.a_preview, self.b_start, self.b_preview):
+        for b in (self.a_start, self.a_preview, self.b_start, self.b_preview, self.continue_button,
+                  self.discard_button):
             b.setEnabled(not running)
         self.stop_button.setEnabled(running)
         self.stop_button.setText("Stop")
@@ -432,9 +483,23 @@ class BackupPage(QWidget):
 
     # -- running
 
-    def start(self, dry_run, custom):
+    def start(self, dry_run, custom, continue_stopped=False):
         if self.app.settings_page.dirty and not self.app.settings_page.ask_save():
             return
+        if self.stopped and not dry_run and not continue_stopped:
+            box = QMessageBox(QMessageBox.Question, "A stopped run can continue",
+                              f"A stopped run still has {self.stopped['left']:,} files to archive.\n\n"
+                              "Continue it (no new scan), or start this new run instead? A new run drops the "
+                              "stopped run's plan; its files are found again by the new scan if they are in "
+                              "the new date range.", parent=self)
+            go_on = box.addButton("Continue stopped run", QMessageBox.AcceptRole)
+            new = box.addButton("Start new run", QMessageBox.DestructiveRole)
+            box.addButton(QMessageBox.Cancel)
+            box.exec()
+            if box.clickedButton() == go_on:
+                continue_stopped, custom = True, False
+            elif box.clickedButton() != new:
+                return
         try:
             cfg = self.app.config()
         except KeyError as e:
@@ -458,10 +523,11 @@ class BackupPage(QWidget):
             row.reset()
         self.banner.hide()
         what = "Preview" if dry_run else "Backup"
-        self.run_title.setText(f"{what}: " + (f"{window[0]} → {window[1]}" if window else "continue"))
-        log.info("---- %s started (%s)", what.lower(), f"{window[0]} .. {window[1]}" if window else "continue")
+        mode = "continue the stopped run" if continue_stopped else f"{window[0]} → {window[1]}" if window else "continue"
+        self.run_title.setText(f"{what}: {mode}")
+        log.info("---- %s started (%s)", what.lower(), mode)
         self.job = Job(lambda job: lb.run(cfg, dry_run=dry_run, report=job.report, confirm=job.confirm,
-                                          window=window, stop=job.stop))
+                                          window=window, stop=job.stop, continue_stopped=continue_stopped))
         self.job.progress.connect(self.on_progress)
         self.job.confirm_needed.connect(self.on_confirm)
         self.job.done.connect(self.on_done)
@@ -512,8 +578,9 @@ class BackupPage(QWidget):
             self.show_banner(f"<b>Done.</b> {counts}. Committed is not a backup on its own: keep an export on "
                              "another drive (Tools).", "#14532d", "#dcfce7")
         elif status == "stopped":
-            self.show_banner(f"<b>Stopped.</b> {counts}. Nothing is lost: start again to continue where it stopped.",
-                             "#78350f", "#fef3c7")
+            self.show_banner(f"<b>Stopped</b> with {summary.get('left', 0):,} files left. {counts}. Nothing is lost: "
+                             "you can close the program or shut down the PC. Continue it any time with "
+                             "<b>Continue</b> above.", "#78350f", "#fef3c7")
         elif status == "cancelled":
             self.show_banner("Cancelled. Nothing was moved or recorded.", "#334155", "#e2e8f0")
         else:  # dry run
@@ -579,8 +646,9 @@ class HistoryPage(QWidget):
             db = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
             try:
                 custom = {r[0] for r in db.execute("SELECT scan_session_id FROM custom_window_session")}
+                waiting = {r[0] for r in db.execute("SELECT scan_session_id FROM pending_run")}
             except sqlite3.Error:
-                custom = set()
+                custom, waiting = set(), set()
             rows = db.execute("SELECT id, started_at, status, query_from_date, query_to_date, total_barcodes,"
                               " total_files_moved, total_errors FROM scan_session ORDER BY id DESC LIMIT 500").fetchall()
             db.close()
@@ -593,6 +661,8 @@ class HistoryPage(QWidget):
             r = self.table.rowCount()
             self.table.insertRow(r)
             mode = "resumed" if end == "resumed" else "custom" if sid in custom else "continue"
+            if sid in waiting:
+                mode += " · can continue"
             when = started
             if str(started).startswith("epoch:"):
                 when = dt.datetime.fromtimestamp(int(started[6:])).strftime("%Y-%m-%d %H:%M")
@@ -1188,6 +1258,8 @@ def main(argv=None):
     style_app(app)
     handler, path = setup_logging()
     window = MainWindow(handler, path)
+    # Windows shutting down or logging off: stop the run at its next safe point (it continues next time).
+    app.commitDataRequest.connect(lambda _manager: window.backup_page.request_stop())
     window.show()
     return app.exec()
 

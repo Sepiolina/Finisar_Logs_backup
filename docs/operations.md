@@ -84,10 +84,32 @@ only that user, on that PC, can decrypt it. Another user, or a copied settings f
 
 **Stop** ends the run at the next safe point: between files while scanning or staging, or before
 the next month's commit. A `mochi` commit that has started is finished first (stopping it could
-leave a broken archive tail), so a stop can take as long as one batch's commit. Nothing is lost:
-staged files are finished by the next run (the **Finish the previous run** row), the rest are
-found again by its scan. A stopped run is recorded as failed, so **Continue** covers its dates again.
-Closing the window during a run asks, then stops the same way and closes.
+leave a broken archive tail), so a stop can take as long as one batch's commit.
+
+**Then you can close the program or shut down the PC.** The run's plan (the files it still has to
+archive, its date range) is kept in the index. Next time, the Backup page shows a **Stopped run**
+card with how many files are left and two buttons:
+
+- **Continue**: first finishes the batch that was staged when it stopped (the **Finish the previous
+  run** row), then archives the rest of the plan. No SQL query and no new scan, so on a slow NAS it
+  starts right away. Files removed from the log folders in the meantime are skipped. If the log
+  folder cannot be reached (NAS not connected yet), it stops without changing anything and the
+  plan stays.
+- **Discard**: forgets the plan. Nothing is deleted; the files stay in the log folders and a later
+  run finds them with a new scan.
+
+Starting A or B while a stopped run is waiting asks whether to continue it or start the new run
+(which replaces the plan). The same holds for a crash, a power cut or Windows shutting down during
+a run: the next run finishes what was staged and the plan continues. While a run works, the app
+keeps Windows from going to sleep (the screen may still turn off). Closing the window during a run
+asks, then stops the same way and closes.
+
+**Integrity across the break.** With copy staging (network drive) every file's BLAKE3 is recorded
+while it is copied from the NAS. Before a batch is committed, each local copy is hashed again and
+must match; a copy that does not (damaged by a power cut before it reached the disk) or whose
+record is missing is deleted and copied again later from the original, which is still on the NAS.
+The originals are deleted only after the archive is verified and indexed, and only if they did not
+change. So a stop, a shutdown or a power cut at any moment loses nothing and archives nothing damaged.
 
 ## Single-file .exe (Windows)
 
@@ -230,7 +252,8 @@ the double-click launcher and scheduled tasks see them.
 | See what would happen | `python backup_ui.py --dry-run` |
 | Run by hand | The desktop app (`run_app.bat` or `FinisarLogsBackup.exe`), or `run_backup.bat` / `python backup_ui.py` |
 | Back-fill old dates | The app's **B · Custom date range** |
-| Stop a running backup | **Stop** in the app, or Ctrl+C in the terminal: the next run continues |
+| Stop a running backup | **Stop** in the app, or Ctrl+C in the terminal. Shut down if you like; **Continue** (app) or the next terminal run picks up where it stopped |
+| Start fresh although a run was stopped | **Discard** on the Stopped run card, or `python backup_ui.py --new` |
 | Run without the question | `python backup_ui.py --yes` |
 | Plain log output (scheduled task) | `python logs_backup.py` |
 

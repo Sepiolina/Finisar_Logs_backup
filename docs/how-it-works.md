@@ -142,8 +142,8 @@ leaves the original where it was.
 | Moment of the crash | State afterwards | What the next run does |
 |---|---|---|
 | During the scan (or Stop) | Nothing moved | Normal run |
-| Stop between batches | Earlier batches are archived; the stopped run is marked `failed` | Continue covers its dates again; archived files are gone from the source, the rest are found |
-| Stop while staging | Like a crash while staging: the batch's staged files are listed in the manifest | Finishes them first (Finish the previous run), then scans for the rest |
+| Stop, shutdown or power cut between batches | Earlier batches are archived; the run's plan (`pending_run`, `pending_file`) holds the files not staged yet; the session is `failed` | **Continue** archives the rest of the plan without a new query or scan, then marks the session `success` with the totals of all days |
+| Stop while staging | Like a crash while staging: the batch's staged files are listed in the manifest, the rest stay in the plan | Finishes the staged files first (Finish the previous run), then continues the plan |
 | While staging | Manifest lines are synced **before** their files move, so every file in staging is listed. A listed file that never moved is still in the source. | Finishes the staged files. Files still in the source are picked up by the scan. |
 | During `mochi` commit | MOCHI publishes nothing half-written. The next `append` may refuse with `UNCOMMITTED_TAIL` (see [operations.md](operations.md#troubleshooting)). | Retries the commit, or stops and asks a person to repair the tail |
 | After commit, before index | Files are in the archive **and** in staging | Sees every staged file already in the archive head with the same hash, so it makes **no new commit**, then indexes and deletes |
@@ -153,6 +153,14 @@ Also:
 - **Never overwrite.** A file is not moved or copied into staging if that staging path is already taken.
 - **Only whole copies.** A copy is written to `<file>.partial` and renamed only once its size matches the
   scan; a crash mid-copy leaves a `.partial` file, which the next finish deletes (the original is in the source).
+- **Only verified copies are committed.** Copy staging records each file's BLAKE3 as it reads it from the
+  source (`staging/copied.jsonl`, synced after each batch of 2,000). Before committing, every copy is hashed
+  again; one that does not match, or has no record (a power cut before the copy or its record reached the
+  disk), is deleted and left out; its original is still in the source, so a later run copies it again.
+- **The plan survives.** A run's file list is saved in the index (`pending_run`, `pending_file`) before
+  anything moves. A batch's rows are dropped once it is staged (the manifest tracks it from then on); files
+  a stop skipped stay. A plan file that is gone by the time it is continued is skipped; if the whole log
+  folder is gone, the run stops and keeps the plan.
 - **Changed originals stay.** With copy staging an original whose size or modification time changed after
   the scan is not deleted: the archive has the older content, and the next run archives the new one.
 - **Verify before delete.** A month's staged copies are deleted only after: every

@@ -121,7 +121,8 @@ def print_summary(summary):
     else:
         lines.append("Dry run: nothing moved")
     if status == "stopped":
-        lines.append("[yellow]Stopped. Nothing is lost: run again to continue where it stopped.")
+        lines.append(f"[yellow]Stopped with {summary.get('left', 0):,} files left. Nothing is lost: you can shut down;"
+                     " the next run continues where it stopped.")
     lines.append(f"Errors      {summary['errors']:,}")
     if status == "done":
         lines.append("[dim]Committed is not a backup: keep an independent copy (--export DIR to another drive).")
@@ -218,6 +219,8 @@ def main():
     parser.add_argument("--yes", action="store_true", help="do not ask before moving files")
     parser.add_argument("--check-sql", action="store_true", help="only check that mochi and SQL Server are reachable")
     parser.add_argument("--export", metavar="DIR", help="copy archives, index and config to DIR, then stop")
+    parser.add_argument("--new", action="store_true",
+                        help="start a new run even if a stopped one could continue (its plan is dropped)")
     args = parser.parse_args()
 
     try:
@@ -251,11 +254,18 @@ def main():
         check_setup(cfg)
         return
 
+    stopped = None if args.dry_run or args.new else lb.stopped_run(cfg)
+    if stopped:
+        date_from, date_to = stopped["window"]
+        console.print(Panel(f"Continuing the stopped run {date_from or '(start)'} .. {date_to}: "
+                            f"{stopped['left']:,} of {stopped['total']:,} files left (no new scan).\n"
+                            "To start a new run instead: --new", border_style="cyan"))
     with Progress(*COLUMNS, console=console) as progress:
         steps = Steps(progress)
         try:
             summary = run_stoppable(lambda stop: lb.run(cfg, dry_run=args.dry_run, report=steps,
-                                                        confirm=ask_confirm(progress, args.yes), stop=stop))
+                                                        confirm=ask_confirm(progress, args.yes), stop=stop,
+                                                        continue_stopped=bool(stopped)))
         except Exception as e:
             steps.fail_running()
             progress.stop()
