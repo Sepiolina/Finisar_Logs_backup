@@ -138,7 +138,7 @@ class Window(unittest.TestCase):
             self.assertEqual(len(page.stopped_cards), 1)
             page.refresh()
             page.refresh()  # refreshing again never shows a stopped run twice
-            self.assertEqual(len(page.stopped_area.findChildren(gui.QFrame, "card")), 1)
+            self.assertEqual(len(page.stopped_area.findChildren(gui.QFrame, "stopped")), 1)
             self.assertIn("Stopped</b> with", page.banner.text())
         # As after closing the program and restarting the PC: a new window, the stopped run offered.
         self.window.close()
