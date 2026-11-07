@@ -47,14 +47,6 @@ TH = {
     # Backup page
     "Archive test-station logs into monthly MOCHI archives.":
         "เก็บไฟล์ log ของสถานีทดสอบเข้าไฟล์เก็บถาวร MOCHI รายเดือน",
-    "A · Continue from the last run": "A · ทำต่อจากครั้งล่าสุด",
-    "Picks up where the last successful run ended, up to today minus the lookback days. "
-    "Use this for the regular backup.":
-        "เริ่มจากจุดที่การสำรองครั้งล่าสุดที่สำเร็จจบไว้ จนถึงวันนี้ลบด้วยจำนวนวันที่เว้นไว้ "
-        "ใช้สำหรับการสำรองข้อมูลตามปกติ",
-    "B · Custom date range": "B · กำหนดช่วงวันที่เอง",
-    "Back-fill or redo any range of dates. Does not change where Continue starts.":
-        "สำรองย้อนหลังหรือทำซ้ำช่วงวันที่ใดก็ได้ ไม่มีผลต่อจุดเริ่มของโหมด A",
     "From": "ตั้งแต่",
     "to": "ถึง",
     "Preview": "ดูตัวอย่าง",
@@ -64,20 +56,10 @@ TH = {
     "Stopping…": "กำลังหยุด…",
     "Stops at the next safe point. Nothing is lost: the next run continues.":
         "หยุดที่จุดที่ปลอดภัยถัดไป ไม่มีข้อมูลสูญหาย ครั้งหน้าจะทำต่อจากจุดนี้",
-    "Log": "บันทึกการทำงาน (log)",
     "Fill in Settings first": "กรุณากรอกการตั้งค่าก่อน",
     "the beginning": "เริ่มต้น",
     "(start)": "(เริ่มต้น)",
     "Elapsed {time}": "ใช้เวลา {time}",
-    "B · custom range": "B · ช่วงวันที่กำหนดเอง",
-    "A · continue": "A · ทำต่อ",
-    "Stopped run ({kind}): continue where it left off": "งานที่หยุดไว้ ({kind}): ทำต่อจากจุดที่หยุด",
-    "<b>{left} of {total} files left</b> · dates {start} → {end} · stopped {when}.<br>Continue picks up "
-    "exactly there, without asking SQL Server or scanning the log folders again. Files staged before the stop "
-    "are checked and finished first.":
-        "<b>เหลือ {left} จาก {total} ไฟล์</b> · วันที่ {start} → {end} · หยุดเมื่อ {when}<br>กด ทำต่อ "
-        "เพื่อเริ่มจากจุดเดิมทันที โดยไม่ต้องถาม SQL Server หรือสแกนโฟลเดอร์ log ใหม่ "
-        "ไฟล์ที่เตรียมไว้ก่อนหยุดจะถูกตรวจสอบและทำให้เสร็จก่อน",
     "Discard": "ยกเลิกงานนี้",
     "Continue": "ทำต่อ",
     "Forget this run's plan. Its files stay in the log folders; a later run finds them.":
@@ -107,7 +89,6 @@ TH = {
     "Set {name} on the Settings page first.": "กรุณาตั้งค่า {name} ในหน้าการตั้งค่าก่อน",
     "Settings problem": "การตั้งค่ามีปัญหา",
     "Date range": "ช่วงวันที่",
-    "The date range starts after it ends.": "วันที่เริ่มต้องไม่อยู่หลังวันที่สิ้นสุด",
     "Backup: {mode}": "สำรองข้อมูล: {mode}",
     "Preview: {mode}": "ดูตัวอย่าง: {mode}",
     "continue": "ทำต่อ",
@@ -133,8 +114,56 @@ TH = {
     "staging. Start again to continue. Details: Tools → Open log file.":
         "<b>ไม่สำเร็จ:</b> {message}<br>ไม่มีข้อมูลสูญหาย ไฟล์ที่ยังไม่ได้บันทึกยังอยู่ในโฟลเดอร์ log "
         "หรือในพื้นที่ staging เริ่มใหม่อีกครั้งเพื่อทำต่อ รายละเอียด: เครื่องมือ → เปิดไฟล์ log",
-    "stop requested: stopping at the next safe point (a commit in progress is finished first)":
-        "stop requested: stopping at the next safe point (a commit in progress is finished first)",
+
+    # redesign: mode cards, result tiles, technical log, stopped cards
+    "Continue from the last run": "ทำต่อจากครั้งล่าสุด",
+    "The regular backup: everything since the last successful run.":
+        "การสำรองข้อมูลตามปกติ: ทุกอย่างตั้งแต่การสำรองครั้งล่าสุดที่สำเร็จ",
+    "Custom date range": "กำหนดช่วงวันที่เอง",
+    "Back-fill or redo any dates. Does not change where A starts.":
+        "สำรองย้อนหลังหรือทำซ้ำวันที่ใดก็ได้ ไม่มีผลต่อจุดเริ่มของโหมด A",
+    "Dates": "ช่วงวันที่",
+    "Shows what would be archived and checks free space. Moves nothing.":
+        "แสดงไฟล์ที่จะเก็บและตรวจพื้นที่ว่าง โดยยังไม่ย้ายไฟล์ใด ๆ",
+    "Nothing running. Choose A or B above: Preview first to see what would be archived, then Start backup.":
+        "ยังไม่มีงานที่กำลังทำ เลือกโหมด A หรือ B ด้านบน: กด ดูตัวอย่าง ก่อนเพื่อดูว่าจะเก็บไฟล์ใดบ้าง "
+        "แล้วจึงกด เริ่มสำรองข้อมูล",
+    "Show technical log ▸": "แสดงบันทึกการทำงานทางเทคนิค ▸",
+    "Hide technical log ▾": "ซ่อนบันทึกการทำงานทางเทคนิค ▾",
+    "Stopped run": "งานที่หยุดไว้",
+    "{left} of {total} files left · stopped {when}": "เหลือ {left} จาก {total} ไฟล์ · หยุดเมื่อ {when}",
+    "Continue picks up exactly there, without asking SQL Server or scanning the log folders again. Files staged "
+    "before the stop are checked and finished first.":
+        "กด ทำต่อ เพื่อเริ่มจากจุดเดิมทันที โดยไม่ต้องถาม SQL Server หรือสแกนโฟลเดอร์ log ใหม่ "
+        "ไฟล์ที่เตรียมไว้ก่อนหยุดจะถูกตรวจสอบและทำให้เสร็จก่อน",
+    "files archived": "ไฟล์ที่เก็บแล้ว",
+    "barcodes": "บาร์โค้ด",
+    "errors": "ข้อผิดพลาด",
+    "from the previous run": "จากงานครั้งก่อน",
+    "time": "เวลาที่ใช้",
+    "files left": "ไฟล์ที่เหลือ",
+    "files to archive": "ไฟล์ที่จะเก็บ",
+    "files scanned": "ไฟล์ที่สแกน",
+    "monthly archives": "ไฟล์เก็บถาวรรายเดือน",
+    "Backup finished": "สำรองข้อมูลเสร็จแล้ว",
+    "Stopped safely": "หยุดอย่างปลอดภัยแล้ว",
+    "Cancelled": "ยกเลิกแล้ว",
+    "Preview: nothing was moved": "ตัวอย่าง: ยังไม่มีไฟล์ใดถูกย้าย",
+    "The run stopped with a problem": "งานหยุดเพราะพบปัญหา",
+    "Advanced settings ▸": "การตั้งค่าขั้นสูง ▸",
+    "Hide advanced settings ▾": "ซ่อนการตั้งค่าขั้นสูง ▾",
+    "Where the test stations write their logs. A network share is fine.":
+        "ที่ที่สถานีทดสอบเขียนไฟล์ log ไว้ ใช้โฟลเดอร์บนเครือข่ายได้",
+    "Where the monthly .mochi archives are kept.": "ที่เก็บไฟล์เก็บถาวร .mochi รายเดือน",
+    "Finds files again by barcode. Empty: next to the archives.":
+        "ใช้ค้นหาไฟล์ด้วยบาร์โค้ด เว้นว่างไว้: เก็บไว้ข้างไฟล์เก็บถาวร",
+    "Files of the last days stay for the next run (stations may still write them).":
+        "ไฟล์ของวันล่าสุดจะเก็บในครั้งถัดไป (สถานีอาจยังเขียนไฟล์อยู่)",
+    "Check": "ตรวจสอบ",
+    "Log folder": "โฟลเดอร์ log",
+    "{path} ({where}), {threads} file(s) at once": "{path} ({where}) ทำงานพร้อมกัน {threads} ไฟล์",
+    "{mode}, in {path} ({where})": "{mode} ที่ {path} ({where})",
+    "Free space for {name}": "พื้นที่ว่างสำหรับ{name}",
 
     # free space rows
     "{what}: <b>{free}</b> free, needs {need}": "{what}: ว่าง <b>{free}</b> ต้องใช้ {need}",
@@ -257,18 +286,12 @@ TH = {
     "Settings: {error}": "การตั้งค่า: {error}",
     "network drive": "ไดรฟ์เครือข่าย",
     "local disk": "ดิสก์ในเครื่อง",
-    "Log folder: {path} ({where}), {threads} file(s) at once":
-        "โฟลเดอร์ log: {path} ({where}) ทำงานพร้อมกัน {threads} ไฟล์",
-    "Staging: {mode}, in {path} ({where})": "การพักไฟล์: {mode} ที่ {path} ({where})",
     "copy": "คัดลอก",
     "move": "ย้าย",
-    "Archives: {path} ({where})": "ไฟล์เก็บถาวร: {path} ({where})",
-    "Free space for {name}: {free}": "พื้นที่ว่างสำหรับ{name}: {free}",
     "unknown (not reachable)": "ไม่ทราบ (เข้าถึงไม่ได้)",
     "staging": "การพักไฟล์",
     "archives": "ไฟล์เก็บถาวร",
     "index": "ดัชนี",
-    "Index: {path} ({where})": "ดัชนี: {path} ({where})",
     "; checked and copied to {path} before each run": " ตรวจสอบและคัดลอกไปที่ {path} ก่อนทุกครั้งที่ทำงาน",
     "Export a restorable copy": "ส่งออกสำเนาสำหรับกู้คืน",
     "Copies the archives, the index and the settings (without the password) to another drive, every file "

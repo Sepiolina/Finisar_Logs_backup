@@ -79,7 +79,30 @@ QTableWidget { background: white; border: 1px solid #e2e8f0; border-radius: 8px;
 QHeaderView::section { background: #f8fafc; border: none; border-bottom: 1px solid #e2e8f0; padding: 6px;
     font-weight: 600; color: #334155; }
 QScrollArea { border: none; background: transparent; }
+QLabel#modeBadge { background: #2563eb; color: white; font-weight: 700; font-size: 12pt; border-radius: 15px;
+    min-width: 30px; max-width: 30px; min-height: 30px; max-height: 30px; qproperty-alignment: AlignCenter; }
+QLabel#modeBadgeB { background: #7c3aed; color: white; font-weight: 700; font-size: 12pt; border-radius: 15px;
+    min-width: 30px; max-width: 30px; min-height: 30px; max-height: 30px; qproperty-alignment: AlignCenter; }
+QLabel#fieldHint { color: #64748b; font-size: 9pt; }
+QLabel#empty { color: #64748b; padding: 18px; background: #f8fafc; border: 1px dashed #cbd5e1; border-radius: 8px; }
+QFrame#stat { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; }
+QLabel#statValue { font-size: 16pt; font-weight: 700; color: #0f172a; }
+QLabel#statLabel { color: #64748b; font-size: 9pt; }
+QLabel#resultTitle { font-size: 13pt; font-weight: 700; }
+QFrame#stopped { background: #fffbeb; border: 1px solid #fcd34d; border-left: 5px solid #f59e0b; border-radius: 10px; }
+QProgressBar#amber::chunk { background: #f59e0b; border-radius: 4px; }
+QPushButton#link { background: transparent; border: none; color: #2563eb; padding: 4px 0; text-align: left; }
+QPushButton#link:hover { color: #1d4ed8; text-decoration: underline; }
+QFrame#checkRow { background: #f8fafc; border-radius: 6px; }
+QTableWidget { alternate-background-color: #f8fafc; }
 """
+
+CHECK_LOOK = {"ok": ("✓", "#16a34a"), "fail": ("✕", "#dc2626"), "warn": ("!", "#d97706"), "info": ("•", "#64748b")}
+
+# Step status icons: (symbol, text color, background, border)
+STATUS_LOOK = {"waiting": ("", "#94a3b8", "white", "#cbd5e1"), "running": ("●", "white", "#2563eb", "#2563eb"),
+               "done": ("✓", "white", "#16a34a", "#16a34a"), "failed": ("✕", "white", "#dc2626", "#dc2626"),
+               "stopped": ("■", "white", "#64748b", "#64748b")}
 
 
 def when_text(stamp):
@@ -286,9 +309,12 @@ class ConfirmDialog(QDialog):
 # ---------------------------------------------------------------- Backup page
 
 class StepRow:
+    """One step of a run: a round status icon, the name, a bar, counts, time and a detail line."""
+
     def __init__(self, grid, row, name):
-        self.status = QLabel("○")
-        self.status.setFixedWidth(18)
+        self.status = QLabel()
+        self.status.setFixedSize(22, 22)
+        self.status.setAlignment(Qt.AlignCenter)
         self.name = QLabel(tr(name))
         self.bar = QProgressBar()
         self.bar.setTextVisible(False)
@@ -303,17 +329,25 @@ class StepRow:
         self.time.setMinimumWidth(56)
         self.time.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.detail = QLabel("")
-        self.detail.setObjectName("muted")
+        self.detail.setObjectName("fieldHint")
         for col, w in enumerate((self.status, self.name, self.bar, self.count, self.time)):
             grid.addWidget(w, row * 2, col)
         grid.addWidget(self.detail, row * 2 + 1, 1, 1, 4)
+        grid.setRowMinimumHeight(row * 2 + 1, 18)
         self.timer = QElapsedTimer()
         self.active = False
         self.reset()
 
+    def look(self, state):
+        mark, color, background, border = STATUS_LOOK[state]
+        self.status.setText(mark)
+        self.status.setStyleSheet(f"color: {color}; background: {background}; border: 2px solid {border};"
+                                  " border-radius: 11px; font-weight: 700;")
+        self.name.setStyleSheet("font-weight: 700; color: #0f172a;" if state == "running"
+                                else "color: #94a3b8;" if state == "waiting" else "color: #334155;")
+
     def reset(self):
-        self.status.setText("○")
-        self.status.setStyleSheet("color: #cbd5e1;")
+        self.look("waiting")
         self.bar.setRange(0, 1)
         self.bar.setValue(0)
         self.count.setText("")
@@ -326,8 +360,7 @@ class StepRow:
         if not self.timer.isValid():
             self.timer.start()
         self.active = True
-        self.status.setText("●")
-        self.status.setStyleSheet("color: #2563eb;")
+        self.look("running")
         if total:
             self.bar.setRange(0, max(int(total), 1))
             self.bar.setValue(min(int(done or 0), int(total)))
@@ -337,21 +370,80 @@ class StepRow:
             self.count.setText(f"{int(done):,}" if done else "")
         self.detail.setText(tr_progress(message or ""))
         if total and done and done >= total:
-            self.finish("✓", "#16a34a")
+            self.finish("done")
 
     def tick(self):
         if self.active and self.timer.isValid():
             self.time.setText(clock(self.timer.elapsed()))
 
-    def finish(self, mark, color):
+    def finish(self, state):
+        """state: "done", "failed" or "stopped"."""
         if self.timer.isValid():
             self.time.setText(clock(self.timer.elapsed()))
         if self.bar.maximum() == 0:
             self.bar.setRange(0, 1)
-            self.bar.setValue(1 if mark == "✓" else 0)
-        self.status.setText(mark)
-        self.status.setStyleSheet(f"color: {color};")
+            self.bar.setValue(1 if state == "done" else 0)
+        self.look(state)
         self.active = False
+
+
+def form_layout():
+    form = QFormLayout()
+    form.setLabelAlignment(Qt.AlignRight | Qt.AlignTop)
+    form.setVerticalSpacing(12)
+    form.setHorizontalSpacing(16)
+    return form
+
+
+def required(label):
+    """A form label marked as required."""
+    return f"{label} <span style='color:#dc2626'>*</span>"
+
+
+def with_hint(field, hint):
+    """A form field with one line of help under it."""
+    holder = QWidget()
+    box = QVBoxLayout(holder)
+    box.setContentsMargins(0, 0, 0, 0)
+    box.setSpacing(3)
+    box.addWidget(field)
+    note = QLabel(hint, objectName="fieldHint")
+    note.setWordWrap(True)
+    box.addWidget(note)
+    return holder
+
+
+def stat_tile(value, label, color="#0f172a"):
+    """A number with a small caption, for a run's result."""
+    frame = QFrame(objectName="stat")
+    box = QVBoxLayout(frame)
+    box.setContentsMargins(14, 10, 14, 10)
+    box.setSpacing(2)
+    number = QLabel(value, objectName="statValue")
+    number.setStyleSheet(f"color: {color};")
+    box.addWidget(number)
+    box.addWidget(QLabel(label, objectName="statLabel"))
+    return frame
+
+
+def mode_header(letter, title, subtitle):
+    """A card header with a round mode badge (A or B), a title and one line of explanation."""
+    frame = QFrame(objectName="card")
+    box = QVBoxLayout(frame)
+    box.setContentsMargins(18, 16, 18, 16)
+    box.setSpacing(10)
+    head = QHBoxLayout()
+    head.setSpacing(10)
+    head.addWidget(QLabel(letter, objectName="modeBadge" if letter == "A" else "modeBadgeB"), 0, Qt.AlignTop)
+    titles = QVBoxLayout()
+    titles.setSpacing(0)
+    titles.addWidget(QLabel(title, objectName="cardTitle"))
+    hint = QLabel(subtitle, objectName="muted")
+    hint.setWordWrap(True)
+    titles.addWidget(hint)
+    head.addLayout(titles, 1)
+    box.addLayout(head)
+    return frame, box
 
 
 class BackupPage(QWidget):
@@ -373,11 +465,13 @@ class BackupPage(QWidget):
 
         modes = QHBoxLayout()
         modes.setSpacing(16)
-        a, abox = card(tr("A · Continue from the last run"),
-                       tr("Picks up where the last successful run ended, up to today minus the lookback days. "
-                          "Use this for the regular backup."))
+        a, abox = mode_header("A", tr("Continue from the last run"),
+                              tr("The regular backup: everything since the last successful run."))
+        dates_a = QHBoxLayout()
+        dates_a.addWidget(QLabel(tr("Dates"), objectName="muted"))
         self.continue_label = QLabel("…", objectName="window")
-        abox.addWidget(self.continue_label)
+        dates_a.addWidget(self.continue_label, 1)
+        abox.addLayout(dates_a)
         abox.addStretch(1)
         arow = QHBoxLayout()
         self.a_preview, self.a_start = button(tr("Preview")), button(tr("Start backup"), "primary")
@@ -386,8 +480,8 @@ class BackupPage(QWidget):
         arow.addWidget(self.a_start)
         abox.addLayout(arow)
 
-        b, bbox = card(tr("B · Custom date range"),
-                       tr("Back-fill or redo any range of dates. Does not change where Continue starts."))
+        b, bbox = mode_header("B", tr("Custom date range"),
+                              tr("Back-fill or redo any dates. Does not change where A starts."))
         dates = QHBoxLayout()
         today = QDate.currentDate()
         self.date_from, self.date_to = QDateEdit(today.addDays(-30)), QDateEdit(today.addDays(-2))
@@ -413,6 +507,8 @@ class BackupPage(QWidget):
         progress, pbox = card()
         head = QHBoxLayout()
         self.run_title = QLabel(tr("Progress"), objectName="cardTitle")
+        self.a_preview.setToolTip(tr("Shows what would be archived and checks free space. Moves nothing."))
+        self.b_preview.setToolTip(tr("Shows what would be archived and checks free space. Moves nothing."))
         head.addWidget(self.run_title)
         head.addStretch(1)
         self.elapsed = QLabel("", objectName="muted")
@@ -422,25 +518,48 @@ class BackupPage(QWidget):
         self.stop_button.setToolTip(tr("Stops at the next safe point. Nothing is lost: the next run continues."))
         head.addWidget(self.stop_button)
         pbox.addLayout(head)
-        grid = QGridLayout()
+        self.empty = QLabel(tr("Nothing running. Choose A or B above: Preview first to see what would be "
+                               "archived, then Start backup."), objectName="empty")
+        self.empty.setWordWrap(True)
+        pbox.addWidget(self.empty)
+        self.steps = QWidget()
+        grid = QGridLayout(self.steps)
+        grid.setContentsMargins(0, 4, 0, 0)
         grid.setHorizontalSpacing(12)
-        grid.setVerticalSpacing(2)
+        grid.setVerticalSpacing(4)
         grid.setColumnStretch(2, 1)
         self.rows = {key: StepRow(grid, i, name) for i, (key, name) in enumerate(STEPS)}
-        pbox.addLayout(grid)
+        self.steps.hide()
+        pbox.addWidget(self.steps)
+        # The result: a title, number tiles, then one message (self.banner).
+        self.result = QFrame(objectName="result")
+        rbox = QVBoxLayout(self.result)
+        rbox.setContentsMargins(16, 14, 16, 14)
+        rbox.setSpacing(10)
+        self.result_title = QLabel("", objectName="resultTitle")
+        rbox.addWidget(self.result_title)
+        self.tiles = QHBoxLayout()
+        self.tiles.setSpacing(10)
+        rbox.addLayout(self.tiles)
         self.banner = QLabel("")
         self.banner.setWordWrap(True)
-        self.banner.hide()
-        pbox.addWidget(self.banner)
+        self.banner.setTextFormat(Qt.RichText)
+        rbox.addWidget(self.banner)
+        self.result.hide()
+        pbox.addWidget(self.result)
         box.addWidget(progress)
 
-        logs, lbox = card(tr("Log"))
+        # The technical log: folded away, it is for support. Opens by itself when a run fails.
+        self.log_toggle = button(tr("Show technical log ▸"), "link")
+        self.log_toggle.clicked.connect(lambda: self.show_log(self.log_view.isHidden()))
+        box.addWidget(self.log_toggle)
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.setMaximumBlockCount(5000)
-        self.log_view.setMinimumHeight(170)
-        lbox.addWidget(self.log_view)
-        box.addWidget(logs, 1)
+        self.log_view.setMinimumHeight(200)
+        self.log_view.hide()
+        box.addWidget(self.log_view, 1)
+        box.addStretch(1)  # spare height goes below, not into the cards
 
         self.a_start.clicked.connect(lambda: self.start(dry_run=False, custom=False))
         self.a_preview.clicked.connect(lambda: self.start(dry_run=True, custom=False))
@@ -450,6 +569,7 @@ class BackupPage(QWidget):
         self.clock = QTimer(self, interval=1000)
         self.clock.timeout.connect(self.tick)
         self.run_timer = QElapsedTimer()
+        self.elapsed_text = "0:00:00"
 
     # -- display
 
@@ -477,22 +597,31 @@ class BackupPage(QWidget):
             frame.deleteLater()
         self.stopped, self.stopped_cards = stopped, []
         for s in reversed(stopped):  # newest first
-            kind = tr("B · custom range") if s["custom"] else tr("A · continue")
-            frame, sbox = card(tr("Stopped run ({kind}): continue where it left off", kind=kind))
-            frame.setStyleSheet("QFrame#card { border: 1px solid #f59e0b; background: #fffbeb; }")
-            label = QLabel(tr("<b>{left} of {total} files left</b> · dates {start} → {end} · stopped {when}.<br>"
-                              "Continue picks up exactly there, without asking SQL Server or scanning the log "
-                              "folders again. Files staged before the stop are checked and finished first.",
-                              left=f"{s['left']:,}", total=f"{s['total']:,}", start=s["window"][0] or tr("(start)"),
-                              end=s["window"][1], when=when_text(s["stopped_at"])), objectName="muted")
-            label.setWordWrap(True)
-            sbox.addWidget(label)
+            frame = QFrame(objectName="stopped")
+            sbox = QHBoxLayout(frame)
+            sbox.setContentsMargins(16, 12, 16, 12)
+            sbox.setSpacing(14)
+            sbox.addWidget(QLabel("B" if s["custom"] else "A", objectName="modeBadgeB" if s["custom"] else "modeBadge"))
+            text = QVBoxLayout()
+            text.setSpacing(4)
+            text.addWidget(QLabel(f"<b>{tr('Stopped run')}</b> · {s['window'][0] or tr('(start)')} → {s['window'][1]}"))
+            label = QLabel(tr("{left} of {total} files left · stopped {when}", left=f"{s['left']:,}",
+                              total=f"{s['total']:,}", when=when_text(s["stopped_at"])), objectName="muted")
+            label.setToolTip(tr("Continue picks up exactly there, without asking SQL Server or scanning the log "
+                                "folders again. Files staged before the stop are checked and finished first."))
+            text.addWidget(label)
+            bar = QProgressBar(objectName="amber")
+            bar.setTextVisible(False)
+            bar.setFixedHeight(6)
+            bar.setRange(0, max(s["total"], 1))
+            bar.setValue(s["total"] - s["left"])
+            text.addWidget(bar)
+            sbox.addLayout(text, 1)
             row = QHBoxLayout()
             discard, go_on = button(tr("Discard")), button(tr("Continue"), "primary")
             discard.setToolTip(tr("Forget this run's plan. Its files stay in the log folders; a later run finds them."))
             discard.clicked.connect(lambda _=False, sid=s["sid"]: self.discard(sid))
             go_on.clicked.connect(lambda _=False, sid=s["sid"]: self.start(False, False, continue_stopped=sid))
-            row.addStretch(1)
             row.addWidget(discard)
             row.addWidget(go_on)
             sbox.addLayout(row)
@@ -518,7 +647,8 @@ class BackupPage(QWidget):
         for row in self.rows.values():
             row.tick()
         if self.run_timer.isValid():
-            self.elapsed.setText(tr("Elapsed {time}", time=clock(self.run_timer.elapsed())))
+            self.elapsed_text = clock(self.run_timer.elapsed())
+            self.elapsed.setText(tr("Elapsed {time}", time=self.elapsed_text))
 
     def set_running(self, running):
         buttons = [self.a_start, self.a_preview, self.b_start, self.b_preview]
@@ -528,10 +658,28 @@ class BackupPage(QWidget):
         self.stop_button.setText(tr("Stop"))
         self.app.set_busy(running)
 
-    def show_banner(self, text, color, background):
+    def show_banner(self, text, color, background, title="", tiles=()):
+        """The result: a title, number tiles (value, caption, color), then the message."""
+        self.result_title.setText(title)
+        self.result_title.setStyleSheet(f"color: {color};")
+        self.result_title.setVisible(bool(title))
+        while self.tiles.count():
+            item = self.tiles.takeAt(0)
+            if item.widget():
+                item.widget().setParent(None)
+        for value, caption, tone in tiles:
+            self.tiles.addWidget(stat_tile(value, caption, tone))
+        self.tiles.addStretch(1)
         self.banner.setText(text)
-        self.banner.setStyleSheet(f"color: {color}; background: {background}; border-radius: 8px; padding: 10px;")
-        self.banner.show()
+        self.banner.setStyleSheet(f"color: {color};")
+        self.result.setStyleSheet(f"QFrame#result {{ background: {background}; border-radius: 10px; }}"
+                                  " QFrame#stat { background: rgba(255,255,255,0.8); border: none; }"
+                                  " QLabel { background: transparent; }")
+        self.result.show()
+
+    def show_log(self, visible):
+        self.log_view.setVisible(visible)
+        self.log_toggle.setText(tr("Hide technical log ▾") if visible else tr("Show technical log ▸"))
 
     # -- running
 
@@ -577,7 +725,9 @@ class BackupPage(QWidget):
                 return
         for row in self.rows.values():
             row.reset()
-        self.banner.hide()
+        self.result.hide()
+        self.empty.hide()
+        self.steps.show()
         what = "Preview" if dry_run else "Backup"
         kept = next((s for s in self.stopped if s["sid"] == continue_stopped), None)
         mode = (tr("continue the stopped run {start} → {end}", start=kept["window"][0] or tr("(start)"),
@@ -608,7 +758,7 @@ class BackupPage(QWidget):
             return
         for key, row in self.rows.items():  # an earlier step still shown as running is over
             if key != step and row.active and row.bar.maximum() == 0:
-                row.finish("✓", "#16a34a")
+                row.finish("done")
         self.rows[step].update(message, done, total)
 
     def on_confirm(self, request):
@@ -621,7 +771,7 @@ class BackupPage(QWidget):
         self.run_timer.invalidate()
         for row in self.rows.values():
             if row.active:
-                row.finish("■", "#64748b")
+                row.finish("stopped")
         self.set_running(False)
         self.job = None
         self.refresh()
@@ -629,43 +779,57 @@ class BackupPage(QWidget):
 
     def on_done(self, summary):
         status = summary["status"]
-        self.end()
-        counts = tr("{files} files committed ({barcodes} barcodes) · {errors} errors",
-                    files=f"{summary['files_moved']:,}", barcodes=f"{summary['barcodes']:,}",
-                    errors=f"{summary['errors']:,}")
+        self.end()  # its last tick sets elapsed_text
+        took = self.elapsed_text
+        errors = summary["errors"]
+        tiles = [(f"{summary['files_moved']:,}", tr("files archived"), "#0f172a"),
+                 (f"{summary['barcodes']:,}", tr("barcodes"), "#0f172a"),
+                 (f"{errors:,}", tr("errors"), "#dc2626" if errors else "#0f172a")]
         if summary.get("resumed"):
-            counts += tr(" · {n} files from the previous run", n=f"{summary['resumed']:,}")
+            tiles.append((f"{summary['resumed']:,}", tr("from the previous run"), "#0f172a"))
+        tiles.append((took, tr("time"), "#0f172a"))
+        counts = tr("{files} files committed ({barcodes} barcodes) · {errors} errors",
+                    files=f"{summary['files_moved']:,}", barcodes=f"{summary['barcodes']:,}", errors=f"{errors:,}")
         if status == "done":
             self.show_banner(tr("<b>Done.</b> {counts}. Committed is not a backup on its own: keep an export on "
-                                "another drive (Tools).", counts=counts), "#14532d", "#dcfce7")
+                                "another drive (Tools).", counts=counts), "#14532d", "#dcfce7",
+                             "✓ " + tr("Backup finished"), tiles)
         elif status == "stopped":
+            tiles.insert(0, (f"{summary.get('left', 0):,}", tr("files left"), "#b45309"))
             self.show_banner(tr("<b>Stopped</b> with {left} files left. {counts}. Nothing is lost: you can close the "
                                 "program or shut down the PC, and run other backups meanwhile. Continue it any time "
                                 "with its <b>Continue</b> button above.", left=f"{summary.get('left', 0):,}",
-                                counts=counts), "#78350f", "#fef3c7")
+                                counts=counts), "#78350f", "#fef3c7", "■ " + tr("Stopped safely"), tiles)
         elif status == "cancelled":
-            self.show_banner(tr("Cancelled. Nothing was moved or recorded."), "#334155", "#e2e8f0")
+            self.show_banner(tr("Cancelled. Nothing was moved or recorded."), "#334155", "#e2e8f0",
+                             tr("Cancelled"))
         else:  # dry run
             vols = summary["volumes"]
             files = sum(v[1] for v in vols.values())
             months = ", ".join(f"{m}: {v[1]:,}" for m, v in vols.items()) or tr("none")
+            tiles = [(f"{files:,}", tr("files to archive"), "#1d4ed8"),
+                     (f"{summary['matched_barcodes']:,}", tr("barcodes"), "#0f172a"),
+                     (f"{summary['scanned']:,}", tr("files scanned"), "#0f172a"),
+                     (str(len(vols)), tr("monthly archives"), "#0f172a")]
             self.show_banner(tr("<b>Preview.</b> {candidates} candidate barcodes, {scanned} files scanned, <b>{files} "
                                 "files would be archived</b> ({months}). Nothing was moved.",
                                 candidates=f"{summary['candidates']:,}", scanned=f"{summary['scanned']:,}",
                                 files=f"{files:,}", months=months)
                              + (f"<br><br><b>{tr('Free space')}</b><br>{space_html(summary['space'])}"
-                                if summary.get("space") else ""), "#1e3a8a", "#dbeafe")
+                                if summary.get("space") else ""), "#1e3a8a", "#dbeafe",
+                             tr("Preview: nothing was moved"), tiles)
         if status == "done" and self.app.cfg_email():
             lb.send_email(self.app.last_cfg, summary)
 
     def on_failed(self, message):
         for row in self.rows.values():
             if row.active:
-                row.finish("✗", "#dc2626")
+                row.finish("failed")
         self.end()
         self.show_banner(tr("<b>Failed:</b> {message}<br>Nothing is lost: files not committed yet are still in the "
                             "log folders or in staging. Start again to continue. Details: Tools → Open log file.",
-                            message=tr_error(message)), "#7f1d1d", "#fee2e2")
+                            message=tr_error(message)), "#7f1d1d", "#fee2e2", "✕ " + tr("The run stopped with a problem"))
+        self.show_log(True)  # the details are there
 
 
 # ---------------------------------------------------------------- History page
@@ -693,6 +857,9 @@ class HistoryPage(QWidget):
         self.table.verticalHeader().hide()
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setAlternatingRowColors(True)
+        self.table.setShowGrid(False)
+        self.table.verticalHeader().setDefaultSectionSize(34)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)  # the date range
         self.table.setMinimumHeight(420)
@@ -721,7 +888,9 @@ class HistoryPage(QWidget):
             self.note.setText(tr("Cannot read the index: {error}", error=e))
             return
         self.note.setText(tr("{n} run(s) · {path}", n=len(rows), path=path))
-        colors = {"success": "#16a34a", "failed": "#dc2626", "running": "#2563eb"}
+        # Status: text color, cell tint. A stopped run that can continue is amber, not red: nothing is wrong.
+        colors = {"success": ("#15803d", "#dcfce7"), "failed": ("#b91c1c", "#fee2e2"),
+                  "running": ("#1d4ed8", "#dbeafe"), "waiting": ("#b45309", "#fef3c7")}
         for sid, started, status, start, end, barcodes, files, errors in rows:
             r = self.table.rowCount()
             self.table.insertRow(r)
@@ -738,7 +907,15 @@ class HistoryPage(QWidget):
                 if c in (0, 5, 6, 7):
                     item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 if c == 2:
-                    item.setForeground(QColor(colors.get(status, "#334155")))
+                    fg, bg = colors.get("waiting" if sid in waiting else status, ("#334155", "#f1f5f9"))
+                    item.setForeground(QColor(fg))
+                    item.setBackground(QColor(bg))
+                    font = item.font()
+                    font.setBold(True)
+                    item.setFont(font)
+                    item.setTextAlignment(Qt.AlignCenter)
+                if c == 7:
+                    item.setForeground(QColor("#dc2626" if errors else "#94a3b8"))
                 self.table.setItem(r, c, item)
 
 
@@ -784,14 +961,16 @@ class SettingsPage(QWidget):
         layout.addWidget(widget)
 
         folders, fbox = card(tr("Folders"))
-        form = QFormLayout()
-        form.setLabelAlignment(Qt.AlignRight)
+        form = form_layout()
         self.source = PathField(tr("D:/logs  or  //server/share/logs"))
         self.output = PathField("E:/archive")
         self.db = PathField(tr("default: <archive folder>/index.db"), folder=False, filter_="Index (*.db)")
-        form.addRow(tr("Log folder (source)"), self.source)
-        form.addRow(tr("Archive folder"), self.output)
-        form.addRow(tr("Index file"), self.db)
+        form.addRow(required(tr("Log folder (source)")), with_hint(
+            self.source, tr("Where the test stations write their logs. A network share is fine.")))
+        form.addRow(required(tr("Archive folder")), with_hint(
+            self.output, tr("Where the monthly .mochi archives are kept.")))
+        form.addRow(tr("Index file"), with_hint(
+            self.db, tr("Finds files again by barcode. Empty: next to the archives.")))
         self.subfolders = QLineEdit()
         self.subfolders.setPlaceholderText("BURNIN, ESS, JTAG, STM, Xray")
         form.addRow(tr("Subfolders to scan"), self.subfolders)
@@ -803,13 +982,13 @@ class SettingsPage(QWidget):
         self.lookback = QSpinBox()
         self.lookback.setRange(0, 365)
         self.lookback.setSuffix(tr(" days"))
-        form.addRow(tr("Leave the newest"), self.lookback)
+        form.addRow(tr("Leave the newest"), with_hint(
+            self.lookback, tr("Files of the last days stay for the next run (stations may still write them).")))
         fbox.addLayout(form)
         box.addWidget(folders)
 
         sql, sbox = card("SQL Server", tr("Read only: one query returns the barcodes of the date range."))
-        form = QFormLayout()
-        form.setLabelAlignment(Qt.AlignRight)
+        form = form_layout()
         self.server = QLineEdit()
         self.server.setPlaceholderText(tr("sqlhost  or  HOST\\INSTANCE"))
         self.port = QSpinBox()
@@ -842,8 +1021,7 @@ class SettingsPage(QWidget):
         perf, pbox = card(tr("Network drive and speed"),
                           tr("Automatic suits most setups: on a network drive files are copied to local staging, "
                              "16 at a time; on a local disk they are moved one at a time."))
-        form = QFormLayout()
-        form.setLabelAlignment(Qt.AlignRight)
+        form = form_layout()
         self.mode = QComboBox()
         for label, value in (("Automatic", None), ("Copy to local staging (network drive)", "copy"),
                              ("Move by rename (local disk)", "move")):
@@ -862,11 +1040,15 @@ class SettingsPage(QWidget):
         form.addRow(tr("Files at once"), self.threads)
         form.addRow(tr("Batch size"), self.batch)
         pbox.addLayout(form)
-        box.addWidget(perf)
+        # Rarely changed: folded away under "Advanced settings".
+        self.advanced = QWidget()
+        adv = QVBoxLayout(self.advanced)
+        adv.setContentsMargins(0, 0, 0, 0)
+        adv.setSpacing(16)
+        adv.addWidget(perf)
 
         other, obox = card(tr("Other"))
-        form = QFormLayout()
-        form.setLabelAlignment(Qt.AlignRight)
+        form = form_layout()
         self.mochi = PathField(tr("found automatically"), folder=False, filter_="mochi (mochi.exe mochi)")
         self.email_url = QLineEdit()
         self.email_url.setPlaceholderText(tr("optional: http://host:port"))
@@ -881,7 +1063,12 @@ class SettingsPage(QWidget):
         form.addRow(tr("Email report to"), self.email_to)
         form.addRow(tr("Language") + (" / Language" if gui_text.language() != "en" else ""), self.language)
         obox.addLayout(form)
-        box.addWidget(other)
+        adv.addWidget(other)
+        self.advanced_toggle = button(tr("Advanced settings ▸"), "link")
+        self.advanced_toggle.clicked.connect(lambda: self.show_advanced(self.advanced.isHidden()))
+        box.addWidget(self.advanced_toggle)
+        box.addWidget(self.advanced)
+        self.advanced.hide()
 
         actions = QHBoxLayout()
         self.state = QLabel("", objectName="muted")
@@ -906,6 +1093,10 @@ class SettingsPage(QWidget):
             w.currentIndexChanged.connect(self.touch)
         for w in self.findChildren(QCheckBox):
             w.toggled.connect(self.touch)
+
+    def show_advanced(self, visible):
+        self.advanced.setVisible(visible)
+        self.advanced_toggle.setText(tr("Hide advanced settings ▾") if visible else tr("Advanced settings ▸"))
 
     def touch(self, *_):
         if not self.loading:
@@ -1055,6 +1246,9 @@ class ToolsPage(QWidget):
         row.addStretch(1)
         cbox.addLayout(row)
         cbox.addWidget(self.check_result)
+        self.check_list = QVBoxLayout()  # one row per checked item (CHECK_LOOK)
+        self.check_list.setSpacing(6)
+        cbox.addLayout(self.check_list)
         box.addWidget(check)
 
         export, ebox = card(tr("Export a restorable copy"),
@@ -1103,6 +1297,7 @@ class ToolsPage(QWidget):
 
         self.check_button.setEnabled(False)
         self.check_result.setText(tr("Checking…"))
+        self.check_result.show()
         self.job = Job(lambda job: self.check_work(cfg))
         self.job.done.connect(self.check_done)
         self.job.failed.connect(self.check_done)
@@ -1110,33 +1305,63 @@ class ToolsPage(QWidget):
 
     @staticmethod
     def check_work(cfg):
-        lines = []
+        """[(state, label, value)]: state "ok", "fail", "warn" or "info"."""
+        rows = []
         try:
-            lines.append("✓ mochi: " + lb.check_mochi(cfg))
+            rows.append(("ok", "mochi", lb.check_mochi(cfg)))
         except lb.BackupError as e:
-            lines.append("✗ mochi: " + str(e))
+            rows.append(("fail", "mochi", tr_error(str(e))))
         try:
-            lines.append("✓ SQL Server: " + lb.check_sql(cfg.sql))
+            rows.append(("ok", "SQL Server", lb.check_sql(cfg.sql)))
         except lb.BackupError as e:
-            lines.append("✗ SQL Server: " + str(e))
+            rows.append(("fail", "SQL Server", tr_error(str(e))))
         where = lambda p: tr("network drive") if lb.is_network_path(p) else tr("local disk")  # noqa: E731
-        lines.append(tr("Log folder: {path} ({where}), {threads} file(s) at once", path=cfg.source_dir,
-                        where=where(cfg.source_dir), threads=cfg.threads))
-        lines.append(tr("Staging: {mode}, in {path} ({where})", mode=tr(cfg.mode), path=cfg.staging_dir,
-                        where=where(cfg.staging_dir)))
-        lines.append(tr("Archives: {path} ({where})", path=cfg.output_dir, where=where(cfg.output_dir)))
-        lines.append(tr("Index: {path} ({where})", path=cfg.db_path, where=where(cfg.db_path))
+        reach = lambda p: "info" if lb.free_space(p) is not None else "fail"  # noqa: E731
+        rows.append((reach(cfg.source_dir), tr("Log folder"), tr("{path} ({where}), {threads} file(s) at once",
+                     path=cfg.source_dir, where=where(cfg.source_dir), threads=cfg.threads)))
+        rows.append(("info", tr("Staging"), tr("{mode}, in {path} ({where})", mode=tr(cfg.mode), path=cfg.staging_dir,
+                                               where=where(cfg.staging_dir))))
+        rows.append((reach(cfg.output_dir), tr("Archive folder"), f"{cfg.output_dir} ({where(cfg.output_dir)})"))
+        rows.append(("info", tr("Index file"), f"{cfg.db_path} ({where(cfg.db_path)})"
                      + (tr("; checked and copied to {path} before each run", path=lb.local_data_dir() / "index-snapshots")
-                        if lb.is_network_path(cfg.db_path) else ""))
+                        if lb.is_network_path(cfg.db_path) else "")))
         for name, path in (("staging", cfg.staging_dir), ("archives", cfg.output_dir), ("index", cfg.db_path)):
             free = lb.free_space(path)
-            lines.append(tr("Free space for {name}: {free}", name=tr(name),
-                            free=tr("unknown (not reachable)") if free is None else size(free)))
-        return "\n".join(lines)
+            rows.append(("info" if free is not None else "warn", tr("Free space for {name}", name=tr(name)),
+                         tr("unknown (not reachable)") if free is None else size(free)))
+        return rows
 
-    def check_done(self, text):
-        self.check_result.setText(text)
+    def check_done(self, rows):
         self.check_button.setEnabled(True)
+        if isinstance(rows, str):  # the check itself failed
+            rows = [("fail", tr("Check"), tr_error(rows))]
+        self.check_result.setText("")
+        self.check_result.hide()
+        self.show_check(rows)
+
+    def show_check(self, rows):
+        while self.check_list.count():
+            item = self.check_list.takeAt(0)
+            if item.widget():
+                item.widget().setParent(None)
+        for state, label, value in rows:
+            mark, color = CHECK_LOOK[state]
+            frame = QFrame(objectName="checkRow")
+            line = QHBoxLayout(frame)
+            line.setContentsMargins(10, 6, 10, 6)
+            line.setSpacing(10)
+            icon = QLabel(mark)
+            icon.setFixedWidth(18)
+            icon.setStyleSheet(f"color: {color}; font-weight: 700;")
+            line.addWidget(icon, 0, Qt.AlignTop)
+            name = QLabel(f"<b>{label}</b>")
+            name.setMinimumWidth(170)
+            line.addWidget(name, 0, Qt.AlignTop)
+            text = QLabel(str(value))
+            text.setWordWrap(True)
+            text.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            line.addWidget(text, 1)
+            self.check_list.addWidget(frame)
 
     def export(self):
         if self.app.busy:
@@ -1221,7 +1446,9 @@ class MainWindow(QMainWindow):
         brand = QLabel("Finisar Log Backup", objectName="brand")
         brand.setWordWrap(True)
         sbox.addWidget(brand)
-        sbox.addWidget(QLabel(tr("MOCHI archives"), objectName="brandSub"))
+        subtitle = QLabel(tr("MOCHI archives"), objectName="brandSub")
+        subtitle.setWordWrap(True)
+        sbox.addWidget(subtitle)
         self.nav = QListWidget(objectName="nav")
         for _, label in self.PAGES:
             self.nav.addItem(QListWidgetItem(tr(label)))
@@ -1344,9 +1571,11 @@ def style_app(app):
                         (QPalette.ToolTipText, "#ffffff")):
         palette.setColor(role, QColor(color))
     app.setPalette(palette)
-    font = QFont("Segoe UI" if os.name == "nt" else app.font().family(), 10)
+    thai = gui_text.language() == "th"  # Thai script reads better a little larger
+    font = QFont("Segoe UI" if os.name == "nt" else app.font().family())
+    font.setPointSizeF(10.5 if thai else 10)
     app.setFont(font)
-    app.setStyleSheet(STYLE)
+    app.setStyleSheet(STYLE.replace("* { font-size: 10pt; }", "* { font-size: 10.5pt; }") if thai else STYLE)
 
 
 def use_language(code):
