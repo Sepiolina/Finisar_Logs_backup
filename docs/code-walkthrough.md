@@ -192,6 +192,7 @@ safe to resume. A broken last line (a crash mid-write) is skipped.
 | `SettingsPage` | A form over the settings keys. **Save** builds a `Config` first (refuses a missing folder or a bad value), then `save_settings`. Remember the password stores `protect(password)`; otherwise the typed password is kept only for this session. |
 | `HistoryPage` | Reads `scan_session` (and `custom_window_session`) read-only. |
 | `ToolsPage` | Run check (`check_mochi`, `check_sql`, drive type and staging mode), Export (`lb.export` on a `Job`), open the log or settings folder. |
+| `gui_text.tr(text, **values)` | Every visible text goes through it: the English text is the key into `TH` (Thai); `tr_progress` and `tr_error` translate what `logs_backup.py` reports. `use_language(code)` picks the language (and Qt's locale) at start, from `"language"` in the settings. `test_gui.Thai` fails if a text has no Thai translation. |
 | `MainWindow` | Navigation, the password prompt, first-start import of a `config.json`, and closing during a run (asks, stops, closes when stopped). |
 
 ## Tests

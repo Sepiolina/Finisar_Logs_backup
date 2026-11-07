@@ -26,6 +26,8 @@ python gui.py
 
 On Windows, double-click `run_app.bat`, or the built `FinisarLogsBackup.exe` (see below).
 
+The app is in **Thai** by default; **Settings → Language** switches it to English (from the next start).
+
 1. **Settings** page: the log folder, the archive folder, the SQL Server login, then **Save**.
    Everything is saved for the Windows user in `%APPDATA%\FinisarLogsBackup\settings.json`;
    no config file to edit. The password can be remembered, encrypted for that Windows user.
@@ -95,6 +97,7 @@ and `dist\FinisarLogsBackupCLI.exe` (the terminal version, for scheduled tasks).
 |---|---|
 | `logs_backup.py` | **All backup logic**, in run order, no display code. `python logs_backup.py` runs it with plain log lines (for scheduled tasks). |
 | `gui.py` | **Desktop app** (PySide6): settings, the two run modes, progress with Stop, history, check and export. Makes no backup decisions. |
+| `gui_text.py` | The app's text in Thai (default) and English: `tr()`, plus Thai for progress lines and error headlines from `logs_backup.py` |
 | `backup_ui.py` | Terminal UI (`rich`): progress, a confirm prompt before files move, a summary, Ctrl+C to stop. Makes no backup decisions. |
 | `test_logs_backup.py`, `test_gui.py` | Tests: `MOCHI_BIN=/path/to/mochi python -m unittest -v` (the app's tests run without a screen) |
 | `bench.py` | Benchmark on generated files |
