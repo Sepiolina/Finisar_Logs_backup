@@ -660,6 +660,79 @@ def staged_path(cfg, entry):
     return cfg.staging_dir / entry["volume_name"] / entry["relative_path"]
 
 
+# ---------------------------------------------------------------- free space
+
+def free_space(path):
+    """Free bytes on the drive of `path` (its nearest existing folder), or None if it cannot be read
+    (a network drive not connected)."""
+    p = Path(path)
+    while not p.exists() and p.parent != p:
+        p = p.parent
+    try:
+        return shutil.disk_usage(p).free
+    except OSError:
+        return None
+
+
+def _drive(path):
+    p = Path(path)
+    while not p.exists() and p.parent != p:
+        p = p.parent
+    try:
+        return os.stat(p).st_dev
+    except OSError:
+        return str(path)
+
+
+def space_needed(cfg, entries):
+    """Free space for archiving `entries`, checked before anything moves. A list of
+    {what, path, free, need, required, ok}:
+
+    - staging (copy staging only): the largest batch plus 10%. Required: without it nothing can
+      be staged, and the run is refused.
+    - archives: the files' full size. Not required: MOCHI compresses, so the archive grows by
+      less; a shortfall is a warning.
+    - index copy (index on a network drive): one more copy on this PC. Not required.
+    Places on the same drive are counted together. `ok` is None when the free space cannot be read."""
+    ordered = sorted(entries, key=lambda e: (e["volume_name"], e["relative_path"]))
+    batch = max((sum(e["original_size"] for e in ordered[i:i + cfg.batch_files])
+                 for i in range(0, len(ordered), cfg.batch_files)), default=0)
+    rows = []
+    if cfg.mode == "copy":
+        rows.append({"what": "staging (this batch at a time)", "path": cfg.staging_dir,
+                     "need": int(batch * STAGING_SPACE_MARGIN), "required": True})
+    rows.append({"what": "archives (at most: MOCHI compresses)", "path": cfg.output_dir,
+                 "need": sum(e["original_size"] for e in entries), "required": False})
+    if cfg.db_path.is_file() and is_network_path(cfg.db_path):
+        rows.append({"what": "index copy on this PC", "path": local_data_dir(),
+                     "need": cfg.db_path.stat().st_size, "required": False})
+    used = defaultdict(int)  # what the rows before need on the same drive
+    for row in rows:
+        drive = _drive(row["path"])
+        row["free"] = free_space(row["path"])
+        used[drive] += row["need"]
+        row["ok"] = None if row["free"] is None else row["free"] >= used[drive]
+    return rows
+
+
+def space_text(row):
+    gib = lambda n: f"{n / 2**30:.1f} GiB" if n >= 2**30 else f"{n / 2**20:.0f} MiB"  # noqa: E731
+    free = "unknown free" if row["free"] is None else f"{gib(row['free'])} free"
+    return f"{row['what']}: {row['path']}: {free}, needs {gib(row['need'])}"
+
+
+def check_space(cfg, entries):
+    """space_needed, logged; raises BackupError (before anything moves) if a required place is short."""
+    rows = space_needed(cfg, entries)
+    for row in rows:
+        if row["ok"] is False and row["required"]:
+            raise BackupError(f"not enough free space: {space_text(row)}. Nothing was moved. Free space there,"
+                              " lower the batch size, or choose another staging folder (Settings)")
+        level = logging.WARNING if row["ok"] is False else logging.INFO
+        log.log(level, "free space %s%s", space_text(row), "  (may be too little)" if row["ok"] is False else "")
+    return rows
+
+
 # ---------------------------------------------------------------- stage
 
 def stage(cfg, sid, entries, report=quiet, stop=None, skipped=None):
@@ -1166,7 +1239,8 @@ def run(cfg, candidates_fn=None, dry_run=False, report=quiet, confirm=None, wind
         continue_stopped=False):
     """One backup run. Returns a summary dict whose "status" is "done", "dry_run", "cancelled" or "stopped".
 
-    confirm(volumes) -> bool, if given, is asked after the scan and before any file moves;
+    confirm(volumes, space) -> bool, if given, is asked after the scan and before any file moves
+    (space: the free-space rows of space_needed);
     False stops the run with nothing moved and nothing recorded.
     candidates_fn(date_from, date_to) defaults to querying SQL Server (tests pass their own).
     window: a custom (from, to) date range; None continues from the last run (see query_window).
@@ -1403,6 +1477,7 @@ def _continue_plan(db, cfg, kept, report, stop, info):
         raise BackupError(f"the log folder {cfg.source_dir} cannot be reached; the stopped run is kept."
                           " Try again when it is available")
     sid, entries, total = kept["sid"], kept["entries"], kept["total"]
+    info["space"] = check_space(cfg, entries)  # refuses before anything moves; the plan stays
     date_from, date_to = kept["window"]
     log.info("continuing stopped run %s (%s .. %s): %d of %d files left", sid, date_from or "(start)", date_to,
              len(entries), total)
@@ -1461,11 +1536,15 @@ def _run_with_index(db, cfg, candidates_fn, dry_run, report, confirm, window=Non
     matched = {e["barcode"] for e in entries}
     info.update(candidates=len(dates), scanned=seen, volumes=volumes,
                 matched_barcodes=len(matched), matched_files=len(entries))
+    space = check_space(cfg, entries) if entries and not dry_run else (space_needed(cfg, entries) if entries else [])
+    info["space"] = space
     if dry_run:
         log.info("dry run: %d of %d candidate barcodes would be archived (%d files): %s",
                  len(matched), len(dates), len(entries), volumes)
+        for row in space:
+            log.info("free space %s", space_text(row))
         return dict(info, status="dry_run", files_moved=0, barcodes=0, errors=errors)
-    if entries and confirm and not confirm(volumes):
+    if entries and confirm and not confirm(volumes, space):
         return dict(info, status="cancelled", files_moved=0, barcodes=0, errors=errors)
     if stop is not None and stop.is_set():
         return _stopped(info, resumed, [], errors)

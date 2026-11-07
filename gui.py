@@ -86,6 +86,18 @@ def when_text(stamp):
     return str(stamp or "")
 
 
+def space_html(rows):
+    """Free-space rows (lb.space_needed) as lines: ✓ enough, ⚠ maybe too little, ✗ too little."""
+    lines = []
+    for r in rows:
+        mark, color = (("✓", "#16a34a") if r["ok"] else ("?", "#64748b") if r["ok"] is None
+                       else ("✗", "#dc2626") if r["required"] else ("⚠", "#d97706"))
+        free = "unknown" if r["free"] is None else size(r["free"])
+        lines.append(f'<span style="color:{color}">{mark}</span> {r["what"]}: <b>{free}</b> free, needs '
+                     f'{size(r["need"])} <span style="color:#64748b">({r["path"]})</span>')
+    return "<br>".join(lines)
+
+
 def size(n):
     for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
         if n < 1024 or unit == "TiB":
@@ -195,10 +207,10 @@ class Job(QObject):
     def report(self, step, message="", done=0, total=None):
         self.progress.emit(step, message, done, total)
 
-    def confirm(self, volumes):
+    def confirm(self, volumes, space=()):
         """Called on the worker thread: waits for the user's answer in the window."""
         self._answered.clear()
-        self.confirm_needed.emit(volumes)
+        self.confirm_needed.emit((volumes, space))
         self._answered.wait()
         return self._answer
 
@@ -210,7 +222,7 @@ class Job(QObject):
 # ---------------------------------------------------------------- dialogs
 
 class ConfirmDialog(QDialog):
-    def __init__(self, volumes, parent=None):
+    def __init__(self, volumes, space=(), parent=None):
         super().__init__(parent)
         self.setWindowTitle("Archive these files?")
         self.setMinimumWidth(520)
@@ -234,6 +246,13 @@ class ConfirmDialog(QDialog):
         table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         table.setMaximumHeight(min(320, 40 + 30 * len(volumes)))
         box.addWidget(table)
+        if space:
+            title = QLabel("<b>Free space</b>")
+            box.addWidget(title)
+            room = QLabel(space_html(space))
+            room.setWordWrap(True)
+            room.setTextFormat(Qt.RichText)
+            box.addWidget(room)
         buttons = QDialogButtonBox()
         go = buttons.addButton("Archive", QDialogButtonBox.AcceptRole)
         go.setObjectName("primary")
@@ -568,8 +587,9 @@ class BackupPage(QWidget):
                 row.finish("✓", "#16a34a")
         self.rows[step].update(message, done, total)
 
-    def on_confirm(self, volumes):
-        self.job.answer(ConfirmDialog(volumes, self).exec() == QDialog.Accepted)
+    def on_confirm(self, request):
+        volumes, space = request
+        self.job.answer(ConfirmDialog(volumes, space, self).exec() == QDialog.Accepted)
 
     def end(self):
         self.clock.stop()
@@ -605,7 +625,9 @@ class BackupPage(QWidget):
             months = ", ".join(f"{m}: {v[1]:,}" for m, v in vols.items()) or "none"
             self.show_banner(f"<b>Preview.</b> {summary['candidates']:,} candidate barcodes, "
                              f"{summary['scanned']:,} files scanned, <b>{files:,} files would be archived</b> "
-                             f"({months}). Nothing was moved.", "#1e3a8a", "#dbeafe")
+                             f"({months}). Nothing was moved."
+                             + (f"<br><br><b>Free space</b><br>{space_html(summary['space'])}"
+                                if summary.get("space") else ""), "#1e3a8a", "#dbeafe")
         if status == "done" and self.app.cfg_email():
             lb.send_email(self.app.last_cfg, summary)
 
@@ -1058,6 +1080,9 @@ class ToolsPage(QWidget):
         lines.append(f"Log folder: {cfg.source_dir} ({where(cfg.source_dir)}), {cfg.threads} file(s) at once")
         lines.append(f"Staging: {cfg.mode}, in {cfg.staging_dir} ({where(cfg.staging_dir)})")
         lines.append(f"Archives: {cfg.output_dir} ({where(cfg.output_dir)})")
+        for name, path in (("staging", cfg.staging_dir), ("archives", cfg.output_dir), ("index", cfg.db_path)):
+            free = lb.free_space(path)
+            lines.append(f"Free space for {name}: " + ("unknown (not reachable)" if free is None else size(free)))
         lines.append(f"Index: {cfg.db_path} ({where(cfg.db_path)})"
                      + (f"; checked and copied to {lb.local_data_dir() / 'index-snapshots'} before each run"
                         if lb.is_network_path(cfg.db_path) else ""))

@@ -28,7 +28,7 @@ range (None: continue). `stop` is a `threading.Event`: once set, the run returns
 | Callback | Called with | Purpose |
 |---|---|---|
 | `report(step, message, done, total)` | `step` is `resume`, `query`, `scan`, `stage` or `commit`. `total=None` means not known yet. `stage` and `commit` count files over the whole run; `message` names the batch (`batch 2/12`). | Progress only. The default, `quiet`, does nothing. Called on the run's thread. |
-| `confirm(volumes) -> bool` | `{"2026-08": (barcodes, files, bytes), ...}` | Asked once, after the scan and **before any file moves**. `False` returns `status="cancelled"` with nothing moved and nothing written to the index. |
+| `confirm(volumes, space) -> bool` | `{"2026-08": (barcodes, files, bytes), ...}`, and the free-space rows of `space_needed` | Asked once, after the scan and **before any file moves**. `False` returns `status="cancelled"` with nothing moved and nothing written to the index. |
 
 `run()` returns a summary dict:
 
@@ -159,6 +159,7 @@ safe to resume. A broken last line (a crash mid-write) is skipped.
 | `export(cfg, target, report)` | `--export`: under the run lock, copies the archives (skipping ones unchanged since the last export, per `export-manifest.json`), the index via SQLite's backup API, the config without its password, and staging if present. Writes `RESTORE.txt`. Refuses a target inside `source_dir` or `output_dir`. |
 | `copy_checked(src, dst)` | Copies through a `.partial` file, hashing while reading. The copy is hashed again and must match before it replaces `dst`. |
 | `run(...)` / `_run(...)` | The whole run under the lock: resume leftovers, query, scan, then dry run / confirm, then record barcodes (and `custom_window_session` for a custom range), then per batch of `cfg.batch_files` (sorted by month): stage, finish. Marks the session `failed` if anything raises after it started, or when stopped. |
+| `space_needed(cfg, entries)`, `check_space`, `free_space`, `space_text` | Free space for a run, before anything moves: staging needs the largest batch + 10% (required: the run is refused), the archive folder the files' full size, an index copy its size (warnings). Places on one drive add up. Also in the dry-run summary (`space`) and passed to `confirm`. |
 | `local_data_dir()`, `snapshot_index(cfg)` | This PC's own disk (`%LOCALAPPDATA%\FinisarLogsBackup`): copy staging when the archive is on a network drive (`Config.default_staging`), and the checked copies of an index on a network drive, taken before each run (last `INDEX_SNAPSHOTS`). |
 | `save_plan`, `load_plan(db, sid)`, `drop_plan`, `stopped_runs(cfg)`, `stopped_run(cfg)`, `discard_stopped_run(cfg, sid)` | The kept plans of stopped runs (`pending_run`, `pending_file` in the index), any number of them: written before anything moves, rows dropped as batches are staged, the whole plan dropped when the run ends `success`, is discarded, or (a continuing run only) is replaced by a new continuing run. `stopped_runs` is what the app's Stopped run cards show; `run(continue_stopped=sid)` continues one. |
 | `_archive(...)`, `_continue_plan(...)` | The batch loop shared by a new run and a continued one; totals add up over the days of one run. `_continue_plan` checks the log folder can be reached, then runs the plan without query or scan. |
@@ -232,6 +233,10 @@ MOCHI_BIN=/path/to/mochi python -m unittest -v
 | `test_new_continue_run_replaces_only_a_stopped_continue_run` | A new A run replaces the stopped A run, never the stopped B run |
 | `test_copy_staging_on_this_pc_when_the_archive_is_on_a_network_drive` | Archive on a network drive: staging goes to this PC's disk |
 | `test_index_on_a_network_drive_is_checked_and_copied_first` | Index on a network drive: a checked copy per run, the last 5 kept, a damaged index stops the run and names the last good copy |
+| `test_too_little_staging_space_refuses_before_anything_moves` | Staging short of space: the run is refused, nothing moved or recorded |
+| `test_little_archive_space_only_warns` | Archive folder short: a warning, the run goes on |
+| `test_preview_reports_free_space` | Preview lists staging and archive space |
+| `test_continue_without_room_keeps_the_plan` | Continuing without room is refused and the plan stays |
 | `test_damaged_copy_is_redone_not_archived` | A staged copy damaged after copying is not archived; the original stays and the next run archives the right content |
 | `test_unjournaled_copies_are_redone` | Copies whose journal is lost are redone, not trusted |
 | `test_gui.Window.*` | The desktop app without a screen (see `test_gui.py` above) |

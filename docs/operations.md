@@ -125,6 +125,17 @@ When the log folder, the archive folder and the index are all on network drives:
 | Index snapshots | `%LOCALAPPDATA%\FinisarLogsBackup\index-snapshots`, the last 5 | SQLite on a network share is safe with one writer at a time (the run lock), but a connection that drops in the middle of a write can damage it. Before each run the index is copied here (SQLite's backup method) and the copy is checked (`PRAGMA quick_check`). A damaged index stops the run before anything moves, with the path of the newest good copy to put back. |
 | Run lock | `<archive folder>/.backup.lock` | Two PCs cannot run at the same time against the same NAS. |
 
+**Free space is checked before anything moves**, right after the scan (and when a stopped run
+continues). Preview, the "Archive these files?" dialog and Tools → Run check show it:
+
+| Place | Needs | If short |
+|---|---|---|
+| Staging (copy staging) | The largest batch plus 10% | The run is refused; nothing moves. Free space, lower the batch size, or pick another staging folder. |
+| Archive folder | The files' full size (the archive grows by less: MOCHI compresses) | A warning; the run goes on |
+| Index copy on this PC (index on a network drive) | One more copy of the index | A warning |
+
+Places on the same drive are counted together. Staging checks again before each batch.
+
 Tools → **Run check** shows which folders are on a network drive and where staging and the
 snapshots are. Keep an export on another drive too (Tools → Export).
 

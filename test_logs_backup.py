@@ -635,6 +635,48 @@ class Flow(unittest.TestCase):
                     self.run_backup()
             self.assertTrue((self.cfg.source_dir / "ESS/BC0011_other.txt").exists())
 
+    def short_of_space(self, where, free=1000):
+        """free_space patched: `free` bytes on the drive of `where`, plenty elsewhere."""
+        real = lb.free_space
+        return unittest.mock.patch.object(
+            lb, "free_space", lambda path: free if str(path).startswith(str(where)) else real(path))
+
+    def test_too_little_staging_space_refuses_before_anything_moves(self):
+        self.copy_mode()
+        self.CANDIDATES = self.CANDIDATES + self.many(50)
+        with self.short_of_space(self.cfg.staging_dir, free=10), unittest.mock.patch.object(
+                lb, "_drive", lambda path: str(path)):
+            with self.assertRaisesRegex(lb.BackupError, "not enough free space: staging"):
+                self.run_backup()
+        self.assertTrue((self.cfg.source_dir / "BURNIN/unit1_BC001_log.txt").is_file())
+        self.assertFalse(self.cfg.manifest.exists())
+        db = connect(self, self.cfg.db_path)
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM scan_session").fetchone()[0], 0)  # nothing recorded
+        self.assertEqual(self.run_backup()["status"], "done")  # with room again
+
+    def test_little_archive_space_only_warns(self):
+        with self.short_of_space(self.cfg.output_dir, free=5), self.assertLogs("logs_backup", "WARNING") as logs:
+            self.assertEqual(self.run_backup()["status"], "done")
+        self.assertTrue(any("may be too little" in line for line in logs.output))
+
+    def test_preview_reports_free_space(self):
+        self.copy_mode()
+        summary = lb.run(self.cfg, lambda *_: self.CANDIDATES, dry_run=True)
+        what = [r["what"].split(" ")[0] for r in summary["space"]]
+        self.assertEqual(what, ["staging", "archives"])
+        self.assertTrue(all(r["ok"] for r in summary["space"]))
+        self.assertEqual(summary["space"][1]["need"], len(b"burnin one") + len(b"ess two"))
+
+    def test_continue_without_room_keeps_the_plan(self):
+        self.stop_partway()
+        left = lb.stopped_run(self.cfg)["left"]
+        self.settings(staging_mode="copy", date_range=None)  # pretend the next day stages on a full disk
+        with self.short_of_space(self.cfg.staging_dir, free=10), unittest.mock.patch.object(
+                lb, "_drive", lambda path: str(path)):
+            with self.assertRaisesRegex(lb.BackupError, "not enough free space"):
+                lb.run(self.cfg, self.no_query, continue_stopped=True)
+        self.assertEqual(lb.stopped_run(self.cfg)["left"], left)
+
     def test_damaged_copy_is_redone_not_archived(self):
         self.copy_mode()
         db = lb.open_index(self.cfg.db_path)
@@ -718,7 +760,7 @@ class Flow(unittest.TestCase):
     def test_callbacks_report_steps_and_cancel_moves_nothing(self):
         steps = []
         summary = lb.run(self.cfg, lambda *_: self.CANDIDATES, report=lambda step, *_: steps.append(step),
-                         confirm=lambda volumes: False)
+                         confirm=lambda volumes, space: False)
         self.assertEqual(summary["status"], "cancelled")
         self.assertEqual(summary["volumes"], {"2026-07": (1, 1, 7), "2026-08": (1, 1, 10)})  # barcodes, files, bytes
         self.assertEqual((summary["candidates"], summary["matched_barcodes"], summary["matched_files"]), (3, 2, 2))
@@ -727,7 +769,7 @@ class Flow(unittest.TestCase):
         self.assertEqual(connect(self, self.cfg.db_path).execute("SELECT COUNT(*) FROM scan_session").fetchone()[0], 0)
 
         summary = lb.run(self.cfg, lambda *_: self.CANDIDATES, report=lambda step, *_: steps.append(step),
-                         confirm=lambda volumes: True)
+                         confirm=lambda volumes, space: True)
         self.assertEqual((summary["files_moved"], summary["barcodes"]), (2, 2))
         self.assertIn("commit", steps)
 

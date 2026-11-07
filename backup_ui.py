@@ -87,17 +87,26 @@ def volume_table(volumes, status):
 
 def ask_confirm(progress, yes):
     """The confirm callback: shows what would be archived and asks before anything moves."""
-    def confirm(volumes):
+    def confirm(volumes, space=()):
         if yes:
             return True
         progress.stop()
         console.print(volume_table(volumes, "[yellow]to archive"))
+        print_space(space)
         barcodes, files, nbytes = totals(volumes)
         answer = Confirm.ask(f"Archive {barcodes:,} barcodes ({files:,} files, {size(nbytes)})"
                              f" into {len(volumes)} monthly archive(s)?", default=False)
         progress.start()
         return answer
     return confirm
+
+
+def print_space(rows):
+    for r in rows:
+        mark = ("[green]✓" if r["ok"] else "[dim]?" if r["ok"] is None
+                else "[red]✗" if r["required"] else "[yellow]⚠")
+        free = "unknown" if r["free"] is None else size(r["free"])
+        console.print(f"{mark}[/] free space, {r['what']}: {free} free, needs {size(r['need'])}  [dim]{r['path']}")
 
 
 def print_summary(summary):
@@ -109,6 +118,8 @@ def print_summary(summary):
              "stopped": "[yellow]committed before the stop"}[status]
     if summary["volumes"]:
         console.print(volume_table(summary["volumes"], label))
+    if status == "dry_run":
+        print_space(summary.get("space") or [])
     date_from, date_to = summary["window"]
     lines = [f"Window      {date_from or '(start)'} .. {date_to}",
              f"Candidates  {summary['candidates']:,} barcodes",

@@ -99,6 +99,7 @@ class Window(unittest.TestCase):
             self.wait(lambda: page.job is None)
         self.assertEqual(threads, {threading.main_thread()})
         self.assertIn("2 files would be archived", page.banner.text())
+        self.assertIn("Free space", page.banner.text())
         self.assertTrue((self.tmp / "src/BURNIN/unit1_BC001_log.txt").exists())
 
     @unittest.skipUnless(MOCHI, "mochi CLI not found (set MOCHI_BIN)")
