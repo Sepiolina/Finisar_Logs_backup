@@ -40,7 +40,8 @@ On Windows, double-click `run_app.bat`, or the built `FinisarLogsBackup.exe` (se
    file moves. **Stop** ends the run at the next safe point (never inside a MOCHI commit). You can
    then close the program or shut down the PC: the run's plan is kept in the index, and the next
    day a **Stopped run** card offers **Continue**, which picks up exactly there without asking
-   SQL Server or scanning the log folders again. Files are archived in batches (10,000 by
+   SQL Server or scanning the log folders again. Every stopped run keeps its own card: a stopped
+   custom-range (B) run stays until you continue or discard it, whatever runs in between. Files are archived in batches (10,000 by
    default), so a stop waits for at most one batch's commit. A power cut or a crash is handled
    the same way.
 4. **History** lists every run; **Tools → Export** copies a restorable set to another drive.
@@ -49,8 +50,12 @@ On Windows, double-click `run_app.bat`, or the built `FinisarLogsBackup.exe` (se
 
 `backup_ui.py` is the terminal version. It uses the same settings as the app (or a `config.json`
 in the current folder or next to the program, which wins). Ctrl+C stops it safely, like Stop.
-If a stopped run can continue, it continues that one (so a scheduled task picks up where the
-last run stopped); `--new` starts a new run instead.
+If stopped runs can continue, it continues them, oldest first (so a scheduled task picks up
+where the last run stopped); `--new` starts a new run instead.
+
+**Everything on a NAS** (logs, archives, index) works: copy staging then uses this PC's own disk
+(`%LOCALAPPDATA%\FinisarLogsBackup\staging`), and the index is checked and copied to this PC
+before each run. See [operations.md](docs/operations.md#everything-on-a-nas).
 
 ```bash
 python backup_ui.py --check-sql

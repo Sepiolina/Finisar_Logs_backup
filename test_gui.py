@@ -131,19 +131,21 @@ class Window(unittest.TestCase):
             with unittest.mock.patch.object(gui.BackupPage, "on_progress", stop_during_staging):
                 page.a_start.click()
                 self.wait(lambda: page.job is None)
-            self.assertFalse(page.stopped_card.isHidden())
+            self.assertEqual(len(page.stopped_cards), 1)
             self.assertIn("Stopped</b> with", page.banner.text())
         # As after closing the program and restarting the PC: a new window, the stopped run offered.
         self.window.close()
         self.window = gui.MainWindow(self.handler, self.tmp / "backup.log")
         page = self.window.backup_page
-        self.assertFalse(page.stopped_card.isHidden())
-        self.assertIn("files left", page.stopped_label.text())
+        self.assertFalse(page.stopped_area.isHidden())
+        frame, label, go_on, _ = page.stopped_cards[0]
+        self.assertIn("files left", label.text())
         with unittest.mock.patch.object(lb, "query_candidates", side_effect=AssertionError("no new query")):
-            page.continue_button.click()
+            go_on.click()
             self.wait(lambda: page.job is None)
         self.assertIn("Done.", page.banner.text())
-        self.assertTrue(page.stopped_card.isHidden())
+        self.assertEqual(page.stopped_cards, [])
+        self.assertTrue(page.stopped_area.isHidden())
         self.assertIn("continue", self.window.history_page.table.item(0, 3).text())
         self.assertEqual(list((self.tmp / "src").rglob("*_BC*")), [])
         files, _ = lb.head_files(lb.Config(lb.find_config()), self.tmp / "out/2026/2026-08.mochi")

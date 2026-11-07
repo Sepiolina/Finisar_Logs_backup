@@ -88,7 +88,8 @@ leave a broken archive tail), so a stop can take as long as one batch's commit.
 
 **Then you can close the program or shut down the PC.** The run's plan (the files it still has to
 archive, its date range) is kept in the index. Next time, the Backup page shows a **Stopped run**
-card with how many files are left and two buttons:
+card with how many files are left and two buttons. Every stopped run has its own card: an A
+run and any number of B (custom range) runs can wait side by side, and each continues on its own.
 
 - **Continue**: first finishes the batch that was staged when it stopped (the **Finish the previous
   run** row), then archives the rest of the plan. No SQL query and no new scan, so on a slow NAS it
@@ -98,8 +99,11 @@ card with how many files are left and two buttons:
 - **Discard**: forgets the plan. Nothing is deleted; the files stay in the log folders and a later
   run finds them with a new scan.
 
-Starting A or B while a stopped run is waiting asks whether to continue it or start the new run
-(which replaces the plan). The same holds for a crash, a power cut or Windows shutting down during
+Running something else meanwhile is fine. A stopped **B** run is never replaced: it waits until you
+continue or discard it. Starting a new **A** run while a stopped A run waits asks first, because the
+new A run covers the same dates and replaces it (choose **Continue stopped run** to save the scan).
+Files already staged when a run stopped are never dropped: whichever run comes next finishes them
+first. The same holds for a crash, a power cut or Windows shutting down during
 a run: the next run finishes what was staged and the plan continues. While a run works, the app
 keeps Windows from going to sleep (the screen may still turn off). Closing the window during a run
 asks, then stops the same way and closes.
@@ -110,6 +114,23 @@ must match; a copy that does not (damaged by a power cut before it reached the d
 record is missing is deleted and copied again later from the original, which is still on the NAS.
 The originals are deleted only after the archive is verified and indexed, and only if they did not
 change. So a stop, a shutdown or a power cut at any moment loses nothing and archives nothing damaged.
+
+## Everything on a NAS
+
+When the log folder, the archive folder and the index are all on network drives:
+
+| What | Where | Why |
+|---|---|---|
+| Staging | `%LOCALAPPDATA%\FinisarLogsBackup\staging` on this PC (automatic when the archive folder is on a network drive) | Each file crosses the network once in (copied from the logs) and once out (written into the archive by `mochi`). The checksum check and `mochi` read the local copy. Holds one batch at a time; the run checks for its size plus 10% free first. |
+| Index snapshots | `%LOCALAPPDATA%\FinisarLogsBackup\index-snapshots`, the last 5 | SQLite on a network share is safe with one writer at a time (the run lock), but a connection that drops in the middle of a write can damage it. Before each run the index is copied here (SQLite's backup method) and the copy is checked (`PRAGMA quick_check`). A damaged index stops the run before anything moves, with the path of the newest good copy to put back. |
+| Run lock | `<archive folder>/.backup.lock` | Two PCs cannot run at the same time against the same NAS. |
+
+Tools → **Run check** shows which folders are on a network drive and where staging and the
+snapshots are. Keep an export on another drive too (Tools → Export).
+
+If you start runs from two different PCs, each keeps its own staging. A batch staged on PC 1 and
+then continued from PC 2 is safe: with copy staging the originals stay on the NAS until archived,
+so PC 2 archives them, and PC 1 later finds them already in the archive and only cleans up.
 
 ## Single-file .exe (Windows)
 
@@ -169,7 +190,7 @@ path last, for example `python backup_ui.py --dry-run D:/configs/line2.json`.
 | `db_path` | required | SQLite index file. Its folder is created if missing. |
 | `sql_server` | none | SQL Server login, see below |
 | `staging_mode` | `null`: automatic | How files get into staging. `"move"`: renamed into staging on the source drive. `"copy"`: copied to staging on a local disk, and each original deleted from the source only after its archive is verified (and only if it did not change after it was copied; a changed file stays for the next run). Automatic: **`"copy"` when `source_dir` is a network drive** (a mapped drive or `//server/share`), `"move"` on a local disk. |
-| `staging_dir` | `source_dir/.staging` (move), `output_dir/.staging` (copy) | With `"move"` it must be on the **same drive** as `source_dir` (files are moved there by rename); a run refuses to start staging otherwise. With `"copy"` put it on a **local disk** with room for one batch (a run checks for the batch's size plus 10% before copying). Created if missing. Never scanned, even inside a subfolder. |
+| `staging_dir` | `source_dir/.staging` (move); `output_dir/.staging` (copy), or this PC's `%LOCALAPPDATA%\FinisarLogsBackup\staging` when the archive folder is on a network drive | With `"move"` it must be on the **same drive** as `source_dir` (files are moved there by rename); a run refuses to start staging otherwise. With `"copy"` put it on a **local disk** with room for one batch (a run checks for the batch's size plus 10% before copying). Created if missing. Never scanned, even inside a subfolder. |
 | `subfolders` | `BURNIN, ESS, JTAG, STM, Xray` | The folders scanned under `source_dir` |
 | `recursive` | `true` | `true`: also scan every folder inside each subfolder, at any depth, keeping those folders in the archive paths (`BURNIN/line2/unit1_BC001_log.txt`). `false`: only files directly in each subfolder. |
 | `file_threads` | `null`: automatic | How many folders are listed, and files copied or renamed into staging and deleted after the commit, at once. Automatic: **16 when `source_dir` is a network drive** (a mapped drive or `//server/share`), where each call mostly waits on the network; 1 on a local disk, where one thread is fastest. Set 1–64 to override. |
@@ -253,7 +274,7 @@ the double-click launcher and scheduled tasks see them.
 | Run by hand | The desktop app (`run_app.bat` or `FinisarLogsBackup.exe`), or `run_backup.bat` / `python backup_ui.py` |
 | Back-fill old dates | The app's **B · Custom date range** |
 | Stop a running backup | **Stop** in the app, or Ctrl+C in the terminal. Shut down if you like; **Continue** (app) or the next terminal run picks up where it stopped |
-| Start fresh although a run was stopped | **Discard** on the Stopped run card, or `python backup_ui.py --new` |
+| Start fresh although a run was stopped | **Discard** on its Stopped run card, or `python backup_ui.py --new` (stopped runs are kept for later) |
 | Run without the question | `python backup_ui.py --yes` |
 | Plain log output (scheduled task) | `python logs_backup.py` |
 

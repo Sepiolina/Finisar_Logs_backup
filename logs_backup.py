@@ -166,6 +166,17 @@ def settings_dir():
     return Path(base or Path.home() / ".config") / APP_NAME
 
 
+def local_data_dir():
+    """This PC's own disk, for data that must not roam or cross the network: copy staging when the
+    archive is on a network drive, and snapshots of an index kept on one.
+    %LOCALAPPDATA%\\FinisarLogsBackup on Windows, ~/.cache/FinisarLogsBackup elsewhere;
+    under FINISAR_BACKUP_HOME when set."""
+    if os.environ.get("FINISAR_BACKUP_HOME"):
+        return Path(os.environ["FINISAR_BACKUP_HOME"]) / "local"
+    base = os.environ.get("LOCALAPPDATA") if os.name == "nt" else os.environ.get("XDG_CACHE_HOME")
+    return Path(base or Path.home() / ".cache") / APP_NAME
+
+
 def settings_path():
     return settings_dir() / "settings.json"
 
@@ -321,14 +332,19 @@ class Config:
         return self.staging_mode or ("copy" if self.on_network else "move")
 
     def default_staging(self, mode):
-        return self.output_dir / ".staging" if mode == "copy" else self.source_dir / ".staging"
+        """Move: next to the logs (a rename must stay on their drive). Copy: on a local disk, which is
+        the archive folder's drive unless that is a network drive too; then this PC's own disk."""
+        if mode == "move":
+            return self.source_dir / ".staging"
+        return local_data_dir() / "staging" if is_network_path(self.output_dir) else self.output_dir / ".staging"
 
     def staging_dirs(self):
         """Every folder an earlier run may have left a batch in: the configured one, and with no
-        staging_dir set, the other mode's default too (the mode may have changed since)."""
+        staging_dir set, every default there has been (the mode or the defaults may have changed)."""
         dirs = [self.staging_dir]
         if not self.staging_dir_set:
-            dirs += [d for d in (self.default_staging("move"), self.default_staging("copy")) if d not in dirs]
+            dirs += [d for d in (self.default_staging("move"), self.output_dir / ".staging",
+                                 local_data_dir() / "staging") if d not in dirs]
         return dirs
 
     def with_staging(self, folder):
@@ -1157,8 +1173,10 @@ def run(cfg, candidates_fn=None, dry_run=False, report=quiet, confirm=None, wind
     stop: a threading.Event; once set, the run stops at the next safe point (between files while
     scanning or staging, before the next month's commit) and returns status "stopped". Nothing is
     lost, and the run's plan (the files it still has to archive) is kept in the index.
-    continue_stopped: continue that stopped run (any day later, after a restart): no SQL query,
-    no scan. A new run (False) drops a kept plan once it is confirmed; its files are found again."""
+    continue_stopped: continue a stopped run (any day later, after a restart): no SQL query, no scan.
+    True picks the most recent, a session id a given one (several can be kept). A new continuing
+    run replaces stopped continuing runs once confirmed (it covers their dates); stopped
+    custom-range runs are always kept until continued or discarded."""
     candidates_fn = candidates_fn or (lambda date_from, date_to: query_candidates(cfg.sql, date_from, date_to))
     if window:
         window = check_window(window)
@@ -1196,11 +1214,53 @@ def _run(cfg, candidates_fn, dry_run, report, confirm, window=None, stop=None, c
     log.info("source_dir %s (%s): %s staging in %s, %d thread(s), batches of %d files", cfg.source_dir,
              "network drive" if cfg.on_network else "local disk", cfg.mode, cfg.staging_dir, cfg.threads,
              cfg.batch_files)
+    if not dry_run:
+        snapshot_index(cfg)
     db = open_index(cfg.db_path)
     try:
         return _run_with_index(db, cfg, candidates_fn, dry_run, report, confirm, window, stop, continue_stopped)
     finally:
         db.close()  # an open connection keeps index.db locked on Windows
+
+
+INDEX_SNAPSHOTS = 5  # local copies of an index that is on a network drive
+
+
+def snapshot_index(cfg):
+    """An index on a network drive: before each run, copies it to this PC's disk (SQLite's backup
+    method: a consistent copy) and checks the copy. A damaged index stops the run before anything
+    moves, naming the newest good copy to restore from. Keeps the last INDEX_SNAPSHOTS copies.
+    SQLite on a network share is safe with one writer (the run lock), but a dropped connection in
+    the middle of a write can damage it. Returns the copy's path, or None (local index, or none yet)."""
+    if not cfg.db_path.is_file() or not is_network_path(cfg.db_path):
+        return None
+    folder = local_data_dir() / "index-snapshots"
+    folder.mkdir(parents=True, exist_ok=True)
+    earlier = sorted(folder.glob("index-*.db"))
+    target = folder / f"index-{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}.db"
+    try:
+        source = sqlite3.connect(f"file:{cfg.db_path.as_posix()}?mode=ro", uri=True)
+        copy_db = sqlite3.connect(target)
+        try:
+            source.backup(copy_db)
+            check = copy_db.execute("PRAGMA quick_check").fetchone()[0]
+        finally:
+            copy_db.close()
+            source.close()
+    except sqlite3.Error as e:
+        check = str(e)
+    if check != "ok":
+        with contextlib.suppress(OSError):
+            target.unlink()
+        good = earlier[-1] if earlier else None
+        raise BackupError(f"the index {cfg.db_path} looks damaged ({check}). Nothing was changed. "
+                          + (f"Restore it from the copy taken before the last run: {good}" if good
+                             else "Restore it from your last export (Tools → Export)."))
+    for old in earlier[:max(len(earlier) + 1 - INDEX_SNAPSHOTS, 0)]:
+        with contextlib.suppress(OSError):
+            old.unlink()
+    log.info("index on a network drive: checked, and copied to %s", target)
+    return target
 
 
 def _offset(report, step, offset, total, label=""):
@@ -1230,11 +1290,12 @@ def save_plan(db, sid, window, custom, entries):
     return list(range(first, first + len(entries)))
 
 
-def load_plan(db):
-    """The kept plan of a stopped run, or None: {sid, window, custom, total, stopped_at, created_at,
-    entries, ids}. There is at most one."""
+def load_plan(db, sid=None):
+    """A stopped run's kept plan, or None: {sid, window, custom, total, stopped_at, created_at,
+    entries, ids}. `sid` picks one; None the most recent. Several stopped runs can be kept."""
     row = db.execute("SELECT scan_session_id, query_from, query_to, custom, total_files, created_at, stopped_at"
-                     " FROM pending_run ORDER BY scan_session_id DESC LIMIT 1").fetchone()
+                     " FROM pending_run" + (" WHERE scan_session_id = ?" if sid else "") +
+                     " ORDER BY scan_session_id DESC LIMIT 1", (sid,) if sid else ()).fetchone()
     if not row:
         return None
     rows = db.execute("SELECT id, entry FROM pending_file WHERE scan_session_id = ? ORDER BY id", (row[0],)).fetchall()
@@ -1249,32 +1310,41 @@ def drop_plan(db, sid):
         db.execute("DELETE FROM pending_run WHERE scan_session_id = ?", (sid,))
 
 
-def stopped_run(cfg):
-    """For display: the stopped run that can continue ({sid, window, custom, total, left, stopped_at}),
-    or None. Does not create the index."""
+def _stopped_runs(db):
+    rows = db.execute("SELECT r.scan_session_id, r.query_from, r.query_to, r.custom, r.total_files,"
+                      " COALESCE(r.stopped_at, r.created_at), (SELECT COUNT(*) FROM pending_file f"
+                      " WHERE f.scan_session_id = r.scan_session_id) FROM pending_run r"
+                      " ORDER BY r.scan_session_id").fetchall()
+    return [{"sid": r[0], "window": (r[1], r[2]), "custom": bool(r[3]), "total": r[4], "stopped_at": r[5],
+             "left": r[6]} for r in rows]
+
+
+def stopped_runs(cfg):
+    """For display: every stopped run that can continue, oldest first, each {sid, window, custom,
+    total, left, stopped_at}. Does not create the index."""
     if not cfg.db_path.is_file():
-        return None
+        return []
     db = open_index(cfg.db_path)
     try:
-        row = db.execute("SELECT r.scan_session_id, r.query_from, r.query_to, r.custom, r.total_files,"
-                         " COALESCE(r.stopped_at, r.created_at), (SELECT COUNT(*) FROM pending_file f"
-                         " WHERE f.scan_session_id = r.scan_session_id) FROM pending_run r"
-                         " ORDER BY r.scan_session_id DESC LIMIT 1").fetchone()
+        return _stopped_runs(db)
     finally:
         db.close()
-    if not row:
-        return None
-    return {"sid": row[0], "window": (row[1], row[2]), "custom": bool(row[3]), "total": row[4],
-            "stopped_at": row[5], "left": row[6]}
 
 
-def discard_stopped_run(cfg):
-    """Forgets the stopped run's plan (its files stay in the source; a later run finds them).
-    Batches already staged are still finished by the next run. Returns how many files it listed."""
+def stopped_run(cfg):
+    """The most recent stopped run (see stopped_runs), or None."""
+    runs = stopped_runs(cfg)
+    return runs[-1] if runs else None
+
+
+def discard_stopped_run(cfg, sid=None):
+    """Forgets a stopped run's plan (`sid`, else the most recent). Its files stay in the source; a
+    later run finds them. A batch already staged is still finished by the next run. Returns how
+    many files it listed."""
     with lock_run(cfg):
         db = open_index(cfg.db_path)
         try:
-            kept = load_plan(db)
+            kept = load_plan(db, sid)
             if not kept:
                 return 0
             drop_plan(db, kept["sid"])
@@ -1365,12 +1435,11 @@ def _run_with_index(db, cfg, candidates_fn, dry_run, report, confirm, window=Non
             report("resume", f"{resumed} files", 1, 1)
         check_stop(stop)
     except Stopped:
-        kept = load_plan(db)
-        return _stopped(info, resumed, [], 0, left=len(kept["entries"]) if kept else 0)
+        return _stopped(info, resumed, [], 0, left=sum(r["left"] for r in _stopped_runs(db)))
     info["resumed"] = resumed
 
-    kept = None if dry_run else load_plan(db)
-    if continue_stopped:
+    if continue_stopped:  # True: the most recent stopped run; a number: that one (its session id)
+        kept = load_plan(db, None if continue_stopped is True else continue_stopped)
         if kept:
             return _continue_plan(db, cfg, kept, report, stop, info)
         log.info("no stopped run to continue")
@@ -1400,10 +1469,12 @@ def _run_with_index(db, cfg, candidates_fn, dry_run, report, confirm, window=Non
         return dict(info, status="cancelled", files_moved=0, barcodes=0, errors=errors)
     if stop is not None and stop.is_set():
         return _stopped(info, resumed, [], errors)
-    if kept:  # replaced by this run: its files are still in the source, and found by this scan if in range
-        log.info("dropping the plan of stopped run %s (%d files left): a new run was started",
-                 kept["sid"], len(kept["entries"]))
-        drop_plan(db, kept["sid"])
+    if not custom:  # a new continuing run covers the dates of a stopped continuing one: it replaces it
+        for old in _stopped_runs(db):     # (stopped custom-range runs are kept: their dates are not covered)
+            if not old["custom"]:
+                log.info("stopped run %s (%d files left) is replaced by this continuing run, which covers its"
+                         " dates", old["sid"], old["left"])
+                drop_plan(db, old["sid"])
 
     sid = start_session(db, date_from or "", date_to)
     try:
@@ -1562,11 +1633,14 @@ def main():
     if args.export:
         export(cfg, args.export)
         return
-    resume = not args.dry_run and not args.new and stopped_run(cfg) is not None
-    summary = run(cfg, dry_run=args.dry_run, continue_stopped=resume)
-    log.info("%s: %s", summary["status"], json.dumps({k: v for k, v in summary.items() if k != "unmatched"}))
-    if summary["status"] == "done" and cfg.email:
-        send_email(cfg, summary)
+    stopped = [] if args.dry_run or args.new else stopped_runs(cfg)  # continued first, oldest first
+    for kept in stopped or [None]:
+        summary = run(cfg, dry_run=args.dry_run, continue_stopped=kept["sid"] if kept else False)
+        log.info("%s: %s", summary["status"], json.dumps({k: v for k, v in summary.items() if k != "unmatched"}))
+        if summary["status"] == "done" and cfg.email:
+            send_email(cfg, summary)
+        if summary["status"] == "stopped":
+            break
 
 
 if __name__ == "__main__":

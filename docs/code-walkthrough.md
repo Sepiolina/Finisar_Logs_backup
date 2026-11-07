@@ -159,7 +159,8 @@ safe to resume. A broken last line (a crash mid-write) is skipped.
 | `export(cfg, target, report)` | `--export`: under the run lock, copies the archives (skipping ones unchanged since the last export, per `export-manifest.json`), the index via SQLite's backup API, the config without its password, and staging if present. Writes `RESTORE.txt`. Refuses a target inside `source_dir` or `output_dir`. |
 | `copy_checked(src, dst)` | Copies through a `.partial` file, hashing while reading. The copy is hashed again and must match before it replaces `dst`. |
 | `run(...)` / `_run(...)` | The whole run under the lock: resume leftovers, query, scan, then dry run / confirm, then record barcodes (and `custom_window_session` for a custom range), then per batch of `cfg.batch_files` (sorted by month): stage, finish. Marks the session `failed` if anything raises after it started, or when stopped. |
-| `save_plan`, `load_plan`, `drop_plan`, `stopped_run(cfg)`, `discard_stopped_run(cfg)` | The kept plan of a run (`pending_run`, `pending_file` in the index): written before anything moves, rows dropped as batches are staged, the whole plan dropped when the run ends `success` or a new run replaces it. `stopped_run` is what the app's Stopped run card shows. |
+| `local_data_dir()`, `snapshot_index(cfg)` | This PC's own disk (`%LOCALAPPDATA%\FinisarLogsBackup`): copy staging when the archive is on a network drive (`Config.default_staging`), and the checked copies of an index on a network drive, taken before each run (last `INDEX_SNAPSHOTS`). |
+| `save_plan`, `load_plan(db, sid)`, `drop_plan`, `stopped_runs(cfg)`, `stopped_run(cfg)`, `discard_stopped_run(cfg, sid)` | The kept plans of stopped runs (`pending_run`, `pending_file` in the index), any number of them: written before anything moves, rows dropped as batches are staged, the whole plan dropped when the run ends `success`, is discarded, or (a continuing run only) is replaced by a new continuing run. `stopped_runs` is what the app's Stopped run cards show; `run(continue_stopped=sid)` continues one. |
 | `_archive(...)`, `_continue_plan(...)` | The batch loop shared by a new run and a continued one; totals add up over the days of one run. `_continue_plan` checks the log folder can be reached, then runs the plan without query or scan. |
 | `verify_copies(cfg, months, known)` | Copy staging: hashes each staged copy and compares it with the journal (`read_journal`) written while copying; unverified copies are deleted and left out. The checked hashes go to `commit_month(known=...)`, so nothing is hashed twice. |
 | `keep_awake()` | Windows `SetThreadExecutionState`: no sleep while a run works. |
@@ -226,6 +227,11 @@ MOCHI_BIN=/path/to/mochi python -m unittest -v
 | `test_continue_skips_files_removed_meanwhile` | Plan files deleted before Continue are skipped without errors |
 | `test_continue_with_the_log_folder_unreachable_keeps_the_plan` | Log folder missing: Continue refuses and the plan stays; once it is back, Continue finishes |
 | `test_new_run_replaces_a_stopped_plan_and_finds_its_files` | A new run drops the plan; its scan finds the files again |
+| `test_stopped_custom_run_survives_other_runs_then_continues` | A stopped B run waits while an A run completes, then continues by itself |
+| `test_two_stopped_runs_continue_separately` | A stopped A and a stopped B are both kept and each continues |
+| `test_new_continue_run_replaces_only_a_stopped_continue_run` | A new A run replaces the stopped A run, never the stopped B run |
+| `test_copy_staging_on_this_pc_when_the_archive_is_on_a_network_drive` | Archive on a network drive: staging goes to this PC's disk |
+| `test_index_on_a_network_drive_is_checked_and_copied_first` | Index on a network drive: a checked copy per run, the last 5 kept, a damaged index stops the run and names the last good copy |
 | `test_damaged_copy_is_redone_not_archived` | A staged copy damaged after copying is not archived; the original stays and the next run archives the right content |
 | `test_unjournaled_copies_are_redone` | Copies whose journal is lost are redone, not trusted |
 | `test_gui.Window.*` | The desktop app without a screen (see `test_gui.py` above) |

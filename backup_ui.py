@@ -254,18 +254,31 @@ def main():
         check_setup(cfg)
         return
 
-    stopped = None if args.dry_run or args.new else lb.stopped_run(cfg)
-    if stopped:
-        date_from, date_to = stopped["window"]
-        console.print(Panel(f"Continuing the stopped run {date_from or '(start)'} .. {date_to}: "
-                            f"{stopped['left']:,} of {stopped['total']:,} files left (no new scan).\n"
-                            "To start a new run instead: --new", border_style="cyan"))
+    # Stopped runs continue first, oldest first (a scheduled task picks up where they stopped);
+    # with none (or --new), a new run.
+    stopped = [] if args.dry_run or args.new else lb.stopped_runs(cfg)
+    for kept in stopped or [None]:
+        if kept:
+            date_from, date_to = kept["window"]
+            kind = "custom range" if kept["custom"] else "continue"
+            console.print(Panel(f"Continuing the stopped run ({kind}) {date_from or '(start)'} .. {date_to}: "
+                                f"{kept['left']:,} of {kept['total']:,} files left (no new scan).\n"
+                                "To start a new run instead: --new", border_style="cyan"))
+        summary = run_once(cfg, args, kept["sid"] if kept else False)
+        print_summary(summary)
+        if summary["status"] == "done" and cfg.email:
+            lb.send_email(cfg, summary)
+        if summary["status"] == "stopped":
+            break
+
+
+def run_once(cfg, args, continue_stopped):
     with Progress(*COLUMNS, console=console) as progress:
         steps = Steps(progress)
         try:
-            summary = run_stoppable(lambda stop: lb.run(cfg, dry_run=args.dry_run, report=steps,
-                                                        confirm=ask_confirm(progress, args.yes), stop=stop,
-                                                        continue_stopped=bool(stopped)))
+            return run_stoppable(lambda stop: lb.run(cfg, dry_run=args.dry_run, report=steps,
+                                                     confirm=ask_confirm(progress, args.yes), stop=stop,
+                                                     continue_stopped=continue_stopped))
         except Exception as e:
             steps.fail_running()
             progress.stop()
@@ -274,9 +287,6 @@ def main():
                                 "Run again to continue where this run stopped. Details: backup.log",
                                 title="Run failed", border_style="red"))
             sys.exit(1)
-    print_summary(summary)
-    if summary["status"] == "done" and cfg.email:
-        lb.send_email(cfg, summary)
 
 
 if __name__ == "__main__":

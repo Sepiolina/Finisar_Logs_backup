@@ -157,6 +157,10 @@ Also:
   source (`staging/copied.jsonl`, synced after each batch of 2,000). Before committing, every copy is hashed
   again; one that does not match, or has no record (a power cut before the copy or its record reached the
   disk), is deleted and left out; its original is still in the source, so a later run copies it again.
+- **An index on a network drive is checked first.** Before each run it is copied to this PC and the copy
+  is checked; a damaged index stops the run before anything moves. The last 5 copies are kept.
+- **Several stopped runs.** Each stopped run keeps its plan until it is continued or discarded; a new
+  continuing run replaces only stopped continuing runs (it covers their dates).
 - **The plan survives.** A run's file list is saved in the index (`pending_run`, `pending_file`) before
   anything moves. A batch's rows are dropped once it is staged (the manifest tracks it from then on); files
   a stop skipped stay. A plan file that is gone by the time it is continued is skipped; if the whole log
