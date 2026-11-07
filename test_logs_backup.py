@@ -223,7 +223,8 @@ class Staging(unittest.TestCase):
         self.assertEqual(self.config().mode, "move")  # a local temp folder
         cfg = self.config(staging_mode="copy")
         self.assertEqual(cfg.staging_dir, cfg.output_dir / ".staging")
-        self.assertEqual(cfg.staging_dirs(), [cfg.output_dir / ".staging", cfg.source_dir / ".staging"])
+        self.assertEqual(cfg.staging_dirs()[:2], [cfg.output_dir / ".staging", cfg.source_dir / ".staging"])
+        self.assertIn(lb.local_data_dir() / "staging", cfg.staging_dirs())  # where it goes with a network archive
         with self.assertRaisesRegex(lb.BackupError, "staging_mode"):
             self.config(staging_mode="rename")
 
@@ -470,6 +471,244 @@ class Flow(unittest.TestCase):
         left = [p for p in self.cfg.source_dir.rglob("*_BC1*")]
         self.assertEqual(left, [])
 
+    def stop_partway(self, at=150):
+        """A continue (A) run of 250 more files in batches of 100; Stop during the second batch."""
+        self.settings(batch_files=100, date_range=None)
+        self.CANDIDATES = self.CANDIDATES + self.many(250)
+        stop = threading.Event()
+
+        def report(step, message="", done=0, total=None):
+            if step == "stage" and done >= at:
+                stop.set()
+
+        summary = lb.run(self.cfg, lambda *_: self.CANDIDATES, report=report, stop=stop)
+        self.assertEqual(summary["status"], "stopped")
+        return summary
+
+    def next_day(self):
+        """A fresh Config, as after closing the program and restarting the PC."""
+        mochi = self.cfg.mochi
+        self.cfg = lb.Config(self.tmp / "config.json")
+        self.cfg.mochi = mochi
+
+    def no_query(self, *_):
+        self.fail("continuing a stopped run must not ask SQL Server again")
+
+    def test_stopped_run_continues_next_day_without_a_new_scan(self):
+        summary = self.stop_partway()
+        self.assertEqual(summary["files_moved"], 100)
+        kept = lb.stopped_run(self.cfg)
+        self.assertEqual(kept["total"], 252)
+        self.assertGreater(kept["left"], 0)
+        self.next_day()
+        with unittest.mock.patch.object(lb, "scan", side_effect=AssertionError("no new scan")):
+            summary = lb.run(self.cfg, self.no_query, continue_stopped=True)
+        self.assertEqual((summary["status"], summary["errors"]), ("done", 0))
+        self.assertEqual(summary["resumed"] + summary["files_moved"], 152)  # the staged batch, then the rest
+        self.assertEqual(len(self.head("2026-08")[0]), 251)
+        self.assertEqual(list(self.cfg.source_dir.rglob("*_BC1*")), [])
+        self.assertIsNone(lb.stopped_run(self.cfg))
+        db = connect(self, self.cfg.db_path)
+        self.assertEqual(db.execute("SELECT status, total_files_moved FROM scan_session WHERE query_to_date"
+                                    " != 'resumed'").fetchall(), [("success", 252)])  # one run, over two days
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM pending_file").fetchone()[0], 0)
+
+    def test_continue_skips_files_removed_meanwhile(self):
+        self.stop_partway()
+        removed = [p for p in self.cfg.source_dir.rglob("*_BC12*")][:10]
+        for p in removed:
+            p.unlink()
+        self.next_day()
+        summary = lb.run(self.cfg, self.no_query, continue_stopped=True)
+        self.assertEqual((summary["status"], summary["errors"]), ("done", 0))
+        self.assertEqual(list(self.cfg.source_dir.rglob("*_BC1*")), [])
+
+    def test_continue_with_the_log_folder_unreachable_keeps_the_plan(self):
+        self.stop_partway()
+        left = lb.stopped_run(self.cfg)["left"]
+        away = self.tmp / "src-offline"
+        self.cfg.source_dir.rename(away)  # the NAS is not mounted yet
+        with self.assertRaisesRegex(lb.BackupError, "cannot be reached"):
+            lb.run(self.cfg, self.no_query, continue_stopped=True)
+        self.assertEqual(lb.stopped_run(self.cfg)["left"], left)
+        away.rename(self.cfg.source_dir)
+        self.assertEqual(lb.run(self.cfg, self.no_query, continue_stopped=True)["status"], "done")
+        self.assertEqual(list(self.cfg.source_dir.rglob("*_BC1*")), [])
+
+    def test_new_run_replaces_a_stopped_plan_and_finds_its_files(self):
+        self.stop_partway()
+        summary = self.run_backup()
+        self.assertEqual(summary["status"], "done")
+        self.assertIsNone(lb.stopped_run(self.cfg))
+        self.assertEqual(len(self.head("2026-08")[0]), 251)
+
+    def stop_custom(self, window=("2026-08-01", "2026-08-31")):
+        """A custom-range (B) run of 250 more files in batches of 100, stopped in the second batch."""
+        self.settings(batch_files=100)
+        extra = self.many(250)
+        stop = threading.Event()
+
+        def report(step, message="", done=0, total=None):
+            if step == "stage" and done >= 150:
+                stop.set()
+
+        summary = lb.run(self.cfg, lambda *_: extra, report=report, stop=stop, window=window)
+        self.assertEqual(summary["status"], "stopped")
+        return lb.stopped_run(self.cfg)
+
+    def stop_while_staging(self, rows, window=None):
+        """Runs on `rows`, pressing Stop as soon as staging reports. Returns the status."""
+        stop = threading.Event()
+
+        def report(step, *_):
+            if step == "stage":
+                stop.set()
+
+        return lb.run(self.cfg, lambda *_: rows, report=report, stop=stop, window=window)["status"]
+
+    def test_stopped_custom_run_survives_other_runs_then_continues(self):
+        kept = self.stop_custom()
+        self.assertTrue(kept["custom"])
+        summary = self.run_backup()  # the regular A run meanwhile, to the end
+        self.assertEqual(summary["status"], "done")
+        self.assertEqual([r["sid"] for r in lb.stopped_runs(self.cfg)], [kept["sid"]])  # B is still there
+        self.next_day()
+        summary = lb.run(self.cfg, self.no_query, continue_stopped=kept["sid"])
+        self.assertEqual((summary["status"], summary["window"]), ("done", ("2026-08-01", "2026-08-31")))
+        self.assertEqual(lb.stopped_runs(self.cfg), [])
+        self.assertEqual(list(self.cfg.source_dir.rglob("*_BC1*")), [])
+        self.assertEqual(len(self.head("2026-08")[0]), 251)
+        db = connect(self, self.cfg.db_path)
+        b_session = db.execute("SELECT status FROM scan_session WHERE id = ?", (kept["sid"],)).fetchone()
+        self.assertEqual(b_session, ("success",))
+
+    def test_two_stopped_runs_continue_separately(self):
+        a = self.stop_partway()  # an A run stopped
+        self.write("ESS/extra_BC2000.txt", b"for B")
+        extra = [("BC2000", "2026-07-15 08:00:00")]
+        self.assertEqual(self.stop_while_staging(extra, window=("2026-07-01", "2026-07-31")), "stopped")  # a B run
+        runs = lb.stopped_runs(self.cfg)
+        self.assertEqual([r["custom"] for r in runs], [False, True])
+        self.assertEqual(a["status"], "stopped")
+        for r in runs:
+            self.assertEqual(lb.run(self.cfg, self.no_query, continue_stopped=r["sid"])["status"], "done")
+        self.assertEqual(lb.stopped_runs(self.cfg), [])
+        self.assertEqual(list(self.cfg.source_dir.rglob("*_BC1*")) + list(self.cfg.source_dir.rglob("*BC2000*")), [])
+
+    def test_new_continue_run_replaces_only_a_stopped_continue_run(self):
+        kept_b = self.stop_custom()
+        self.settings(batch_files=100, date_range=None)
+        self.write("ESS/late_BC3000.txt", b"a")
+        self.assertEqual(self.stop_while_staging([("BC3000", "2026-08-11 08:00:00")]), "stopped")  # an A run
+        self.assertEqual(len(lb.stopped_runs(self.cfg)), 2)
+        self.assertEqual(self.run_backup()["status"], "done")  # a new A run
+        self.assertEqual([r["sid"] for r in lb.stopped_runs(self.cfg)], [kept_b["sid"]])  # only B is left
+
+    def test_copy_staging_on_this_pc_when_the_archive_is_on_a_network_drive(self):
+        with unittest.mock.patch.dict(os.environ, {"FINISAR_BACKUP_HOME": str(self.tmp / "app")}):
+            network = lambda path: str(path).startswith(str(self.tmp / "out")) or str(path).startswith(  # noqa: E731
+                str(self.cfg.source_dir))
+            with unittest.mock.patch.object(lb, "is_network_path", network):
+                self.settings()
+                self.assertEqual((self.cfg.mode, self.cfg.staging_dir), ("copy", self.tmp / "app" / "local" / "staging"))
+                self.assertEqual(self.run_backup()["files_moved"], 2)
+            self.assertFalse((self.tmp / "out" / ".staging").exists())
+            self.assertFalse((self.tmp / "app" / "local" / "staging").exists())  # cleaned up after the run
+
+    def test_index_on_a_network_drive_is_checked_and_copied_first(self):
+        with unittest.mock.patch.dict(os.environ, {"FINISAR_BACKUP_HOME": str(self.tmp / "app")}):
+            on_nas = lambda path: str(path) == str(self.cfg.db_path)  # noqa: E731
+            with unittest.mock.patch.object(lb, "is_network_path", on_nas):
+                self.run_backup()  # the first run creates the index: nothing to copy yet
+                snapshots = self.tmp / "app" / "local" / "index-snapshots"
+                for i in range(7):
+                    with unittest.mock.patch.object(lb.dt, "datetime", unittest.mock.Mock(wraps=lb.dt.datetime)) as clock:
+                        clock.now.return_value = lb.dt.datetime(2026, 1, 1, 0, 0, i)
+                        self.run_backup()
+                kept = sorted(snapshots.glob("index-*.db"))
+                self.assertEqual(len(kept), lb.INDEX_SNAPSHOTS)  # the last 5
+                good = kept[-1]
+                data = bytearray(self.cfg.db_path.read_bytes())
+                data[100:4096] = b"\xff" * (4096 - 100)  # a damaged page (e.g. a dropped connection mid-write)
+                self.cfg.db_path.write_bytes(bytes(data))
+                with self.assertRaisesRegex(lb.BackupError, "looks damaged.*" + good.name):
+                    self.run_backup()
+            self.assertTrue((self.cfg.source_dir / "ESS/BC0011_other.txt").exists())
+
+    def short_of_space(self, where, free=1000):
+        """free_space patched: `free` bytes on the drive of `where`, plenty elsewhere."""
+        real = lb.free_space
+        return unittest.mock.patch.object(
+            lb, "free_space", lambda path: free if str(path).startswith(str(where)) else real(path))
+
+    def test_too_little_staging_space_refuses_before_anything_moves(self):
+        self.copy_mode()
+        self.CANDIDATES = self.CANDIDATES + self.many(50)
+        with self.short_of_space(self.cfg.staging_dir, free=10), unittest.mock.patch.object(
+                lb, "_drive", lambda path: str(path)):
+            with self.assertRaisesRegex(lb.BackupError, "not enough free space: staging"):
+                self.run_backup()
+        self.assertTrue((self.cfg.source_dir / "BURNIN/unit1_BC001_log.txt").is_file())
+        self.assertFalse(self.cfg.manifest.exists())
+        db = connect(self, self.cfg.db_path)
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM scan_session").fetchone()[0], 0)  # nothing recorded
+        self.assertEqual(self.run_backup()["status"], "done")  # with room again
+
+    def test_little_archive_space_only_warns(self):
+        with self.short_of_space(self.cfg.output_dir, free=5), self.assertLogs("logs_backup", "WARNING") as logs:
+            self.assertEqual(self.run_backup()["status"], "done")
+        self.assertTrue(any("may be too little" in line for line in logs.output))
+
+    def test_preview_reports_free_space(self):
+        self.copy_mode()
+        summary = lb.run(self.cfg, lambda *_: self.CANDIDATES, dry_run=True)
+        what = [r["what"].split(" ")[0] for r in summary["space"]]
+        self.assertEqual(what, ["staging", "archives"])
+        self.assertTrue(all(r["ok"] for r in summary["space"]))
+        self.assertEqual(summary["space"][1]["need"], len(b"burnin one") + len(b"ess two"))
+
+    def test_continue_without_room_keeps_the_plan(self):
+        self.stop_partway()
+        left = lb.stopped_run(self.cfg)["left"]
+        self.settings(staging_mode="copy", date_range=None)  # pretend the next day stages on a full disk
+        with self.short_of_space(self.cfg.staging_dir, free=10), unittest.mock.patch.object(
+                lb, "_drive", lambda path: str(path)):
+            with self.assertRaisesRegex(lb.BackupError, "not enough free space"):
+                lb.run(self.cfg, self.no_query, continue_stopped=True)
+        self.assertEqual(lb.stopped_run(self.cfg)["left"], left)
+
+    def test_damaged_copy_is_redone_not_archived(self):
+        self.copy_mode()
+        db = lb.open_index(self.cfg.db_path)
+        self.addCleanup(db.close)
+        entries, _, _ = lb.scan(self.cfg, dict(self.CANDIDATES))
+        lb.stage(self.cfg, lb.start_session(db, "", "x"), entries)
+        damaged = self.cfg.staging_dir / "2026-08/BURNIN/unit1_BC001_log.txt"
+        damaged.write_bytes(b"\0" * len(b"burnin one"))  # e.g. a power cut before the copy reached the disk
+        with self.assertLogs("logs_backup", "WARNING"):
+            result = lb.finish_staged(db, self.cfg)
+        self.assertEqual((result["files_moved"], result["errors"]), (1, 1))
+        self.assertTrue((self.cfg.source_dir / "BURNIN/unit1_BC001_log.txt").is_file())  # original kept
+        self.assertFalse(lb.Path(self.cfg.archive("2026-08")).exists())  # nothing damaged was archived
+        self.assertFalse(self.cfg.staging_dir.exists())
+        self.CANDIDATES = [("BC001", "2026-08-03 10:00:00")]
+        self.run_backup()
+        self.assertEqual(self.head("2026-08")[0]["BURNIN/unit1_BC001_log.txt"],
+                         lb.blake3.blake3(b"burnin one").hexdigest())
+
+    def test_unjournaled_copies_are_redone(self):
+        self.copy_mode()
+        db = lb.open_index(self.cfg.db_path)
+        self.addCleanup(db.close)
+        entries, _, _ = lb.scan(self.cfg, dict(self.CANDIDATES))
+        lb.stage(self.cfg, lb.start_session(db, "", "x"), entries)
+        self.cfg.journal.unlink()  # a crash after the copies, before their journal reached the disk
+        with self.assertLogs("logs_backup", "WARNING"):
+            result = lb.finish_staged(db, self.cfg)
+        self.assertEqual((result["files_moved"], result["errors"]), (0, 2))
+        self.assertTrue((self.cfg.source_dir / "ESS/unit2_BC002.txt").is_file())
+        self.assertEqual(self.run_backup()["files_moved"], 2)
+
     def test_stop_while_resuming_keeps_the_rest_for_later(self):
         db = lb.open_index(self.cfg.db_path)
         self.addCleanup(db.close)
@@ -521,7 +760,7 @@ class Flow(unittest.TestCase):
     def test_callbacks_report_steps_and_cancel_moves_nothing(self):
         steps = []
         summary = lb.run(self.cfg, lambda *_: self.CANDIDATES, report=lambda step, *_: steps.append(step),
-                         confirm=lambda volumes: False)
+                         confirm=lambda volumes, space: False)
         self.assertEqual(summary["status"], "cancelled")
         self.assertEqual(summary["volumes"], {"2026-07": (1, 1, 7), "2026-08": (1, 1, 10)})  # barcodes, files, bytes
         self.assertEqual((summary["candidates"], summary["matched_barcodes"], summary["matched_files"]), (3, 2, 2))
@@ -530,7 +769,7 @@ class Flow(unittest.TestCase):
         self.assertEqual(connect(self, self.cfg.db_path).execute("SELECT COUNT(*) FROM scan_session").fetchone()[0], 0)
 
         summary = lb.run(self.cfg, lambda *_: self.CANDIDATES, report=lambda step, *_: steps.append(step),
-                         confirm=lambda volumes: True)
+                         confirm=lambda volumes, space: True)
         self.assertEqual((summary["files_moved"], summary["barcodes"]), (2, 2))
         self.assertIn("commit", steps)
 

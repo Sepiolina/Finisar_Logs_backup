@@ -87,17 +87,26 @@ def volume_table(volumes, status):
 
 def ask_confirm(progress, yes):
     """The confirm callback: shows what would be archived and asks before anything moves."""
-    def confirm(volumes):
+    def confirm(volumes, space=()):
         if yes:
             return True
         progress.stop()
         console.print(volume_table(volumes, "[yellow]to archive"))
+        print_space(space)
         barcodes, files, nbytes = totals(volumes)
         answer = Confirm.ask(f"Archive {barcodes:,} barcodes ({files:,} files, {size(nbytes)})"
                              f" into {len(volumes)} monthly archive(s)?", default=False)
         progress.start()
         return answer
     return confirm
+
+
+def print_space(rows):
+    for r in rows:
+        mark = ("[green]✓" if r["ok"] else "[dim]?" if r["ok"] is None
+                else "[red]✗" if r["required"] else "[yellow]⚠")
+        free = "unknown" if r["free"] is None else size(r["free"])
+        console.print(f"{mark}[/] free space, {r['what']}: {free} free, needs {size(r['need'])}  [dim]{r['path']}")
 
 
 def print_summary(summary):
@@ -109,6 +118,8 @@ def print_summary(summary):
              "stopped": "[yellow]committed before the stop"}[status]
     if summary["volumes"]:
         console.print(volume_table(summary["volumes"], label))
+    if status == "dry_run":
+        print_space(summary.get("space") or [])
     date_from, date_to = summary["window"]
     lines = [f"Window      {date_from or '(start)'} .. {date_to}",
              f"Candidates  {summary['candidates']:,} barcodes",
@@ -121,7 +132,8 @@ def print_summary(summary):
     else:
         lines.append("Dry run: nothing moved")
     if status == "stopped":
-        lines.append("[yellow]Stopped. Nothing is lost: run again to continue where it stopped.")
+        lines.append(f"[yellow]Stopped with {summary.get('left', 0):,} files left. Nothing is lost: you can shut down;"
+                     " the next run continues where it stopped.")
     lines.append(f"Errors      {summary['errors']:,}")
     if status == "done":
         lines.append("[dim]Committed is not a backup: keep an independent copy (--export DIR to another drive).")
@@ -218,6 +230,8 @@ def main():
     parser.add_argument("--yes", action="store_true", help="do not ask before moving files")
     parser.add_argument("--check-sql", action="store_true", help="only check that mochi and SQL Server are reachable")
     parser.add_argument("--export", metavar="DIR", help="copy archives, index and config to DIR, then stop")
+    parser.add_argument("--new", action="store_true",
+                        help="start a new run even if a stopped one could continue (its plan is dropped)")
     args = parser.parse_args()
 
     try:
@@ -251,11 +265,31 @@ def main():
         check_setup(cfg)
         return
 
+    # Stopped runs continue first, oldest first (a scheduled task picks up where they stopped);
+    # with none (or --new), a new run.
+    stopped = [] if args.dry_run or args.new else lb.stopped_runs(cfg)
+    for kept in stopped or [None]:
+        if kept:
+            date_from, date_to = kept["window"]
+            kind = "custom range" if kept["custom"] else "continue"
+            console.print(Panel(f"Continuing the stopped run ({kind}) {date_from or '(start)'} .. {date_to}: "
+                                f"{kept['left']:,} of {kept['total']:,} files left (no new scan).\n"
+                                "To start a new run instead: --new", border_style="cyan"))
+        summary = run_once(cfg, args, kept["sid"] if kept else False)
+        print_summary(summary)
+        if summary["status"] == "done" and cfg.email:
+            lb.send_email(cfg, summary)
+        if summary["status"] == "stopped":
+            break
+
+
+def run_once(cfg, args, continue_stopped):
     with Progress(*COLUMNS, console=console) as progress:
         steps = Steps(progress)
         try:
-            summary = run_stoppable(lambda stop: lb.run(cfg, dry_run=args.dry_run, report=steps,
-                                                        confirm=ask_confirm(progress, args.yes), stop=stop))
+            return run_stoppable(lambda stop: lb.run(cfg, dry_run=args.dry_run, report=steps,
+                                                     confirm=ask_confirm(progress, args.yes), stop=stop,
+                                                     continue_stopped=continue_stopped))
         except Exception as e:
             steps.fail_running()
             progress.stop()
@@ -264,9 +298,6 @@ def main():
                                 "Run again to continue where this run stopped. Details: backup.log",
                                 title="Run failed", border_style="red"))
             sys.exit(1)
-    print_summary(summary)
-    if summary["status"] == "done" and cfg.email:
-        lb.send_email(cfg, summary)
 
 
 if __name__ == "__main__":

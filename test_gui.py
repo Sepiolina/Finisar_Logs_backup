@@ -99,6 +99,7 @@ class Window(unittest.TestCase):
             self.wait(lambda: page.job is None)
         self.assertEqual(threads, {threading.main_thread()})
         self.assertIn("2 files would be archived", page.banner.text())
+        self.assertIn("Free space", page.banner.text())
         self.assertTrue((self.tmp / "src/BURNIN/unit1_BC001_log.txt").exists())
 
     @unittest.skipUnless(MOCHI, "mochi CLI not found (set MOCHI_BIN)")
@@ -131,10 +132,22 @@ class Window(unittest.TestCase):
             with unittest.mock.patch.object(gui.BackupPage, "on_progress", stop_during_staging):
                 page.a_start.click()
                 self.wait(lambda: page.job is None)
-            self.assertIn("Stopped.", page.banner.text())
-            page.a_start.click()
+            self.assertEqual(len(page.stopped_cards), 1)
+            self.assertIn("Stopped</b> with", page.banner.text())
+        # As after closing the program and restarting the PC: a new window, the stopped run offered.
+        self.window.close()
+        self.window = gui.MainWindow(self.handler, self.tmp / "backup.log")
+        page = self.window.backup_page
+        self.assertFalse(page.stopped_area.isHidden())
+        frame, label, go_on, _ = page.stopped_cards[0]
+        self.assertIn("files left", label.text())
+        with unittest.mock.patch.object(lb, "query_candidates", side_effect=AssertionError("no new query")):
+            go_on.click()
             self.wait(lambda: page.job is None)
         self.assertIn("Done.", page.banner.text())
+        self.assertEqual(page.stopped_cards, [])
+        self.assertTrue(page.stopped_area.isHidden())
+        self.assertIn("continue", self.window.history_page.table.item(0, 3).text())
         self.assertEqual(list((self.tmp / "src").rglob("*_BC*")), [])
         files, _ = lb.head_files(lb.Config(lb.find_config()), self.tmp / "out/2026/2026-08.mochi")
         self.assertEqual(len(files), 301)
