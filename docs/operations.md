@@ -58,10 +58,42 @@ Install, configure, run, get files back, move to another PC, and fix problems.
    cannot be found. A dry run only warns. A Python venv makes no difference: it
    changes which Python runs, not where programs are found.
 
+## Desktop app
+
+```bash
+python gui.py
+```
+
+On Windows: double-click `run_app.bat`, or `FinisarLogsBackup.exe` once built (below).
+
+| Page | What it does |
+|---|---|
+| **Backup** | Two separate ways to run. **A · Continue from the last run** (the regular backup) shows the date range it would use. **B · Custom date range** takes any From/To dates; it never changes where A starts. Each has **Preview** (moves nothing) and **Start backup** (asks before any file moves). While a run goes: a row per step with progress, counts and time, the log, and **Stop**. |
+| **History** | Every run in the index: when, status, mode (continue, custom, resumed), date range, counts |
+| **Settings** | Everything from the table under [Configure](#configure), with Browse buttons. **Save** checks the values first. |
+| **Tools** | **Run check** (finds `mochi`, one SQL Server connection), **Export to…** (see [Export](#export-a-copy-of-everything-to-restore-from)), open the log file or the settings folder |
+
+**Settings are saved per Windows user** in `%APPDATA%\FinisarLogsBackup\settings.json` (the same
+keys as `config.json`). On the first start the app imports a `config.json` from the current folder
+or next to the program, if there is one; **Import config.json…** does it later. The run log is
+`backup.log` in the same folder.
+
+**The SQL Server password** is asked when a run starts and kept until the app closes. With
+**Remember the password** it is saved encrypted with Windows DPAPI for the current Windows user:
+only that user, on that PC, can decrypt it. Another user, or a copied settings file, cannot.
+
+**Stop** ends the run at the next safe point: between files while scanning or staging, or before
+the next month's commit. A `mochi` commit that has started is finished first (stopping it could
+leave a broken archive tail), so a stop can take as long as one batch's commit. Nothing is lost:
+staged files are finished by the next run (the **Finish the previous run** row), the rest are
+found again by its scan. A stopped run is recorded as failed, so **Continue** covers its dates again.
+Closing the window during a run asks, then stops the same way and closes.
+
 ## Single-file .exe (Windows)
 
-`build_exe.bat` packs Python, the code and its libraries into one `FinisarLogsBackup.exe`, so the
-PC that runs the backup does not need Python. Build it on any Windows PC with Python 3.9 or newer:
+`build_exe.bat` packs Python, the code and its libraries into `dist\FinisarLogsBackup.exe` (the desktop
+app) and `dist\FinisarLogsBackupCLI.exe` (the terminal version), so the PC that runs the backup does
+not need Python. Build it on any Windows PC with Python 3.9 or newer:
 
 ```bash
 build_exe.bat
@@ -72,22 +104,22 @@ What it does:
 1. creates a virtual environment in `.venv` the first time (with `py -3`, else `python`), so nothing
    goes into the system Python;
 2. installs `requirements.txt` and PyInstaller into `.venv`;
-3. runs the tests and stops if they fail;
-4. writes `dist\FinisarLogsBackup.exe` and copies `config.example.json` next to it.
+3. runs the tests (`test_logs_backup`, and `test_gui` without a screen) and stops if they fail;
+4. writes `dist\FinisarLogsBackup.exe` and `dist\FinisarLogsBackupCLI.exe`.
 
 `build_exe.bat clean` deletes `.venv`, `build` and `dist` first and builds from scratch.
 
-To use the `.exe`, put it in a folder together with `config.json`. It looks for `config.json` in the
-current folder first, then in the `.exe`'s folder, and writes `backup.log` next to the config. Double-click
-it for a normal run (the window waits for Enter at the end), or run it from a terminal with the same
-options as `backup_ui.py`:
+Double-click `FinisarLogsBackup.exe` and fill in Settings. `FinisarLogsBackupCLI.exe` takes the same
+options as `backup_ui.py`; it uses a `config.json` in the current folder or the `.exe`'s folder if there
+is one, else the settings the app saved, and writes `backup.log` next to whichever it used. For a
+scheduled task, save the password in the app (Remember) as the same Windows user the task runs as:
 
 ```bash
-FinisarLogsBackup.exe --check-sql
+FinisarLogsBackupCLI.exe --check-sql
 ```
 
 ```bash
-FinisarLogsBackup.exe --dry-run
+FinisarLogsBackupCLI.exe --yes
 ```
 
 The `.exe` does not contain `mochi.exe`. It finds it the same way as the Python version (step 3 of
@@ -97,10 +129,11 @@ Once `.venv` exists, `run_backup.bat` uses it too.
 
 ## Configure
 
-Copy `config.example.json` to `config.json`, next to the program.
+The desktop app's Settings page writes all of this for you. To use a file instead, copy
+`config.example.json` to `config.json`, next to the program.
 
-The commands find the config on their own: `config.json` in the folder you run
-them from, else the one next to `backup_ui.py`. To use another file, pass its
+The commands find the settings on their own: `config.json` in the folder you run
+them from, else the one next to `backup_ui.py`, else the settings the desktop app saved. To use another file, pass its
 path last, for example `python backup_ui.py --dry-run D:/configs/line2.json`.
 
 > **Windows paths:** write them with `/` (`E:/archive`) or doubled `\\`
@@ -120,7 +153,8 @@ path last, for example `python backup_ui.py --dry-run D:/configs/line2.json`.
 | `file_threads` | `null`: automatic | How many folders are listed, and files copied or renamed into staging and deleted after the commit, at once. Automatic: **16 when `source_dir` is a network drive** (a mapped drive or `//server/share`), where each call mostly waits on the network; 1 on a local disk, where one thread is fastest. Set 1–64 to override. |
 | `extensions` | `txt, zip` | Allowed file extensions |
 | `lookback_days` | `2` | The newest `N` days are left for the next run |
-| `date_range` | none | `["YYYY-MM-DD", "YYYY-MM-DD"]` to back-fill a fixed window instead |
+| `date_range` | none | `["YYYY-MM-DD", "YYYY-MM-DD"]` to back-fill a fixed window instead. Like the app's custom range, such runs do not move where a continuing run starts. |
+| `batch_files` | `10000` | Files staged and committed per batch (100–1,000,000). A stop waits for at most one batch's commit. Each batch is one MOCHI commit per month it touches. |
 | `mochi` | `null`: found automatically | Full path to `mochi.exe`, only needed if it is not in one of the places [Install](#install-once) step 3 lists |
 | `email` | none | `{"api_base_url": "http://host:port", "to": "a@b.c"}` for a report after each run |
 
@@ -194,14 +228,17 @@ the double-click launcher and scheduled tasks see them.
 | Check that `mochi` is found and SQL Server answers | `python backup_ui.py --check-sql` |
 | Copy everything needed to restore, to another drive | `python backup_ui.py --export E:/finisar_export` (see [Export](#export-a-copy-of-everything-to-restore-from)) |
 | See what would happen | `python backup_ui.py --dry-run` |
-| Run by hand | Double-click `run_backup.bat` or `FinisarLogsBackup.exe`, or `python backup_ui.py` |
+| Run by hand | The desktop app (`run_app.bat` or `FinisarLogsBackup.exe`), or `run_backup.bat` / `python backup_ui.py` |
+| Back-fill old dates | The app's **B · Custom date range** |
+| Stop a running backup | **Stop** in the app, or Ctrl+C in the terminal: the next run continues |
 | Run without the question | `python backup_ui.py --yes` |
 | Plain log output (scheduled task) | `python logs_backup.py` |
 
-Every run continues where the last successful one ended, so running by hand
-every few days or weeks is fine. If a run is stopped (window closed, power cut),
-the next run finishes its leftover batch first. The UI writes a full log to
-`backup.log` next to `config.json`.
+Every continuing run starts where the last successful continuing one ended, so
+running by hand every few days or weeks is fine. If a run is stopped (Stop, window
+closed, power cut), the next run finishes its leftover batch first. The app writes a
+full log to `backup.log` in its settings folder; the terminal UI next to the settings
+file it used.
 
 ## Get files back
 

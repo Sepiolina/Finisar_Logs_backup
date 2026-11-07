@@ -14,6 +14,7 @@ archive was verified and indexed; on any failure they stay, and the next run
 resumes them first.
 """
 import argparse
+import base64
 import contextlib
 import copy
 import datetime as dt
@@ -43,6 +44,8 @@ MANIFEST_BATCH = 2000  # manifest lines synced before the matching files are mov
 WORKERS = min(os.cpu_count() or 1, 8)  # hashing threads, and months committed side by side
 NETWORK_FILE_THREADS = 16  # folders listed, files copied/renamed/deleted at once on a network drive
 STAGING_SPACE_MARGIN = 1.1  # copy staging needs the batch's size plus this margin free
+BATCH_FILES = 10_000  # files staged and committed per batch: a stop waits for at most one batch's commit
+APP_NAME = "FinisarLogsBackup"
 PROGRESS_EVERY = 100  # files between progress updates while staging
 
 SCHEMA_VERSION = 2
@@ -91,12 +94,23 @@ CREATE TABLE IF NOT EXISTS scanned_log_entry (
     UNIQUE(relative_path, file_storage_volume_id)
 );
 CREATE INDEX IF NOT EXISTS idx_scanned_log_entry_barcode ON scanned_log_entry(barcode);
+-- Sessions run on a custom date range: "continue" ignores them when it picks its start date.
+CREATE TABLE IF NOT EXISTS custom_window_session (scan_session_id INTEGER PRIMARY KEY REFERENCES scan_session(id));
 CREATE INDEX IF NOT EXISTS idx_session_barcode_session ON session_barcode(scan_session_id);
 """
 
 
 class BackupError(Exception):
     pass
+
+
+class Stopped(Exception):
+    """Raised inside a run when its stop event is set. The run returns status "stopped"."""
+
+
+def check_stop(stop):
+    if stop is not None and stop.is_set():
+        raise Stopped
 
 
 def now():
@@ -106,7 +120,8 @@ def now():
 def quiet(step, message="", done=0, total=None):
     """Default progress callback: does nothing. A front end (backup_ui.py) passes its own.
 
-    step is one of "resume", "query", "scan", "stage", "commit"; total None means unknown."""
+    step is one of "resume", "query", "scan", "stage", "commit"; total None means unknown.
+    "stage" and "commit" count files over the whole run (a run works in batches of BATCH_FILES)."""
 
 
 # ---------------------------------------------------------------- config
@@ -119,22 +134,103 @@ def program_dir():
     return Path(__file__).resolve().parent
 
 
+def settings_dir():
+    """Where the desktop app keeps its settings and log: %APPDATA%\\FinisarLogsBackup on Windows,
+    ~/.config/FinisarLogsBackup elsewhere. FINISAR_BACKUP_HOME overrides it (tests, portable use)."""
+    if os.environ.get("FINISAR_BACKUP_HOME"):
+        return Path(os.environ["FINISAR_BACKUP_HOME"])
+    base = os.environ.get("APPDATA") if os.name == "nt" else os.environ.get("XDG_CONFIG_HOME")
+    return Path(base or Path.home() / ".config") / APP_NAME
+
+
+def settings_path():
+    return settings_dir() / "settings.json"
+
+
+def load_settings(path=None):
+    """The saved settings (the same keys as config.json), or None if none were saved yet."""
+    path = Path(path or settings_path())
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        raise BackupError(f"cannot read the settings {path}: {e}") from e
+
+
+def save_settings(raw, path=None):
+    """Writes the settings atomically (a crash never leaves half a file). Returns the path."""
+    path = Path(path or settings_path())
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+    return path
+
+
 def find_config(given=None):
-    """The config file: `given` if passed, else config.json in the current folder, else next to this program."""
+    """The settings file: `given` if passed, else config.json in the current folder, else next to this
+    program, else the settings the desktop app saved (settings_path())."""
     if given:
         return Path(given)
-    places = [Path.cwd() / "config.json", program_dir() / "config.json"]
+    places = [Path.cwd() / "config.json", program_dir() / "config.json", settings_path()]
     found = next((p for p in places if p.is_file()), None)
     if not found:
-        raise BackupError("no config.json found in " + " or ".join(str(p.parent) for p in places)
-                          + ": copy config.example.json to config.json there, or pass the config's path")
+        raise BackupError("no settings found: open the desktop app (FinisarLogsBackup.exe) and fill in Settings,"
+                          " or copy config.example.json to config.json in " + str(places[0].parent))
     return found
 
 
+# ---------------------------------------------------------------- saved password (Windows DPAPI)
+
+def _dpapi(data, encrypt):
+    """CryptProtectData / CryptUnprotectData for the current Windows user (no prompt)."""
+    import ctypes
+    from ctypes import wintypes
+
+    class Blob(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+    buf = ctypes.create_string_buffer(data, len(data))
+    blob_in, blob_out = Blob(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char))), Blob()
+    crypt32 = ctypes.windll.crypt32
+    fn = crypt32.CryptProtectData if encrypt else crypt32.CryptUnprotectData
+    if not fn(ctypes.byref(blob_in), None, None, None, None, 0x1, ctypes.byref(blob_out)):  # UI_FORBIDDEN
+        raise BackupError("Windows could not " + ("encrypt" if encrypt else "decrypt") + " the saved password"
+                          + ("" if encrypt else " (saved by another Windows user?): enter it again in Settings"))
+    try:
+        return ctypes.string_at(blob_out.pbData, blob_out.cbData)
+    finally:
+        ctypes.windll.kernel32.LocalFree(ctypes.cast(blob_out.pbData, ctypes.c_void_p))
+
+
+def can_protect():
+    return os.name == "nt"
+
+
+def protect(text):
+    """The password encrypted for this Windows user (DPAPI), as text for the settings file."""
+    if not can_protect():
+        raise BackupError("saving the password is only available on Windows")
+    return base64.b64encode(_dpapi(text.encode("utf-8"), True)).decode("ascii")
+
+
+def unprotect(token):
+    if not can_protect():
+        raise BackupError("the saved password can only be read on Windows, by the user who saved it")
+    return _dpapi(base64.b64decode(token), False).decode("utf-8")
+
+
 class Config:
-    def __init__(self, path):
-        self.path = Path(path)
-        raw = json.loads(self.path.read_text(encoding="utf-8"))
+    def __init__(self, path=None, raw=None):
+        """From a settings file (config.json or the app's settings.json), or from `raw`, a dict with
+        the same keys (the desktop app)."""
+        self.path = Path(path) if path else None
+        if raw is None:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        for key in ("source_dir", "output_dir", "db_path"):
+            if not raw.get(key):
+                raise KeyError(key)
         self.source_dir = Path(raw["source_dir"])
         self.output_dir = Path(raw["output_dir"])
         # "move": files are renamed into staging, which must be on the source drive (default there).
@@ -154,6 +250,10 @@ class Config:
                                                   and not isinstance(self.file_threads, bool)
                                                   and 1 <= self.file_threads <= 64):
             raise BackupError('"file_threads" in config.json must be a whole number from 1 to 64, or null')
+        self.batch_files = raw.get("batch_files") or BATCH_FILES
+        if not (isinstance(self.batch_files, int) and not isinstance(self.batch_files, bool)
+                and 100 <= self.batch_files <= 1_000_000):
+            raise BackupError('"batch_files" in config.json must be a whole number from 100 to 1000000, or null')
         self.recursive = raw.get("recursive", True)  # scan folders inside each subfolder too
         if not isinstance(self.recursive, bool):
             raise BackupError('"recursive" in config.json must be true or false')
@@ -164,11 +264,14 @@ class Config:
         self.mochi = raw.get("mochi")  # None: found by check_mochi() (PATH, cargo's bin, a MOCHI checkout)
         self.email = raw.get("email")  # optional {"api_base_url": ..., "to": ...}
         # SQL Server login: "sql_server" in config.json, each value overridden by its DB_* variable.
-        # A missing password is asked for by backup_ui.py (hidden) instead of being stored.
+        # A missing password is asked for by the front end (hidden) instead of being stored, unless the
+        # desktop app saved it encrypted for this Windows user ("password_dpapi").
         sql, env = raw.get("sql_server") or {}, os.environ
         self.sql = {key: env.get(var) or sql.get(key) for key, var in (
             ("server", "DB_SERVER"), ("port", "DB_PORT"), ("database", "DB_NAME"),
             ("user", "DB_USER"), ("password", "DB_PASSWORD"), ("encryption", "DB_ENCRYPTION"))}
+        if not self.sql["password"] and sql.get("password_dpapi"):
+            self.sql["password"] = unprotect(sql["password_dpapi"])
         for name in ("source_dir", "output_dir", "staging_dir", "db_path"):
             if any(ord(c) < 32 for c in str(getattr(self, name))):  # "E:\backup" in JSON is E: + backspace + ackup
                 raise BackupError(f"{name} in config.json has a broken path: write Windows paths with / (E:/backup)")
@@ -264,13 +367,27 @@ def complete_session(db, sid, status, barcodes=0, moved=0, errors=0):
             (now(), status, barcodes, moved, errors, sid))
 
 
-def query_window(db, cfg):
-    """(from, to): from = last successful to-date - 1 day (None on the first run), to = today - lookback."""
-    if cfg.date_range:
-        return tuple(cfg.date_range)
+def check_window(window):
+    """A custom (from, to) window as two ISO dates, from <= to. Raises BackupError otherwise."""
+    try:
+        start, end = (dt.date.fromisoformat(str(d)) for d in window)
+    except (TypeError, ValueError) as e:
+        raise BackupError(f"the date range must be two dates YYYY-MM-DD: {window!r}") from e
+    if start > end:
+        raise BackupError(f"the date range starts after it ends: {start} .. {end}")
+    return start.isoformat(), end.isoformat()
+
+
+def query_window(db, cfg, window=None):
+    """(from, to). A custom window (argument, else "date_range" in the settings) is used as is.
+    Otherwise it continues: from = the last successful continuing run's to-date - 1 day (None on the
+    first run), to = today - lookback_days. Custom-range runs never move where "continue" starts."""
+    if window or cfg.date_range:
+        return check_window(window or cfg.date_range)
     to = dt.datetime.now(dt.timezone.utc).date() - dt.timedelta(days=cfg.lookback_days)
-    row = db.execute("SELECT query_to_date FROM scan_session WHERE status = 'success'"
-                     " AND query_to_date != 'resumed' ORDER BY id DESC LIMIT 1").fetchone()
+    row = db.execute("SELECT query_to_date FROM scan_session s WHERE status = 'success'"
+                     " AND query_to_date != 'resumed' AND NOT EXISTS (SELECT 1 FROM custom_window_session c"
+                     " WHERE c.scan_session_id = s.id) ORDER BY id DESC LIMIT 1").fetchone()
     start = dt.date.fromisoformat(row[0]) - dt.timedelta(days=1) if row else None
     return (start.isoformat() if start else None), to.isoformat()
 
@@ -331,6 +448,19 @@ def query_candidates(sql_login, date_from, date_to):
            " JOIN ForthUtilities.dbo.ShipmentFinisarTrace sft WITH (NOLOCK) ON sfs.trace_id = sft.trace_id"
            f" WHERE {where}")
     return [(str(b).strip(), str(d)) for b, d in run_sql(sql_login, sql, params)]
+
+
+def continue_window(cfg):
+    """The window a "continue" run would use now, for display. Does not create the index."""
+    if not cfg.db_path.is_file():  # first run: everything up to today - lookback_days
+        db = sqlite3.connect(":memory:")
+        db.executescript(SCHEMA)
+    else:
+        db = open_index(cfg.db_path)
+    try:
+        return query_window(db, cfg)
+    finally:
+        db.close()
 
 
 def check_sql(sql_login):
@@ -409,18 +539,22 @@ def walk_files(top, recursive, skip, on_error, threads=1):
 
     with ThreadPoolExecutor(max(threads, 1)) as pool:
         pending = {pool.submit(listing, (Path(top), ""))}
-        while pending:
-            done, pending = wait(pending, return_when=FIRST_COMPLETED)
-            for job in done:
-                folder, rel, files, folders, error = job.result()
-                pending |= {pool.submit(listing, f) for f in folders}
-                if error:
-                    on_error(folder, error)
-                for item in files:
-                    yield rel, item
+        try:
+            while pending:
+                done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                for job in done:
+                    folder, rel, files, folders, error = job.result()
+                    pending |= {pool.submit(listing, f) for f in folders}
+                    if error:
+                        on_error(folder, error)
+                    for item in files:
+                        yield rel, item
+        finally:  # the caller stopped early (a stop, an error): list nothing more
+            for job in pending:
+                job.cancel()
 
 
-def scan(cfg, dates, report=quiet):
+def scan(cfg, dates, report=quiet, stop=None):
     """Matched files as manifest entries, plus error and scanned-file counts. Each subfolder is scanned
     at every depth (config "recursive", default on); the staging and output folders are never entered."""
     entries, errors, seen = [], 0, 0
@@ -434,8 +568,10 @@ def scan(cfg, dates, report=quiet):
     for sub in cfg.subfolders:
         for rel, item in walk_files(cfg.source_dir / sub, cfg.recursive, skip, unreadable, cfg.threads):
             seen += 1
+            if seen % 200 == 0:
+                check_stop(stop)
             if seen % 2000 == 0:
-                report("scan", f"{len(entries)} matches", seen)
+                report("scan", f"{len(entries):,} matches", seen)
             if not has_extension(item.name, cfg.extensions):
                 continue
             found = find_barcodes(item.name, dates)
@@ -450,7 +586,7 @@ def scan(cfg, dates, report=quiet):
             st = item.stat()  # on Windows from the folder listing: no extra round trip
             entries.append({"relative_path": f"{sub}/{rel}{item.name}", "source_subfolder": sub, "barcode": barcode,
                             "original_size": st.st_size, "mtime_ns": st.st_mtime_ns, "volume_name": month})
-    report("scan", f"{len(entries)} matches", seen, seen)
+    report("scan", f"{len(entries):,} matches", seen, seen)
     log.info("scanned %d files, %d matches", seen, len(entries))
     return entries, errors, seen
 
@@ -482,13 +618,15 @@ def staged_path(cfg, entry):
 
 # ---------------------------------------------------------------- stage
 
-def stage(cfg, sid, entries, report=quiet):
+def stage(cfg, sid, entries, report=quiet, stop=None):
     """Puts files into staging/<YYYY-MM>/<SUB>/; the manifest lists each file before it is touched.
 
     cfg.mode "move": renamed there (staging is on the source drive); the staged file is the only copy.
     cfg.mode "copy": copied there (staging on a local disk); the original stays in the source until
     its archive is verified, then finish_staged deletes it if it did not change meanwhile.
     Returns the number of files not staged (they stay in the source; a later run picks them up).
+    A set `stop` ends it early: files not staged yet stay in the source, the staged ones are
+    finished by the next run (as a resumed batch).
     Works on cfg.threads files at once: one on a local disk (measured, threads made renames slower
     there), several on a network drive, where each file mostly waits on the network."""
     errors, mode = 0, cfg.mode
@@ -543,10 +681,14 @@ def stage(cfg, sid, entries, report=quiet):
             manifest.writelines(json.dumps(e) + "\n" for e in batch)
             manifest.flush()
             os.fsync(manifest.fileno())  # the batch is listed on disk before any of it moves
-            for n, failed in enumerate(each(cfg.threads, copy_in if mode == "copy" else move, batch), i + 1):
+            put = copy_in if mode == "copy" else move
+            for n, failed in enumerate(each(cfg.threads, lambda e: 0 if stop and stop.is_set() else put(e), batch),
+                                       i + 1):
                 errors += failed
                 if n % PROGRESS_EVERY == 0 or n == i + len(batch):
                     report("stage", "copying to local staging" if mode == "copy" else "", n, len(entries))
+            if stop is not None and stop.is_set():
+                break
     return errors
 
 
@@ -693,10 +835,12 @@ def commit(cfg, month):
         log.warning("%s: DEGRADED (not an error): %s", month, out.get("durability_note"))
 
 
-def commit_month(cfg, month, entries, resume=False):
+def commit_month(cfg, month, entries, resume=False, stop=None):
     """Commits a month's staged files (one commit), then checks every file and the archive.
 
-    Touches neither SQLite nor staging. Returns (hashes, head)."""
+    Touches neither SQLite nor staging. Returns (hashes, head). A set `stop` is checked before
+    the commit starts; a running `mochi` is never interrupted (that could leave a broken tail)."""
+    check_stop(stop)
     archive, paths = cfg.archive(month), [e["relative_path"] for e in entries]
     with ThreadPoolExecutor(WORKERS) as pool:
         hashing = hash_all(pool, [staged_path(cfg, e) for e in entries])  # runs while mochi commits
@@ -767,8 +911,13 @@ def release(cfg, e, mode):
     return kept
 
 
-def finish_staged(db, cfg, report=quiet, resume=False):
-    """Archives whatever the manifest lists in staging. Returns a summary dict, or None if nothing is staged."""
+def finish_staged(db, cfg, report=quiet, resume=False, stop=None):
+    """Archives whatever the manifest lists in staging. Returns a summary dict (with "archived", the
+    archived entries), or None if nothing is staged.
+
+    Reports "commit" in files of this batch. A set `stop` lets months already committing finish
+    (and be indexed and cleaned up), starts no other, keeps the manifest and raises Stopped:
+    the next run resumes what is left."""
     manifest = read_manifest(cfg)
     if manifest is None:
         return None
@@ -782,26 +931,33 @@ def finish_staged(db, cfg, report=quiet, resume=False):
         if moved:  # listed but never moved: still in the source
             months[e["volume_name"]].append(e)
 
-    archived, failures, errors = [], [], 0
-    report("commit", "", 0, len(months))
+    archived, failures, errors, stopped = [], [], 0, False
+    total = sum(len(es) for es in months.values())
+    report("commit", "committing " + ", ".join(sorted(months)), 0, total)
     with ThreadPoolExecutor(min(WORKERS, max(len(months), 1))) as pool:
-        jobs = {m: pool.submit(commit_month, cfg, m, es, resume) for m, es in months.items()}
+        jobs = {m: pool.submit(commit_month, cfg, m, es, resume, stop) for m, es in months.items()}
         for month, job in sorted(jobs.items()):  # SQLite and deletes stay on this thread
             try:
                 hashes, head = job.result()
                 index_month(db, cfg, sid, month, months[month], hashes, head)
+            except Stopped:
+                stopped = True
+                continue
             except (BackupError, OSError, sqlite3.Error) as e:
                 log.error("%s kept in staging: %s", month, e)
                 failures.append(e)
                 continue
-            report("commit", f"{month} cleaning up", len(plan(archived)), len(months))
+            report("commit", f"{month} cleaning up", len(archived), total)
             kept = sum(each(cfg.threads, lambda e: release(cfg, e, mode), months[month]))
             errors += kept
             archived += months[month]
             log.info("%s: %d files committed (LOCAL_COMMITTED), verified and indexed", month, len(months[month]))
-            report("commit", month, len(plan(archived)), len(months))
+            report("commit", month, len(archived), total)
     if failures:
         raise BackupError(f"{len(failures)} month(s) failed; staging kept for the next run: {failures[0]}")
+    if stopped:
+        log.info("stopped: %d files archived, the rest stays in staging for the next run", len(archived))
+        raise Stopped
 
     cfg.manifest.unlink()
     leftovers = 0
@@ -817,7 +973,7 @@ def finish_staged(db, cfg, report=quiet, resume=False):
     barcodes = len({e["barcode"] for e in archived})
     complete_session(db, sid, "success", barcodes, len(archived), leftovers + errors)
     return {"files_moved": len(archived), "barcodes": barcodes, "errors": leftovers + errors,
-            "volumes": plan(archived)}
+            "volumes": plan(archived), "archived": archived}
 
 
 # ---------------------------------------------------------------- run
@@ -855,15 +1011,21 @@ def plan(entries):
             for month, es in sorted(months.items())}
 
 
-def run(cfg, candidates_fn=None, dry_run=False, report=quiet, confirm=None):
-    """One backup run. Returns a summary dict whose "status" is "done", "dry_run" or "cancelled".
+def run(cfg, candidates_fn=None, dry_run=False, report=quiet, confirm=None, window=None, stop=None):
+    """One backup run. Returns a summary dict whose "status" is "done", "dry_run", "cancelled" or "stopped".
 
     confirm(volumes) -> bool, if given, is asked after the scan and before any file moves;
     False stops the run with nothing moved and nothing recorded.
-    candidates_fn(date_from, date_to) defaults to querying SQL Server (tests pass their own)."""
+    candidates_fn(date_from, date_to) defaults to querying SQL Server (tests pass their own).
+    window: a custom (from, to) date range; None continues from the last run (see query_window).
+    stop: a threading.Event; once set, the run stops at the next safe point (between files while
+    scanning or staging, before the next month's commit) and returns status "stopped". Nothing is
+    lost: the next run finishes what was staged and scans the rest again."""
     candidates_fn = candidates_fn or (lambda date_from, date_to: query_candidates(cfg.sql, date_from, date_to))
+    if window:
+        window = check_window(window)
     with lock_run(cfg):
-        return _run(cfg, candidates_fn, dry_run, report, confirm)
+        return _run(cfg, candidates_fn, dry_run, report, confirm, window, stop)
 
 
 def prepare_folders(cfg):
@@ -879,7 +1041,7 @@ def prepare_folders(cfg):
         log.warning("source_dir %s does not exist: nothing to scan", cfg.source_dir)
 
 
-def _run(cfg, candidates_fn, dry_run, report, confirm):
+def _run(cfg, candidates_fn, dry_run, report, confirm, window=None, stop=None):
     # Checked before anything moves: without mochi, staged files could not be committed.
     try:
         log.info("using %s", check_mochi(cfg))
@@ -889,63 +1051,110 @@ def _run(cfg, candidates_fn, dry_run, report, confirm):
         log.warning("a real run would stop here: %s", e)
     if not dry_run:
         prepare_folders(cfg)
+    log.info("source_dir %s (%s): %s staging in %s, %d thread(s), batches of %d files", cfg.source_dir,
+             "network drive" if cfg.on_network else "local disk", cfg.mode, cfg.staging_dir, cfg.threads,
+             cfg.batch_files)
     db = open_index(cfg.db_path)
     try:
-        return _run_with_index(db, cfg, candidates_fn, dry_run, report, confirm)
+        return _run_with_index(db, cfg, candidates_fn, dry_run, report, confirm, window, stop)
     finally:
         db.close()  # an open connection keeps index.db locked on Windows
 
 
-def _run_with_index(db, cfg, candidates_fn, dry_run, report, confirm):
-    resumed = 0
-    for folder in cfg.staging_dirs() if not dry_run else ():
-        leftover = cfg.with_staging(folder)
-        if not leftover.manifest.exists():
-            continue
-        report("resume", "finishing the batch an earlier run left in staging")
-        # The resumed batch's progress is shown on the "resume" row.
-        finished = finish_staged(db, leftover, lambda _step, *args: report("resume", *args), resume=True)
-        resumed += finished["files_moved"] if finished else 0
-        report("resume", f"{resumed} files", 1, 1)
+def _offset(report, step, offset, total, label=""):
+    """A report callback that shows one batch's progress as part of the whole run."""
+    def batch_report(_step, message="", done=0, _total=None):
+        report(step, " ".join(m for m in (label, message) if m), offset + (done or 0), total)
+    return batch_report
 
-    date_from, date_to = query_window(db, cfg)
-    window = (date_from, date_to)
+
+def _stopped(info, resumed, archived, errors, sid=None):
+    log.info("run stopped: %d files archived in this run; the next run continues", len(archived))
+    return dict(info, status="stopped", resumed=resumed, files_moved=len(archived),
+                barcodes=len({e["barcode"] for e in archived}), volumes=plan(archived), errors=errors,
+                session_id=sid, unmatched=[])
+
+
+def _run_with_index(db, cfg, candidates_fn, dry_run, report, confirm, window=None, stop=None):
+    resumed, info = 0, {"window": (None, None), "candidates": 0, "scanned": 0, "volumes": {},
+                        "matched_barcodes": 0, "matched_files": 0}
+    try:
+        for folder in cfg.staging_dirs() if not dry_run else ():
+            leftover = cfg.with_staging(folder)
+            if not leftover.manifest.exists():
+                continue
+            check_stop(stop)
+            report("resume", "finishing the batch an earlier run left in staging")
+            # The resumed batch's progress is shown on the "resume" row.
+            finished = finish_staged(db, leftover, lambda _step, *args: report("resume", *args), resume=True,
+                                     stop=stop)
+            resumed += finished["files_moved"] if finished else 0
+            report("resume", f"{resumed} files", 1, 1)
+        check_stop(stop)
+    except Stopped:
+        return _stopped(info, resumed, [], 0)
+
+    custom = bool(window or cfg.date_range)
+    date_from, date_to = query_window(db, cfg, window)
+    info["window"] = (date_from, date_to)
     report("query", f"{date_from or '(start)'} .. {date_to}")
-    log.info("querying candidates %s .. %s", date_from or "(start)", date_to)
+    log.info("querying candidates %s .. %s%s", date_from or "(start)", date_to, " (custom range)" if custom else "")
     candidates = candidates_fn(date_from, date_to)
     dates = dict(candidates)  # barcode -> last_update (the last row wins)
     report("query", f"{len(dates):,} candidate barcodes", 1, 1)
-    entries, errors, seen = scan(cfg, dates, report)
+    try:
+        entries, errors, seen = scan(cfg, dates, report, stop)
+    except Stopped:
+        return _stopped(dict(info, candidates=len(dates)), resumed, [], 0)
     volumes = plan(entries)
     matched = {e["barcode"] for e in entries}
-    info = {"window": window, "candidates": len(dates), "scanned": seen, "volumes": volumes, "resumed": resumed,
-            "matched_barcodes": len(matched), "matched_files": len(entries)}
+    info.update(candidates=len(dates), scanned=seen, volumes=volumes, resumed=resumed,
+                matched_barcodes=len(matched), matched_files=len(entries))
     if dry_run:
         log.info("dry run: %d of %d candidate barcodes would be archived (%d files): %s",
                  len(matched), len(dates), len(entries), volumes)
         return dict(info, status="dry_run", files_moved=0, barcodes=0, errors=errors)
     if entries and confirm and not confirm(volumes):
         return dict(info, status="cancelled", files_moved=0, barcodes=0, errors=errors)
+    if stop is not None and stop.is_set():
+        return _stopped(info, resumed, [], errors)
 
     sid = start_session(db, date_from or "", date_to)
+    archived = []
     try:
+        if custom:
+            with db:
+                db.execute("INSERT INTO custom_window_session (scan_session_id) VALUES (?)", (sid,))
         fresh = [(b, d) for b, d in candidates if not db.execute(
             "SELECT 1 FROM session_barcode WHERE barcode = ? AND last_update = ?", (b, d)).fetchone()]
         with db:
             db.executemany("INSERT OR IGNORE INTO session_barcode (scan_session_id, barcode, last_update, status)"
                            " VALUES (?, ?, ?, ?)",
                            [(sid, b, d, "matched" if b in matched else "no_files_found") for b, d in fresh])
-        result = {"files_moved": 0, "barcodes": 0, "errors": 0, "volumes": {}}
-        if entries:
-            errors += stage(cfg, sid, entries, report)
-            result = finish_staged(db, cfg, report)
-        errors += result["errors"]
-        complete_session(db, sid, "success", len(fresh), result["files_moved"], errors)
+        # Batches of cfg.batch_files, a month at a time where possible (fewer commits): each is
+        # staged, committed, verified, indexed and cleaned up before the next one starts.
+        entries.sort(key=lambda e: (e["volume_name"], e["relative_path"]))
+        batches = [entries[i:i + cfg.batch_files] for i in range(0, len(entries), cfg.batch_files)]
+        for n, batch in enumerate(batches):
+            check_stop(stop)
+            label = f"batch {n + 1}/{len(batches)}" if len(batches) > 1 else ""
+            offset = n * cfg.batch_files
+            errors += stage(cfg, sid, batch, _offset(report, "stage", offset, len(entries), label), stop)
+            check_stop(stop)  # what was staged is finished by the next run
+            result = finish_staged(db, cfg, _offset(report, "commit", offset, len(entries), label), stop=stop)
+            errors += result["errors"]
+            archived += result["archived"]
+    except Stopped:
+        complete_session(db, sid, "failed", len(fresh), len(archived), errors)  # "continue" redoes this window
+        return _stopped(info, resumed, archived, errors, sid)
     except Exception:
-        complete_session(db, sid, "failed", errors=errors + 1)
+        complete_session(db, sid, "failed", moved=len(archived), errors=errors + 1)
         raise
+    complete_session(db, sid, "success", len(fresh), len(archived), errors)
     unmatched = sorted({b for b, _ in fresh} - matched)
-    return {**info, **result, "status": "done", "session_id": sid, "errors": errors, "unmatched": unmatched}
+    return {**info, "status": "done", "session_id": sid, "errors": errors, "unmatched": unmatched,
+            "files_moved": len(archived), "barcodes": len({e["barcode"] for e in archived}),
+            "volumes": plan(archived)}
 
 
 # ---------------------------------------------------------------- export

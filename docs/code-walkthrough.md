@@ -8,36 +8,40 @@ for the overall flow.
 | File | Lines | Role |
 |---|---|---|
 | `logs_backup.py` | ~640 | **All backup logic.** No display code. Also runs alone: `python logs_backup.py`. |
-| `backup_ui.py` | ~180 | Terminal UI with `rich`. Draws progress and asks before moving files. **Makes no backup decisions.** |
+| `gui.py` | ~900 | Desktop app with PySide6: settings, the two run modes, progress, Stop, history, check, export. **Makes no backup decisions.** |
+| `backup_ui.py` | ~210 | Terminal UI with `rich`. Draws progress and asks before moving files; Ctrl+C stops. **Makes no backup decisions.** |
+| `test_gui.py` | ~140 | The app without a screen: settings saved and used by the command line, preview, a custom-range backup in History, Stop then continue, widgets only touched on the window's thread. |
 | `test_logs_backup.py` | ~190 | Tests: matching rules, config, full flow, crash recovery, cancel, the run lock. |
 | `bench.py` | ~75 | Times a full run over generated files. See [performance.md](performance.md). |
 
-For a safety audit, read `logs_backup.py` only. `backup_ui.py` cannot move,
-commit or delete anything: it only calls `logs_backup.run()` and draws what it
-gets back.
+For a safety audit, read `logs_backup.py` only. `gui.py` and `backup_ui.py` cannot
+move, commit or delete anything: they only call `logs_backup.run()` (and `export`,
+`check_mochi`, `check_sql`) and draw what they get back.
 
 ## The contract between logic and UI
 
-`logs_backup.run(cfg, dry_run=False, report=quiet, confirm=None)` is the only
-entry point the UI uses.
+`logs_backup.run(cfg, dry_run=False, report=quiet, confirm=None, window=None, stop=None)`
+is the only entry point the UIs use to back up. `window` is a custom `(from, to)`
+range (None: continue). `stop` is a `threading.Event`: once set, the run returns
+`status="stopped"` at the next safe point. The UIs run it on a background thread.
 
 | Callback | Called with | Purpose |
 |---|---|---|
-| `report(step, message, done, total)` | `step` is `resume`, `query`, `scan`, `stage` or `commit`. `total=None` means not known yet. | Progress only. The default, `quiet`, does nothing. |
+| `report(step, message, done, total)` | `step` is `resume`, `query`, `scan`, `stage` or `commit`. `total=None` means not known yet. `stage` and `commit` count files over the whole run; `message` names the batch (`batch 2/12`). | Progress only. The default, `quiet`, does nothing. Called on the run's thread. |
 | `confirm(volumes) -> bool` | `{"2026-08": (barcodes, files, bytes), ...}` | Asked once, after the scan and **before any file moves**. `False` returns `status="cancelled"` with nothing moved and nothing written to the index. |
 
 `run()` returns a summary dict:
 
 | Key | Meaning |
 |---|---|
-| `status` | `done`, `dry_run` or `cancelled` |
+| `status` | `done`, `dry_run`, `cancelled` or `stopped` |
 | `window` | `(from, to)` dates queried. `from` is `None` on the first run. |
 | `candidates` | Distinct barcodes returned by SQL Server |
 | `matched_barcodes`, `matched_files` | Barcodes that have files in the source folders, and those files: what the run would archive |
 | `barcodes`, `files_moved` | What was committed (0 for a dry run or a cancel) |
 | `scanned`, `errors`, `resumed` | Counts |
 | `volumes` | `{month: (barcodes, files, bytes)}`: committed months when `done`, otherwise what was found |
-| `session_id`, `unmatched` | Only when `done` |
+| `session_id`, `unmatched` | When `done` (and `session_id` when `stopped` after files were recorded) |
 
 On failure `run()` raises (`BackupError` for expected failures). Nothing is
 lost in that case (see [how-it-works.md](how-it-works.md#why-nothing-is-lost)).
@@ -154,7 +158,11 @@ safe to resume. A broken last line (a crash mid-write) is skipped.
 | `plan(entries)` | `{month: (barcodes, files, bytes)}`. One helper for both what a run would archive (confirm, dry run) and what it did archive (summary), so the two always count the same way. |
 | `export(cfg, target, report)` | `--export`: under the run lock, copies the archives (skipping ones unchanged since the last export, per `export-manifest.json`), the index via SQLite's backup API, the config without its password, and staging if present. Writes `RESTORE.txt`. Refuses a target inside `source_dir` or `output_dir`. |
 | `copy_checked(src, dst)` | Copies through a `.partial` file, hashing while reading. The copy is hashed again and must match before it replaces `dst`. |
-| `run(...)` / `_run(...)` | The whole run under the lock: resume leftovers, query, scan, then dry run / confirm, then record barcodes, stage, finish. Marks the session `failed` if anything raises after it started. |
+| `run(...)` / `_run(...)` | The whole run under the lock: resume leftovers, query, scan, then dry run / confirm, then record barcodes (and `custom_window_session` for a custom range), then per batch of `cfg.batch_files` (sorted by month): stage, finish. Marks the session `failed` if anything raises after it started, or when stopped. |
+| `check_stop(stop)`, `Stopped` | Raises `Stopped` once the stop event is set. Checked every 200 scanned files, per staged file (files not staged yet are skipped), between batches, and in `commit_month` before `mochi` starts. `finish_staged` lets months already committing finish and be indexed and cleaned up, then re-raises; the manifest stays for the next run. |
+| `query_window(db, cfg, window)`, `continue_window(cfg)`, `check_window(window)` | The date range: a custom one as given (checked: two dates, from ≤ to), else continuing from the last successful run that is not in `custom_window_session`. `continue_window` is what the app shows on card A; it does not create the index. |
+| `settings_dir()`, `load_settings()`, `save_settings()` | The app's settings file (`%APPDATA%\FinisarLogsBackup\settings.json`, or `$FINISAR_BACKUP_HOME`), written atomically. `find_config()` falls back to it after the `config.json` places. |
+| `protect(text)`, `unprotect(token)` | The remembered SQL password, encrypted with Windows DPAPI for the current user (`password_dpapi` in `sql_server`). `Config` decrypts it. Windows only. |
 | `send_email(cfg, summary)` | Optional HTML summary POSTed to `{api_base_url}/api/email/send`. Barcodes are HTML-escaped and the body is capped at 95,000 characters. Failure only logs a warning. |
 | `main()` | Plain command line with log lines, no prompt. For scheduled tasks. |
 
@@ -165,8 +173,20 @@ safe to resume. A broken last line (a crash mid-write) is skipped.
 | `Steps` | The `report` callback. Adds one progress row per step the first time it reports, then updates it. `fail_running()` marks unfinished rows red when the run fails. |
 | `Mark` | The status column: spinner while running, ✓ when done, ✗ when failed. |
 | `ask_confirm(progress, yes)` | The `confirm` callback. Pauses the progress display, shows a table of months, asks `y/n` (default no). `--yes` skips it. |
+| `run_stoppable(work)` | Runs the backup on a thread; Ctrl+C sets the stop event instead of killing the run mid-step. |
 | `print_summary(summary)` | Summary table and panel. Uses the words "committed (LOCAL_COMMITTED)" and the reminder that this is not a backup on its own. |
 | `main()` | Loads the config (a broken config shows a "Config problem" panel, not a traceback), asks for the SQL password hidden if `sql_server` has a user but no password, sets up logging (warnings on screen, everything in `backup.log`), runs, catches failures and shows a red panel that says nothing is lost and running again continues. |
+
+## `gui.py`
+
+| Piece | What it does |
+|---|---|
+| `Job` | Runs a function on a background thread with a stop event. Stays on the window's thread itself, so every signal it emits (progress, confirm request, result) is queued to the window's thread; widgets are never touched from the run. `confirm()` blocks the run until the user answers the dialog. |
+| `BackupPage` | Cards A (continue, shows `continue_window`) and B (From/To dates), each with Preview and Start; a row per step (`StepRow`: progress, counts, time), Stop, the log, and a banner with the result. |
+| `SettingsPage` | A form over the settings keys. **Save** builds a `Config` first (refuses a missing folder or a bad value), then `save_settings`. Remember the password stores `protect(password)`; otherwise the typed password is kept only for this session. |
+| `HistoryPage` | Reads `scan_session` (and `custom_window_session`) read-only. |
+| `ToolsPage` | Run check (`check_mochi`, `check_sql`, drive type and staging mode), Export (`lb.export` on a `Job`), open the log or settings folder. |
+| `MainWindow` | Navigation, the password prompt, first-start import of a `config.json`, and closing during a run (asks, stops, closes when stopped). |
 
 ## Tests
 
@@ -191,6 +211,14 @@ MOCHI_BIN=/path/to/mochi python -m unittest -v
 | `test_move_batch_left_by_an_older_run_is_resumed_in_copy_mode` | A move batch in `source_dir/.staging` is finished after switching to copy staging |
 | `Staging.test_parallel_scan_finds_the_same_files` | Listing folders on 8 threads finds the same files as on 1, and skips staging |
 | `Staging.test_staging_mode_setting` | `staging_mode` defaults, staging folder per mode, bad values refused |
+| `test_batches_archive_everything_one_commit_each` | 252 files in batches of 100: all archived, one commit per batch, progress counted over the whole run |
+| `test_stop_while_staging_then_continue` | Stop during the second batch: the first is archived, the session is `failed`, the next run finishes the rest |
+| `test_stop_while_resuming_keeps_the_rest_for_later` | Stop before resuming: the leftover batch stays and the next run finishes it |
+| `test_stop_while_scanning_moves_nothing` | Stop during the scan: nothing moved, nothing recorded |
+| `test_custom_range_does_not_move_where_continue_starts` | A custom range between two continuing runs does not change the second one's start; a reversed range is refused |
+| `Staging.test_settings_dict_and_saved_password` | `Config` from a dict, the remembered password decrypted, settings saved and read back, DPAPI refused off Windows |
+| `Staging.test_check_window` | Custom ranges must be two valid dates, from ≤ to |
+| `test_gui.Window.*` | The desktop app without a screen (see `test_gui.py` above) |
 | `test_sql_login_from_config_with_env_override` | Login read from `config.json`, `DB_*` variables win, a missing part is named |
 | `test_backspace_in_a_path_is_refused` | `"E:\backup"` in JSON is caught |
 | `test_sql_errors_are_one_readable_line_with_a_hint` | Your error 20002, a stale code from `pymssql`, login failure, a bad `encryption` value |
