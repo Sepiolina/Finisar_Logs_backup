@@ -45,6 +45,11 @@ WORKERS = min(os.cpu_count() or 1, 8)  # hashing threads, and months committed s
 NETWORK_FILE_THREADS = 16  # folders listed, files copied/renamed/deleted at once on a network drive
 STAGING_SPACE_MARGIN = 1.1  # copy staging needs the batch's size plus this margin free
 BATCH_FILES = 10_000  # files staged and committed per batch: a stop waits for at most one batch's commit
+# MOCHI 0.9.16's seven presets for .mochi, fastest to smallest: the Zstandard level passed to
+# `mochi create --compression-level` (None: the writer's default, 3). The level is recorded in the
+# archive when it is created (spec §13) and kept by every append, so a change applies to new months.
+COMPRESSION_PRESETS = {"turbo": -4, "very_fast": -1, "fast": 1, "balanced": None,
+                       "maximum": 19, "ultra": 20, "extreme": 22}
 APP_NAME = "FinisarLogsBackup"
 PROGRESS_EVERY = 100  # files between progress updates while staging
 
@@ -273,6 +278,10 @@ class Config:
         self.staging_mode = raw.get("staging_mode")
         if self.staging_mode not in (None, "move", "copy"):
             raise BackupError('"staging_mode" in config.json must be "move", "copy" or null')
+        self.compression = raw.get("compression") or "balanced"
+        if self.compression not in COMPRESSION_PRESETS:
+            raise BackupError('"compression" in config.json must be one of '
+                              + ", ".join(f'"{k}"' for k in COMPRESSION_PRESETS) + ", or null")
         self.staging_dir_set = bool(raw.get("staging_dir"))
         self.staging_dir = Path(raw["staging_dir"]) if self.staging_dir_set else None  # see mode
         self.db_path = Path(raw["db_path"])
@@ -1010,7 +1019,12 @@ def commit(cfg, month):
     archive = cfg.archive(month)
     archive.parent.mkdir(parents=True, exist_ok=True)
     inputs = sorted(d for d in (cfg.staging_dir / month).iterdir() if d.is_dir())
-    out = mochi(cfg, "append" if archive.exists() else "create", archive, *inputs)
+    if archive.exists():  # keeps the level the archive was created with
+        out = mochi(cfg, "append", archive, *inputs)
+    else:
+        level = COMPRESSION_PRESETS[cfg.compression]
+        out = mochi(cfg, "create", archive, *([f"--compression-level={level}"] if level is not None else []),
+                    *inputs)
     if out.get("durability") != "durable":
         log.warning("%s: DEGRADED (not an error): %s", month, out.get("durability_note"))
 

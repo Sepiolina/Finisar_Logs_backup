@@ -5,6 +5,7 @@
   "staging_mode": null,
   "file_threads": null,
   "db_path": "E:/archive/index.db",
+  "compression": null,
   "sql_server": {
     "server": "sqlhost",
     "port": 1433,

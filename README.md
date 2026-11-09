@@ -116,7 +116,8 @@ and `dist\FinisarLogsBackupCLI.exe` (the terminal version, for scheduled tasks).
 Deliberate differences:
 
 - **Terminal UI instead of a desktop app.** The SQL login is in `config.json` (the password can be asked each run) or `DB_*` environment variables, not an encrypted settings file.
-- **MOCHI through its command line** (`mochi --json`), not the Rust library.
+- **MOCHI through its command line** (`mochi --json`), not the Rust library. Tested with MOCHI 0.9.16.
+- **Added: compression presets.** Settings → Compression (or `"compression"` in config.json) picks one of MOCHI 0.9.16's seven presets, Turbo to Extreme, for new monthly archives; Balanced is the default. An existing archive keeps the level it was created with.
 - **One commit per month per run**, not commits split at 1 GiB or 20,000 files. The archive contents are the same.
 - **Verify checks the whole month each run**, not only the new commit. This makes appends to big months a few seconds slower (see [performance](docs/performance.md)).
 - **Two kinds of staging.** On a local disk files move into `source_dir/.staging` by rename (same drive). On a network drive they are copied to `output_dir/.staging` on the local disk, and the originals are deleted only after their archive is verified (`"staging_mode"` in config.json).

@@ -969,6 +969,15 @@ class SettingsPage(QWidget):
             self.source, tr("Where the test stations write their logs. A network share is fine.")))
         form.addRow(required(tr("Archive folder")), with_hint(
             self.output, tr("Where the monthly .mochi archives are kept.")))
+        self.compression = QComboBox()
+        for label, value in ((tr("Turbo (fastest, largest)"), "turbo"), (tr("Very fast"), "very_fast"),
+                             (tr("Fast"), "fast"), (tr("Balanced (default)"), "balanced"),
+                             (tr("Maximum"), "maximum"), (tr("Ultra"), "ultra"),
+                             (tr("Extreme (slowest, smallest)"), "extreme")):
+            self.compression.addItem(label, value)
+        form.addRow(tr("Compression"), with_hint(
+            self.compression, tr("For new monthly archives; an existing archive keeps the level it was "
+                                 "created with. Ultra and Extreme are much slower and save little over Maximum.")))
         form.addRow(tr("Index file"), with_hint(
             self.db, tr("Finds files again by barcode. Empty: next to the archives.")))
         self.subfolders = QLineEdit()
@@ -1112,6 +1121,7 @@ class SettingsPage(QWidget):
         self.source.setText(raw.get("source_dir"))
         self.output.setText(raw.get("output_dir"))
         self.db.setText(raw.get("db_path"))
+        self.compression.setCurrentIndex(max(self.compression.findData(raw.get("compression") or "balanced"), 0))
         self.subfolders.setText(", ".join(raw.get("subfolders") or ["BURNIN", "ESS", "JTAG", "STM", "Xray"]))
         self.extensions.setText(", ".join(raw.get("extensions") or ["txt", "zip"]))
         self.recursive.setChecked(raw.get("recursive", True))
@@ -1158,6 +1168,7 @@ class SettingsPage(QWidget):
             self.app.session_password = typed  # used this session even if not remembered
         raw = {"source_dir": self.source.text(), "output_dir": output,
                "db_path": self.db.text() or (f"{output.rstrip('/')}/index.db" if output else ""),
+               "compression": self.compression.currentData(),
                "sql_server": sql, "subfolders": split(self.subfolders.text()) or None,
                "extensions": split(self.extensions.text()) or None, "recursive": self.recursive.isChecked(),
                "lookback_days": self.lookback.value(), "staging_mode": self.mode.currentData(),

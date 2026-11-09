@@ -245,6 +245,16 @@ TH = {
     "Stop waits for at most one batch's commit. Smaller: quicker stop, more commits.":
         "การหยุดจะรอการบันทึกของชุดปัจจุบันให้เสร็จก่อน ชุดเล็กลง: หยุดได้เร็วขึ้น แต่บันทึกบ่อยขึ้น",
     "Staging": "การพักไฟล์ (staging)",
+    "Compression": "การบีบอัด",
+    "Turbo (fastest, largest)": "Turbo (เร็วที่สุด ไฟล์ใหญ่ที่สุด)",
+    "Very fast": "เร็วมาก",
+    "Fast": "เร็ว",
+    "Balanced (default)": "สมดุล (ค่าเริ่มต้น)",
+    "Maximum": "สูงสุด",
+    "Ultra": "Ultra",
+    "Extreme (slowest, smallest)": "Extreme (ช้าที่สุด ไฟล์เล็กที่สุด)",
+    "For new monthly archives; an existing archive keeps the level it was created with. Ultra and Extreme are much slower and save little over Maximum.":
+        "ใช้กับไฟล์เก็บถาวรรายเดือนที่สร้างใหม่ ไฟล์ที่มีอยู่แล้วใช้ระดับเดิมตอนที่สร้าง Ultra และ Extreme ช้ากว่ามาก และประหยัดพื้นที่ได้มากกว่าระดับสูงสุดเพียงเล็กน้อย",
     "Staging folder": "โฟลเดอร์พักไฟล์",
     "Files at once": "จำนวนไฟล์พร้อมกัน",
     "Batch size": "ขนาดชุด",
