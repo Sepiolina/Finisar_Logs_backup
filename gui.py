@@ -875,7 +875,7 @@ class HistoryPage(QWidget):
             self.note.setText(tr("No runs yet."))
             return
         try:
-            db = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
+            db = sqlite3.connect(lb.readonly_uri(path), uri=True)
             try:
                 custom = {r[0] for r in db.execute("SELECT scan_session_id FROM custom_window_session")}
                 waiting = {r[0] for r in db.execute("SELECT scan_session_id FROM pending_run")}
