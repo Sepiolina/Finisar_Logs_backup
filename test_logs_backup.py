@@ -921,5 +921,26 @@ class Flow(unittest.TestCase):
         self.assertFalse(self.cfg.staging_dir.exists())
 
 
+class ReadonlyUri(unittest.TestCase):
+    def test_unc_path_has_an_empty_authority(self):
+        # file://192.168.16.11/... made SQLite fail with "invalid uri authority", reported as a damaged index
+        uri = lb.readonly_uri(r"\\192.168.16.11\Logfile\Backup_index\index.db")
+        self.assertEqual(uri, "file:////192.168.16.11/Logfile/Backup_index/index.db?mode=ro")
+
+    def test_drive_letter_and_special_characters(self):
+        self.assertEqual(lb.readonly_uri(r"Z:\logs #1\index.db"), "file:/Z:/logs%20%231/index.db?mode=ro")
+
+    def test_opens_a_local_file_read_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "a b#?%" / "index.db"
+            path.parent.mkdir()
+            sqlite3.connect(path).execute("CREATE TABLE t(x)").connection.commit()
+            db = sqlite3.connect(lb.readonly_uri(path), uri=True)
+            self.assertEqual(db.execute("PRAGMA quick_check").fetchone()[0], "ok")
+            with self.assertRaises(sqlite3.OperationalError):
+                db.execute("INSERT INTO t VALUES (1)")
+            db.close()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -30,6 +30,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 import urllib.request
 from collections import defaultdict
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -633,6 +634,21 @@ def scan(cfg, dates, report=quiet, stop=None):
     report("scan", f"{len(entries):,} matches", seen, seen)
     log.info("scanned %d files, %d matches", seen, len(entries))
     return entries, errors, seen
+
+
+def readonly_uri(path):
+    """A SQLite URI that opens `path` read-only. Works for a UNC path (\\\\server\\share\\...): a plain
+    f"file:{path.as_posix()}" gives file://server/share/..., which SQLite rejects ("invalid uri authority").
+    Here the authority is left empty (file:////server/share/...), so SQLite hands //server/share/... to Windows.
+    Characters such as space, #, ? and % are escaped."""
+    text = str(path).replace("\\", "/")
+    if not text.startswith("//") and not (len(text) > 1 and text[1] == ":") and not text.startswith("/"):
+        text = Path(path).absolute().as_posix()  # a relative path
+    if text.startswith("//"):
+        text = "//" + text  # UNC: empty authority, then //server/share/...
+    elif not text.startswith("/"):
+        text = "/" + text  # C:/x -> /C:/x (SQLite drops the slash before a drive letter on Windows)
+    return "file:" + urllib.parse.quote(text, safe="/:") + "?mode=ro"
 
 
 def is_network_path(path):
@@ -1313,7 +1329,7 @@ def snapshot_index(cfg):
     earlier = sorted(folder.glob("index-*.db"))
     target = folder / f"index-{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}.db"
     try:
-        source = sqlite3.connect(f"file:{cfg.db_path.as_posix()}?mode=ro", uri=True)
+        source = sqlite3.connect(readonly_uri(cfg.db_path), uri=True)
         copy_db = sqlite3.connect(target)
         try:
             source.backup(copy_db)
