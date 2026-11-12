@@ -139,7 +139,7 @@ safe to resume. A broken last line (a crash mid-write) is skipped.
 | `mochi(cfg, *args)` | Runs `mochi --json --no-local-history ARGS`. Exit 0 and 2 pass (2 = committed or checked, with a warning such as unconfirmed folder durability). Any other exit raises `BackupError` with MOCHI's error code. |
 | `head_files(cfg, archive)` | `mochi list`: returns `{path: BLAKE3}` of the archive head, plus `(seq, commit_id)`. |
 | `b3(path)` | BLAKE3 of a file, memory-mapped. BLAKE3 may use several threads for a big file. |
-| `commit(cfg, month)` | One `mochi create` (new month) or `mochi append` with the `staging/<month>/<SUB>` folders as input. MOCHI merges each into the archive's `<SUB>/` folder. |
+| `commit(cfg, month)` | One `mochi create` (new month, with `--compression-level` from the `compression` preset unless it is Balanced) or `mochi append` (keeps the archive's recorded level) with the `staging/<month>/<SUB>` folders as input. MOCHI merges each into the archive's `<SUB>/` folder. |
 | `commit_month(cfg, month, entries, resume)` | Hashes every staged file on worker threads (`hash_all`, 500 files per task) **while** MOCHI commits. When resuming, first checks whether the head already holds every file with the same hash and, if so, skips the commit (no duplicate versions). Then compares each staged hash with the head and runs `mochi verify --level content`. Does not touch SQLite or staging, so it can run on a worker thread. |
 
 ### Index and clean up
@@ -218,6 +218,8 @@ MOCHI_BIN=/path/to/mochi python -m unittest -v
 | `test_copy_staging_skips_a_file_that_changed_before_the_copy` | A file whose size changed since the scan is not staged, and no `.partial` file is left |
 | `test_move_batch_left_by_an_older_run_is_resumed_in_copy_mode` | A move batch in `source_dir/.staging` is finished after switching to copy staging |
 | `Staging.test_parallel_scan_finds_the_same_files` | Listing folders on 8 threads finds the same files as on 1, and skips staging |
+| `Staging.test_compression_setting` | `compression` defaults to Balanced, the seven presets map to zstd -4…22, other values refused |
+| `test_compression_preset_is_set_when_an_archive_is_created_only` | The preset reaches `mochi create` only; an append to an existing month passes no level, and a preset changed later applies to a new month |
 | `Staging.test_staging_mode_setting` | `staging_mode` defaults, staging folder per mode, bad values refused |
 | `test_batches_archive_everything_one_commit_each` | 252 files in batches of 100: all archived, one commit per batch, progress counted over the whole run |
 | `test_stop_while_staging_then_continue` | Stop during the second batch: the first is archived, the session is `failed`, the next run finishes the rest |

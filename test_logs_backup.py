@@ -228,6 +228,15 @@ class Staging(unittest.TestCase):
         with self.assertRaisesRegex(lb.BackupError, "staging_mode"):
             self.config(staging_mode="rename")
 
+    def test_compression_setting(self):
+        self.assertEqual(self.config().compression, "balanced")
+        self.assertEqual(self.config(compression=None).compression, "balanced")
+        self.assertEqual(self.config(compression="extreme").compression, "extreme")
+        self.assertEqual(list(lb.COMPRESSION_PRESETS.values()), [-4, -1, 1, None, 19, 20, 22])
+        for bad in ("smallest", "Extreme", 19, True):
+            with self.assertRaisesRegex(lb.BackupError, '"compression"'):
+                self.config(compression=bad)
+
     def test_threaded_stage_moves_every_file_and_never_overwrites(self):
         cfg = self.config(file_threads=8)
         entries = []
@@ -433,6 +442,29 @@ class Flow(unittest.TestCase):
         mochi = self.cfg.mochi
         self.cfg = lb.Config(self.tmp / "config.json")
         self.cfg.mochi = mochi
+
+    def test_compression_preset_is_set_when_an_archive_is_created_only(self):
+        calls, real = [], lb.mochi
+
+        def spy(cfg, *args):
+            calls.append([str(a) for a in args])
+            return real(cfg, *args)
+
+        self.settings(compression="turbo", date_range=["2026-06-01", "2026-09-01"])
+        with unittest.mock.patch.object(lb, "mochi", spy):
+            self.run_backup()
+            self.write("BURNIN/unit3_BC003.txt", b"burnin three")
+            self.settings(compression="extreme")  # changed later: new months only
+            self.CANDIDATES = self.CANDIDATES + [("BC003", "2026-08-05 10:00:00"), ("BC005", "2026-06-05 10:00:00")]
+            self.write("ESS/unit5_BC005.txt", b"ess five")
+            self.run_backup()
+        writes = {(c[0], Path(c[1]).stem): c[2:] for c in calls if c[0] in ("create", "append")}
+        self.assertIn("--compression-level=-4", writes["create", "2026-08"])
+        self.assertIn("--compression-level=-4", writes["create", "2026-07"])
+        self.assertFalse(any(a.startswith("--compression-level") for a in writes["append", "2026-08"]))
+        self.assertIn("--compression-level=22", writes["create", "2026-06"])
+        self.assertEqual(len(self.head("2026-08")[0]), 2)
+        self.assertEqual(len(self.head("2026-06")[0]), 1)
 
     def test_batches_archive_everything_one_commit_each(self):
         self.settings(batch_files=100)

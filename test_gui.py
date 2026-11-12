@@ -77,6 +77,14 @@ class Window(unittest.TestCase):
         self.assertEqual(saved["subfolders"], ["BURNIN", "ESS"])
         self.assertEqual(saved["batch_files"], 500)
         self.assertNotIn("password_dpapi", saved["sql_server"])
+        self.assertEqual(saved["compression"], "balanced")  # the default preset
+        page = self.window.settings_page
+        page.compression.setCurrentIndex(page.compression.findData("ultra"))
+        self.assertTrue(page.save())
+        self.assertEqual(lb.load_settings()["compression"], "ultra")
+        page.load(lb.load_settings())
+        self.assertEqual(page.compression.currentData(), "ultra")
+        self.assertEqual(page.compression.count(), len(lb.COMPRESSION_PRESETS))
         cfg = lb.Config(lb.find_config())  # the command line uses the same settings
         self.assertEqual(cfg.source_dir, Path(saved["source_dir"]))
         self.assertIn("→", self.window.backup_page.continue_label.text())
