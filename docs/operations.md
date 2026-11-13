@@ -87,6 +87,14 @@ or next to the program, if there is one; **Import config.json…** does it later
 **Remember the password** it is saved encrypted with Windows DPAPI for the current Windows user:
 only that user, on that PC, can decrypt it. Another user, or a copied settings file, cannot.
 
+**Progress and time left.** Above the step rows, one bar shows the whole run: files archived of
+all, and *about 2 h 35 min left · done around 15:40*. Before the first batch is done the estimate
+goes by the pace of earlier runs (also shown in the confirm question and in Preview); after each
+batch, by this run's own pace. The commit row says what it is doing right now (copying, writing the
+archive, checking every file, verifying, saving to the index, cleaning up). When a step shows
+nothing new for 10 seconds (a big month being written or verified by `mochi`), its line adds
+*still working, 0:04:12*, so a long step is visibly alive. `mochi` runs without a console window.
+
 **Stop** ends the run at the next safe point: between files while scanning or staging, or before
 the next month's commit. A `mochi` commit that has started is finished first (stopping it could
 leave a broken archive tail), so a stop can take as long as one batch's commit.
@@ -384,6 +392,28 @@ Not needed: the code, `mochi` (rebuild it), `.backup.lock`, `backup.log`.
 Keep the same paths on the new PC if you can. The index stores each archive's
 full path. If paths change, everything still works, but the stored path of a
 month is only updated the next time that month gets new files.
+
+## A run is slow: where did the time go?
+
+`backup.log` (Tools → Open log file) records how long each part took:
+
+```
+scanned 250000 files, 40000 matches, in 12 min 04 s
+batch 1/4: staged 10000 files in 18 min 30 s
+mochi create 2026-10.mochi: 9 min 12 s
+mochi list 2026-10.mochi: 41 s
+mochi verify 2026-10.mochi: 11 min 05 s
+batch 1/4: committed, verified and cleaned up 10000 files in 25 min 40 s; whole run so far 44 min 10 s, about 2 h 12 min left
+time: staging 1 h 10 min, commit + verify + index + clean-up 3 h 40 min, 40000 files archived (0.44 s per file)
+```
+
+- **Scan** slow: the log folders hold many files the run does not take, or they are on a NAS.
+- **Staged** slow: copying from the NAS (see [performance](performance.md#on-a-network-drive)).
+- **mochi verify** growing batch after batch: each batch verifies the whole month, so a month
+  archived in several batches is read several times. A larger **Batch size** (Settings) means fewer
+  verifies, at the cost of a slower Stop.
+- **mochi create / append / verify** slow with the archive folder on a NAS: `mochi` writes and reads
+  the archive over the network.
 
 ## Troubleshooting
 

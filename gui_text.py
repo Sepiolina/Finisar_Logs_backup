@@ -60,6 +60,24 @@ TH = {
     "the beginning": "เริ่มต้น",
     "(start)": "(เริ่มต้น)",
     "Elapsed {time}": "ใช้เวลา {time}",
+    # time left
+    "less than a minute": "ไม่ถึงหนึ่งนาที",
+    "{m} min": "{m} นาที",
+    "{h} h {m} min": "{h} ชม. {m} นาที",
+    "almost done (finishing this batch)": "ใกล้เสร็จแล้ว (กำลังทำชุดนี้ให้เสร็จ)",
+    "about {left} left · done around {when}": "เหลืออีกประมาณ {left} · น่าจะเสร็จราว {when} น.",
+    "<b>{done} of {total} files archived</b> ({pct}%)": "<b>เก็บแล้ว {done} จาก {total} ไฟล์</b> ({pct}%)",
+    "time left: estimated after the first batch": "เวลาที่เหลือ: จะประมาณได้หลังชุดแรกเสร็จ",
+    "{what} · still working, {time}": "{what} · ยังทำงานอยู่ {time}",
+    "still working, {time}": "ยังทำงานอยู่ {time}",
+    "Expected time: <b>about {time}</b> (from the pace of earlier runs). The progress shows the time left as it goes.":
+        "เวลาที่คาดว่าจะใช้: <b>ประมาณ {time}</b> (จากความเร็วของการสำรองครั้งก่อน ๆ) "
+        "ระหว่างทำงานจะแสดงเวลาที่เหลือให้เห็นตลอด",
+    "Expected time: shown in the progress once the first batch is done (no earlier run to go by yet).":
+        "เวลาที่คาดว่าจะใช้: จะแสดงในความคืบหน้าเมื่อชุดแรกเสร็จ (ยังไม่มีการสำรองครั้งก่อนให้เทียบ)",
+    "Expected time for a real run: about {time} (from the pace of earlier runs).":
+        "ถ้าสำรองจริงจะใช้เวลาประมาณ {time} (จากความเร็วของการสำรองครั้งก่อน ๆ)",
+    "staging {stage}, archiving and checking {commit}": "พักไฟล์ {stage}, เก็บและตรวจสอบ {commit}",
     "Discard": "ยกเลิกงานนี้",
     "Continue": "ทำต่อ",
     "Forget this run's plan. Its files stay in the log folders; a later run finds them.":
@@ -339,6 +357,12 @@ _PROGRESS = [
     (r"^([\d,]+) candidate barcodes$", r"บาร์โค้ดที่เข้าเงื่อนไข \1 รายการ"),
     (r"^([\d,]+) matches$", r"พบ \1 ไฟล์ที่ตรงกัน"),
     (r"committing ", "กำลังบันทึก "),
+    (r"checking the local copies", "กำลังตรวจสำเนาบนเครื่องนี้"),
+    (r" checking what the archive already holds$", " กำลังตรวจว่าไฟล์เก็บถาวรมีอะไรแล้ว"),
+    (r" writing the archive \(mochi\)$", " กำลังเขียนไฟล์เก็บถาวร (mochi)"),
+    (r" checking every file against the archive$", " กำลังตรวจทุกไฟล์กับไฟล์เก็บถาวร"),
+    (r" verifying the archive \(mochi\)$", " กำลังตรวจสอบไฟล์เก็บถาวร (mochi)"),
+    (r" saving to the index$", " กำลังบันทึกลงดัชนี"),
     (r" cleaning up$", " กำลังเก็บกวาด"),
     (r"^continuing the stopped run (.*)$", r"กำลังทำงานที่หยุดไว้ต่อ \1"),
     (r"^([\d,]+) files left \(kept from the first scan\)$", r"เหลือ \1 ไฟล์ (จากการสแกนครั้งแรก)"),
