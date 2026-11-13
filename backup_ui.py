@@ -10,12 +10,14 @@ import argparse
 import logging
 import sys
 import threading
+import time
 from pathlib import Path
 
 from rich.console import Console
 from rich.logging import RichHandler
 from rich.panel import Panel
-from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
+from rich.progress import (BarColumn, MofNCompleteColumn, Progress, ProgressColumn, SpinnerColumn, TextColumn,
+                           TimeElapsedColumn)
 from rich.prompt import Confirm, Prompt
 from rich.table import Table
 from rich.text import Text
@@ -23,6 +25,7 @@ from rich.text import Text
 import logs_backup as lb
 
 STEPS = {
+    "total": "[bold]Whole run (files archived)",
     "resume": "Resume staging",
     "query": "Query SQL Server",
     "scan": "Scan folders",
@@ -41,6 +44,29 @@ class Mark(SpinnerColumn):
         return Text("✗", style="red") if task.fields.get("failed") else super().render(task)
 
 
+def duration(seconds):
+    """About how long: "2 h 15 min", "40 min", "less than a minute"."""
+    minutes = int(round(max(seconds, 0) / 60))
+    if minutes < 1:
+        return "less than a minute"
+    return f"{minutes} min" if minutes < 60 else f"{minutes // 60} h {minutes % 60:02d} min"
+
+
+class TimeLeft(ProgressColumn):
+    """For the whole-run row: the time left, counting down between reports, and the finish clock."""
+
+    def render(self, task):
+        finish = task.fields.get("finish")
+        if not task.fields.get("whole") or task.finished:
+            return Text("")
+        if not finish:
+            return Text("time left: after the first batch", style="dim")
+        left = finish - time.time()
+        if left < 60:
+            return Text("almost done", style="cyan")
+        return Text(f"~{duration(left)} left, done ~{time.strftime('%H:%M', time.localtime(finish))}", style="cyan")
+
+
 def size(n):
     for unit in ("B", "KiB", "MiB", "GiB"):
         if n < 1024 or unit == "GiB":
@@ -52,11 +78,15 @@ class Steps:
     """The report callback: one progress row per step, added when the step first reports."""
 
     def __init__(self, progress):
-        self.progress, self.rows = progress, {}
+        self.progress, self.rows, self.finish = progress, {}, None
 
     def __call__(self, step, message="", done=0, total=None):
         if step not in self.rows:
-            self.rows[step] = self.progress.add_task(STEPS[step], total=None)
+            self.rows[step] = self.progress.add_task(STEPS[step], total=None, whole=step == "total")
+        if step == "total":  # message: the estimated finish (time.time() seconds) or None
+            self.finish = message
+            self.progress.update(self.rows[step], completed=done, total=total, finish=message)
+            return
         detail = f" [dim]{message}" if message else ""
         self.progress.update(self.rows[step], description=STEPS[step] + detail,
                              completed=done, total=total)
@@ -85,7 +115,7 @@ def volume_table(volumes, status):
     return table
 
 
-def ask_confirm(progress, yes):
+def ask_confirm(progress, yes, steps=None):
     """The confirm callback: shows what would be archived and asks before anything moves."""
     def confirm(volumes, space=()):
         if yes:
@@ -93,6 +123,8 @@ def ask_confirm(progress, yes):
         progress.stop()
         console.print(volume_table(volumes, "[yellow]to archive"))
         print_space(space)
+        if steps is not None and steps.finish:
+            console.print(f"Expected time: [bold]about {duration(steps.finish - time.time())}[/] (the pace of earlier runs)")
         barcodes, files, nbytes = totals(volumes)
         answer = Confirm.ask(f"Archive {barcodes:,} barcodes ({files:,} files, {size(nbytes)})"
                              f" into {len(volumes)} monthly archive(s)?", default=False)
@@ -134,6 +166,12 @@ def print_summary(summary):
     if status == "stopped":
         lines.append(f"[yellow]Stopped with {summary.get('left', 0):,} files left. Nothing is lost: you can shut down;"
                      " the next run continues where it stopped.")
+    if status == "dry_run" and summary.get("expected_seconds"):
+        lines.append(f"Expected    about {duration(summary['expected_seconds'])} for a real run (the pace of earlier runs)")
+    if summary.get("seconds"):
+        spent = summary["seconds"]
+        lines.append(f"Time        staging {duration(spent.get('stage', 0))}, archiving and checking "
+                     f"{duration(spent.get('commit', 0))}")
     lines.append(f"Errors      {summary['errors']:,}")
     if status == "done":
         lines.append("[dim]Committed is not a backup: keep an independent copy (--export DIR to another drive).")
@@ -142,7 +180,7 @@ def print_summary(summary):
 
 
 COLUMNS = (Mark(finished_text="[green]✓"), TextColumn("{task.description}"),
-           BarColumn(), MofNCompleteColumn(), TimeElapsedColumn())
+           BarColumn(), MofNCompleteColumn(), TimeElapsedColumn(), TimeLeft())
 
 
 def export(cfg, target):
@@ -288,7 +326,7 @@ def run_once(cfg, args, continue_stopped):
         steps = Steps(progress)
         try:
             return run_stoppable(lambda stop: lb.run(cfg, dry_run=args.dry_run, report=steps,
-                                                     confirm=ask_confirm(progress, args.yes), stop=stop,
+                                                     confirm=ask_confirm(progress, args.yes, steps), stop=stop,
                                                      continue_stopped=continue_stopped))
         except Exception as e:
             steps.fail_running()

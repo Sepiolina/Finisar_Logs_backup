@@ -53,6 +53,9 @@ COMPRESSION_PRESETS = {"turbo": -4, "very_fast": -1, "fast": 1, "balanced": None
                        "maximum": 19, "ultra": 20, "extreme": 22}
 APP_NAME = "FinisarLogsBackup"
 PROGRESS_EVERY = 100  # files between progress updates while staging
+# Windows: start mochi without a console window. The desktop app and FinisarLogsBackup.exe have no
+# console, so without this every mochi call (several per batch) flashed up an empty black window.
+NO_WINDOW = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
 
 SCHEMA_VERSION = 2
 SCHEMA = """
@@ -75,6 +78,13 @@ CREATE TABLE IF NOT EXISTS session_barcode (
     last_update TEXT NOT NULL,
     status TEXT CHECK(status IN ('matched','no_files_found','error')) NOT NULL,
     UNIQUE(barcode, last_update)
+);
+CREATE TABLE IF NOT EXISTS run_pace (
+    id INTEGER PRIMARY KEY,
+    scan_session_id INTEGER,
+    files INTEGER NOT NULL,
+    seconds REAL NOT NULL,
+    recorded_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS file_storage_volume (
     id INTEGER PRIMARY KEY,
@@ -150,7 +160,11 @@ def quiet(step, message="", done=0, total=None):
     """Default progress callback: does nothing. A front end (backup_ui.py) passes its own.
 
     step is one of "resume", "query", "scan", "stage", "commit"; total None means unknown.
-    "stage" and "commit" count files over the whole run (a run works in batches of BATCH_FILES)."""
+    "stage" and "commit" count files over the whole run (a run works in batches of BATCH_FILES).
+
+    "total" is the whole run: done = files archived so far, total = files to archive, and
+    message = the estimated finish time (time.time() seconds, a float), or None while there is
+    no pace to go by yet. It is sent before the confirm question too (the expected duration)."""
 
 
 # ---------------------------------------------------------------- config
@@ -348,14 +362,21 @@ class Config:
             return self.source_dir / ".staging"
         return local_data_dir() / "staging" if is_network_path(self.output_dir) else self.output_dir / ".staging"
 
+    @property
+    def next_staging_dir(self):
+        """The second staging folder, next to the first: the next batch is staged there while the
+        current one commits. A sibling, not inside: a batch's clean-up walks its whole folder."""
+        return self.staging_dir.with_name(self.staging_dir.name + "-2")
+
     def staging_dirs(self):
-        """Every folder an earlier run may have left a batch in: the configured one, and with no
-        staging_dir set, every default there has been (the mode or the defaults may have changed)."""
-        dirs = [self.staging_dir]
+        """Every folder an earlier run may have left a batch in: the configured one and its second
+        folder, and with no staging_dir set, every default there has been (the mode or the defaults
+        may have changed)."""
+        firsts = [self.staging_dir]
         if not self.staging_dir_set:
-            dirs += [d for d in (self.default_staging("move"), self.output_dir / ".staging",
-                                 local_data_dir() / "staging") if d not in dirs]
-        return dirs
+            firsts += [d for d in (self.default_staging("move"), self.output_dir / ".staging",
+                                   local_data_dir() / "staging") if d not in firsts]
+        return [d for first in firsts for d in (first, first.with_name(first.name + "-2"))]
 
     def with_staging(self, folder):
         other = copy.copy(self)
@@ -612,6 +633,7 @@ def scan(cfg, dates, report=quiet, stop=None):
     """Matched files as manifest entries, plus error and scanned-file counts. Each subfolder is scanned
     at every depth (config "recursive", default on); the staging and output folders are never entered."""
     entries, errors, seen = [], 0, 0
+    started = time.monotonic()
     skip = {path_key(p) for p in (*cfg.staging_dirs(), cfg.output_dir)}
 
     def unreadable(folder, e):
@@ -641,7 +663,7 @@ def scan(cfg, dates, report=quiet, stop=None):
             entries.append({"relative_path": f"{sub}/{rel}{item.name}", "source_subfolder": sub, "barcode": barcode,
                             "original_size": st.st_size, "mtime_ns": st.st_mtime_ns, "volume_name": month})
     report("scan", f"{len(entries):,} matches", seen, seen)
-    log.info("scanned %d files, %d matches", seen, len(entries))
+    log.info("scanned %d files, %d matches, in %s", seen, len(entries), seconds_text(time.monotonic() - started))
     return entries, errors, seen
 
 
@@ -979,7 +1001,7 @@ def check_mochi(cfg):
     tried = []
     for exe in mochi_places(cfg.mochi):
         try:
-            p = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=60)
+            p = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=60, **NO_WINDOW)
         except (OSError, subprocess.TimeoutExpired) as e:
             tried.append(f"{exe}: {e.strerror if isinstance(e, OSError) and e.strerror else e}")
             continue
@@ -996,11 +1018,15 @@ def mochi(cfg, *args):
     """Runs `mochi --json ARGS`. Exit 0 and 2 (degraded, data committed / checked) pass; others raise."""
     if not cfg.mochi or not Path(cfg.mochi).is_absolute():
         check_mochi(cfg)  # finds it and sets cfg.mochi to its full path
+    started = time.monotonic()
     try:
         p = subprocess.run([cfg.mochi, "--json", "--no-local-history", *map(str, args)],
-                           capture_output=True, text=True)
+                           capture_output=True, text=True, **NO_WINDOW)
     except OSError as e:
         raise BackupError(f"the mochi program could not be started ({cfg.mochi}): {e}") from e
+    took = time.monotonic() - started
+    if took >= 1:
+        log.info("mochi %s %s: %s", args[0], Path(str(args[1])).name, seconds_text(took))
     try:
         out = json.loads(p.stdout)
     except ValueError:
@@ -1045,12 +1071,14 @@ def commit(cfg, month):
         log.warning("%s: DEGRADED (not an error): %s", month, out.get("durability_note"))
 
 
-def commit_month(cfg, month, entries, resume=False, stop=None, known=None):
+def commit_month(cfg, month, entries, resume=False, stop=None, known=None, phase=None):
     """Commits a month's staged files (one commit), then checks every file and the archive.
 
     Touches neither SQLite nor staging. Returns (hashes, head). A set `stop` is checked before
     the commit starts; a running `mochi` is never interrupted (that could leave a broken tail).
-    `known`: {path: blake3} of the staged files, already checked (copy staging): not hashed again."""
+    `known`: {path: blake3} of the staged files, already checked (copy staging): not hashed again.
+    `phase(text)`, if given, is told what it is doing now (mochi runs can take minutes)."""
+    phase = phase or (lambda text: None)
     check_stop(stop)
     archive, paths = cfg.archive(month), [e["relative_path"] for e in entries]
     with ThreadPoolExecutor(WORKERS) as pool:
@@ -1060,16 +1088,21 @@ def commit_month(cfg, month, entries, resume=False, stop=None, known=None):
             # A crash between commit and index leaves the batch already committed:
             # commit only if the head does not hold every file with the same hash.
             hashes = dict(zip(paths, hashing))
+            phase("checking what the archive already holds")
             head, _ = head_files(cfg, archive)
             if any(head.get(p) != h for p, h in hashes.items()):
+                phase("writing the archive (mochi)")
                 commit(cfg, month)
         else:
+            phase("writing the archive (mochi)")
             commit(cfg, month)
             hashes = dict(zip(paths, hashing))
+    phase("checking every file against the archive")
     head, head_id = head_files(cfg, archive)
     bad = [p for p, h in hashes.items() if head.get(p) != h]
     if bad:
         raise BackupError(f"{month}: {len(bad)} staged files differ from the archive head, e.g. {bad[0]}")
+    phase("verifying the archive (mochi)")
     mochi(cfg, "verify", archive, "--level", "content")
     return hashes, head_id
 
@@ -1174,17 +1207,25 @@ def finish_staged(db, cfg, report=quiet, resume=False, stop=None):
 
     archived, failures, errors, stopped = [], [], 0, False
     known = {}
-    if mode == "copy" and journaled:
-        errors += verify_copies(cfg, months, known)
     total = sum(len(es) for es in months.values())
+    if mode == "copy" and journaled:
+        report("commit", "checking the local copies", 0, total)
+        errors += verify_copies(cfg, months, known)
+        total = sum(len(es) for es in months.values())
     report("commit", "committing " + ", ".join(sorted(months)), 0, total)
+
+    def phase(month):  # called from the commit threads: what each month is doing now
+        return lambda text: report("commit", f"{month} {text}", len(archived), total)
+
     with ThreadPoolExecutor(min(WORKERS, max(len(months), 1))) as pool:
         jobs = {m: pool.submit(commit_month, cfg, m, es, resume, stop,
-                               {e["relative_path"]: known[e["relative_path"]] for e in es} if known else None)
+                               {e["relative_path"]: known[e["relative_path"]] for e in es} if known else None,
+                               phase(m))
                 for m, es in months.items() if es}
         for month, job in sorted(jobs.items()):  # SQLite and deletes stay on this thread
             try:
                 hashes, head = job.result()
+                report("commit", f"{month} saving to the index", len(archived), total)
                 index_month(db, cfg, sid, month, months[month], hashes, head)
             except Stopped:
                 stopped = True
@@ -1194,7 +1235,11 @@ def finish_staged(db, cfg, report=quiet, resume=False, stop=None):
                 failures.append(e)
                 continue
             report("commit", f"{month} cleaning up", len(archived), total)
-            kept = sum(each(cfg.threads, lambda e: release(cfg, e, mode), months[month]))
+            kept = 0
+            for n, k in enumerate(each(cfg.threads, lambda e: release(cfg, e, mode), months[month]), 1):
+                kept += k
+                if n % PROGRESS_EVERY == 0:  # deleting on a network drive takes a while: show it moving
+                    report("commit", f"{month} cleaning up", len(archived) + n, total)
             errors += kept
             archived += months[month]
             log.info("%s: %d files committed (LOCAL_COMMITTED), verified and indexed", month, len(months[month]))
@@ -1367,6 +1412,67 @@ def snapshot_index(cfg):
     return target
 
 
+def seconds_text(seconds):
+    """1 h 05 min, 12 min 30 s, 8 s: for the log."""
+    seconds = int(round(seconds))
+    h, m, sec = seconds // 3600, seconds // 60 % 60, seconds % 60
+    return f"{h} h {m:02d} min" if h else f"{m} min {sec:02d} s" if m else f"{sec} s"
+
+
+PACE_RUNS = 5  # earlier runs whose pace estimates a new run before its first batch is done
+
+
+def earlier_pace(db):
+    """Seconds per file of the last PACE_RUNS runs (staging, commit, verify, index and clean-up;
+    not the query or the scan), or None if there is no history yet. Runs from before this was
+    recorded count by their start and end times, the median of them (a run continued another
+    day would otherwise count its days off)."""
+    rows = db.execute("SELECT files, seconds FROM run_pace WHERE files >= 100 ORDER BY id DESC LIMIT ?",
+                      (PACE_RUNS,)).fetchall()
+    if rows:
+        return sum(r[1] for r in rows) / sum(r[0] for r in rows)
+    paces = []
+    for started, completed, files in db.execute(
+            "SELECT started_at, completed_at, total_files_moved FROM scan_session WHERE status = 'success'"
+            " AND total_files_moved >= 100 AND started_at LIKE 'epoch:%' AND completed_at LIKE 'epoch:%'"
+            " ORDER BY id DESC LIMIT ?", (PACE_RUNS,)):
+        seconds = int(completed[6:]) - int(started[6:])
+        if seconds > 0:
+            paces.append(seconds / files)
+    return sorted(paces)[len(paces) // 2] if paces else None
+
+
+class Pace:
+    """When a run's archiving should end. Before its first batch is done it goes by earlier runs
+    (`history`, seconds per file, or None: no estimate yet); then by this run's own batches. The
+    running batch counts down, so the finish time holds still while mochi works."""
+
+    def __init__(self, files, history=None):
+        self.files, self.history = files, history
+        self.start = self.batch_start = time.monotonic()
+        self.done_files, self.done_seconds = 0, 0.0
+        self.step_seconds = defaultdict(float)  # "stage", "commit": for the log and the summary
+
+    def batch_done(self, files):
+        t = time.monotonic()
+        self.done_files += files
+        self.done_seconds, self.batch_start = t - self.start, t
+
+    def per_file(self):
+        return self.done_seconds / self.done_files if self.done_files else self.history
+
+    def finish_at(self):
+        """time.time() when everything should be archived, or None (no pace yet)."""
+        per = self.per_file()
+        if not per:
+            return None
+        left = per * (self.files - self.done_files) - (time.monotonic() - self.batch_start)
+        return time.time() + max(left, 0)
+
+    def seconds(self):
+        return time.monotonic() - self.start
+
+
 def _offset(report, step, offset, total, label=""):
     """A report callback that shows one batch's progress as part of the whole run."""
     def batch_report(_step, message="", done=0, _total=None):
@@ -1466,24 +1572,109 @@ def _archive(db, cfg, sid, entries, ids, report, stop, info, done_before, total,
     before = db.execute("SELECT total_files_moved, total_errors FROM scan_session WHERE id = ?", (sid,)).fetchone()
     moved_before, errors_before = (before or (0, 0))
     archived = []
+    pace = Pace(len(entries), earlier_pace(db))
+    done = [done_before]  # files archived so far, over the whole run
+
+    def tracked(step, offset, label):
+        """Reports a batch's step, then the whole run with its estimated finish."""
+        inner = _offset(report, step, offset, total, label)
+
+        def batch_report(_step, message="", n=0, _total=None):
+            inner(_step, message, n, _total)
+            if step == "commit":
+                done[0] = max(done[0], offset + (n or 0))
+            report("total", pace.finish_at(), done[0], total)
+        return batch_report
+
+    report("total", pace.finish_at(), done_before, total)
+    starts = list(range(0, len(entries), cfg.batch_files))
+    slots = [cfg, cfg.with_staging(cfg.next_staging_dir)]  # batches take turns: one stages while one commits
+
+    def start_stage(k):
+        """Stages batch k on a background thread, into slot k % 2."""
+        i, slot = starts[k], slots[k % 2]
+        job = {"k": k, "slot": slot, "batch": entries[i:i + cfg.batch_files], "ids": ids[i:i + cfg.batch_files],
+               "skipped": [], "label": f"batch {k + 1}/{len(starts)}" if len(starts) > 1 else ""}
+
+        def work():
+            t = time.monotonic()
+            failed = stage(slot, sid, job["batch"], tracked("stage", done_before + i, job["label"]), stop,
+                           job["skipped"])
+            took = time.monotonic() - t
+            pace.step_seconds["stage"] += took
+            log.info("%sstaged %d files in %s", f"{job['label']}: " if job["label"] else "",
+                     len(job["batch"]) - len(job["skipped"]), seconds_text(took))
+            return failed
+
+        job["future"] = stager.submit(work)
+        return job
+
+    def staged(job):
+        """Waits for a batch's staging. Its staged files are in its manifest now, so they leave the
+        plan; files a stop skipped stay in it. (If staging raised, the whole batch stays: files
+        already staged are then found gone, and skipped.)"""
+        failed = job["future"].result()
+        keep = {id(e) for e in job["skipped"]}
+        with db:
+            db.executemany("DELETE FROM pending_file WHERE id = ?",
+                           [(pid,) for pid, e in zip(job["ids"], job["batch"]) if id(e) not in keep])
+        return failed
+
+    def room_for(k):
+        """Copy staging: the next batch may be copied during this commit only if the staging drive
+        has room for it beside the batch already there; otherwise it waits (as before)."""
+        if cfg.mode != "copy":
+            return True
+        i = starts[k]
+        need = sum(e["original_size"] for e in entries[i:i + cfg.batch_files]) * STAGING_SPACE_MARGIN
+        free = free_space(cfg.staging_dir)
+        return free is not None and free >= need
+
     try:
-        for n, i in enumerate(range(0, len(entries), cfg.batch_files)):
+        stager = ThreadPoolExecutor(1, thread_name_prefix="stage")
+        following = None  # the next batch, staging while this one commits
+        try:
             check_stop(stop)
-            batch, batch_ids = entries[i:i + cfg.batch_files], ids[i:i + cfg.batch_files]
-            label = f"batch {n + 1}/{-(-len(entries) // cfg.batch_files)}" if len(entries) > cfg.batch_files else ""
-            offset, skipped = done_before + i, []
-            errors += stage(cfg, sid, batch, _offset(report, "stage", offset, total, label), stop, skipped)
-            # Staged files are in the manifest now; files a stop skipped stay in the plan. (If staging
-            # raised, the whole batch stays: files already staged are then found gone, and skipped.)
-            keep = {id(e) for e in skipped}
-            with db:
-                db.executemany("DELETE FROM pending_file WHERE id = ?",
-                               [(pid,) for pid, e in zip(batch_ids, batch) if id(e) not in keep])
-            check_stop(stop)  # what was staged is finished by the next run
-            result = finish_staged(db, cfg, _offset(report, "commit", offset, total, label), stop=stop)
-            errors += result["errors"]
-            archived += result["archived"]
+            current = start_stage(0) if starts else None
+            for k in range(len(starts)):
+                errors += staged(current)
+                check_stop(stop)  # what was staged is finished by the next run
+                following = None
+                if k + 1 < len(starts) and not (stop is not None and stop.is_set()) and room_for(k + 1):
+                    following = start_stage(k + 1)
+                elif k + 1 < len(starts):
+                    log.info("the next batch waits for this commit: not enough free space for two batches in %s",
+                             cfg.staging_dir)
+                t = time.monotonic()
+                # A commit that has begun is finished, even if Stop is pressed meanwhile (while the next batch
+                # stages): a stop waits for at most this batch's commit, as before.
+                result = finish_staged(db, current["slot"], tracked("commit", done_before + starts[k], current["label"]))
+                pace.step_seconds["commit"] += time.monotonic() - t
+                errors += result["errors"]
+                archived += result["archived"]
+                pace.batch_done(len(current["batch"]))
+                label = current["label"]
+                log.info("%scommitted, verified and cleaned up %d files in %s; whole run so far %s, about %s left",
+                         f"{label}: " if label else "", len(result["archived"]), seconds_text(time.monotonic() - t),
+                         seconds_text(pace.seconds()),
+                         seconds_text(max(pace.finish_at() - time.time(), 0)) if pace.finish_at() else "?")
+                report("total", pace.finish_at(), done[0], total)
+                if k + 1 < len(starts):
+                    check_stop(stop)
+                    current, following = following or start_stage(k + 1), None
+        except BaseException:
+            # A batch still staging in the background is waited for, so its plan rows match its manifest
+            # (the next run finishes that batch from staging). A stop makes it end at its next file.
+            if following is not None:
+                try:
+                    errors += staged(following)
+                except Exception as e:
+                    log.warning("staging the next batch also failed: %s", e)
+            raise
+        finally:
+            stager.shutdown(wait=True)
     except Stopped:
+        save_pace(db, sid, pace, archived)
         left = db.execute("SELECT COUNT(*) FROM pending_file WHERE scan_session_id = ?", (sid,)).fetchone()[0]
         with db:
             db.execute("UPDATE pending_run SET stopped_at = ? WHERE scan_session_id = ?", (now(), sid))
@@ -1494,11 +1685,24 @@ def _archive(db, cfg, sid, entries, ids, report, stop, info, done_before, total,
             db.execute("UPDATE pending_run SET stopped_at = ? WHERE scan_session_id = ?", (now(), sid))
         complete_session(db, sid, "failed", barcodes, moved_before + len(archived), errors_before + errors + 1)
         raise
+    save_pace(db, sid, pace, archived)
     drop_plan(db, sid)
     complete_session(db, sid, "success", barcodes, moved_before + len(archived), errors_before + errors)
     return {**info, "status": "done", "session_id": sid, "errors": errors, "left": 0,
             "files_moved": len(archived), "barcodes": len({e["barcode"] for e in archived}),
-            "volumes": plan(archived)}
+            "volumes": plan(archived), "seconds": dict(pace.step_seconds)}
+
+
+def save_pace(db, sid, pace, archived):
+    """Records how long this run took per file (also a stopped one), for the next run's estimate."""
+    stage_s, commit_s = pace.step_seconds["stage"], pace.step_seconds["commit"]
+    log.info("time: staging %s, commit + verify + index + clean-up %s, %d files archived (%.2f s per file)",
+             seconds_text(stage_s), seconds_text(commit_s), len(archived),
+             pace.seconds() / len(archived) if archived else 0)
+    if archived:
+        with db:
+            db.execute("INSERT INTO run_pace (scan_session_id, files, seconds, recorded_at) VALUES (?, ?, ?, ?)",
+                       (sid, len(archived), pace.seconds(), now()))
 
 
 def _continue_plan(db, cfg, kept, report, stop, info):
@@ -1568,6 +1772,13 @@ def _run_with_index(db, cfg, candidates_fn, dry_run, report, confirm, window=Non
                 matched_barcodes=len(matched), matched_files=len(entries))
     space = check_space(cfg, entries) if entries and not dry_run else (space_needed(cfg, entries) if entries else [])
     info["space"] = space
+    history = earlier_pace(db)
+    info["expected_seconds"] = history * len(entries) if history and entries else None
+    if entries and not dry_run:  # a preview has it in its summary
+        if info["expected_seconds"]:
+            log.info("expected to take about %s (the pace of earlier runs)", seconds_text(info["expected_seconds"]))
+        report("total", time.time() + info["expected_seconds"] if info["expected_seconds"] else None, 0,
+               len(entries))
     if dry_run:
         log.info("dry run: %d of %d candidate barcodes would be archived (%d files): %s",
                  len(matched), len(dates), len(entries), volumes)
@@ -1623,7 +1834,8 @@ To restore on another PC
   1. Copy this folder there.
   2. Edit config.json: output_dir = <this folder>/archives, db_path = <this folder>/index.db
      (or copy them where you want and point there), and set source_dir and mochi.
-  3. If staging/ exists: copy its contents into <source_dir>/.staging before the first run.
+  3. If staging/ exists: copy its contents into <source_dir>/.staging before the first run,
+     and staging-2/ (if there) into <source_dir>/.staging-2.
   4. python backup_ui.py --check-sql, then --dry-run, then a real run.
 """
 
@@ -1663,9 +1875,10 @@ def export(cfg, target, report=quiet):
         except (OSError, ValueError, KeyError):
             previous = {}
         archives = sorted(cfg.output_dir.glob("*/*.mochi"))
-        staged = sorted(p for p in cfg.staging_dir.rglob("*") if p.is_file()) if cfg.staging_dir.exists() else []
         jobs = [(p, f"archives/{p.relative_to(cfg.output_dir).as_posix()}", "archives") for p in archives]
-        jobs += [(p, f"staging/{p.relative_to(cfg.staging_dir).as_posix()}", "staging") for p in staged]
+        for folder, name in ((cfg.staging_dir, "staging"), (cfg.next_staging_dir, "staging-2")):
+            staged = sorted(p for p in folder.rglob("*") if p.is_file()) if folder.exists() else []
+            jobs += [(p, f"{name}/{p.relative_to(folder).as_posix()}", "staging") for p in staged]
         files, items = {}, defaultdict(lambda: [0, 0, 0])  # item -> [files, bytes, copied]
         total = len(jobs) + 2
         for i, (src, rel, item) in enumerate(jobs):

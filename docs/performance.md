@@ -104,6 +104,22 @@ against its local disk: then nothing crosses the network. Antivirus that scans
 each file as it is renamed also slows staging down; excluding `source_dir`,
 staging and `output_dir` from real-time scanning helps.
 
+### Next batch staged while this one commits
+
+A run works in batches. Before, each batch was staged, then committed, verified and cleaned up,
+and only then was the next batch staged. Now the next batch is staged (copied from the NAS, or
+renamed) on a second thread **while** the current one commits, into a second staging folder next
+to the first (`.staging-2`). On a NAS both steps mostly wait on the network or on `mochi`, so they
+overlap well. Simulated with about 2 s of staging and 2 s of commit per batch, 4 batches of 1,000
+files: **19.0 s → 12.6 s**. The saving per batch is about the shorter of the two steps.
+
+- Copy staging: the next batch is copied only if the staging drive has room for it beside the
+  batch already there; otherwise it waits for the commit, as before (logged).
+- Stop: a commit that has begun is finished; the batch staging meanwhile stops at its next file
+  and is finished from staging by the next run, like any staged batch.
+- A failure in the commit: the batch staging meanwhile is completed first, then the run stops.
+  Both batches wait in their staging folders and the next run finishes them.
+
 ## Measure on your own machine
 
 ```bash

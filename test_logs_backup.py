@@ -223,7 +223,8 @@ class Staging(unittest.TestCase):
         self.assertEqual(self.config().mode, "move")  # a local temp folder
         cfg = self.config(staging_mode="copy")
         self.assertEqual(cfg.staging_dir, cfg.output_dir / ".staging")
-        self.assertEqual(cfg.staging_dirs()[:2], [cfg.output_dir / ".staging", cfg.source_dir / ".staging"])
+        self.assertEqual(cfg.staging_dirs()[:4], [cfg.output_dir / ".staging", cfg.output_dir / ".staging-2",
+                                                  cfg.source_dir / ".staging", cfg.source_dir / ".staging-2"])
         self.assertIn(lb.local_data_dir() / "staging", cfg.staging_dirs())  # where it goes with a network archive
         with self.assertRaisesRegex(lb.BackupError, "staging_mode"):
             self.config(staging_mode="rename")
@@ -480,6 +481,141 @@ class Flow(unittest.TestCase):
         self.assertEqual(connect(self, self.cfg.db_path).execute(
             "SELECT status, total_files_moved FROM scan_session").fetchall(), [("success", 252)])
 
+    def test_progress_shows_the_whole_run_and_what_the_commit_is_doing(self):
+        self.settings(batch_files=100)
+        self.CANDIDATES = self.CANDIDATES + self.many(250)
+        reports = []
+        summary = lb.run(self.cfg, lambda *_: self.CANDIDATES, report=lambda *a: reports.append(a))
+        whole = [r for r in reports if r[0] == "total"]
+        self.assertEqual(whole[0][2:], (0, 252))
+        self.assertEqual(whole[-1][2:], (252, 252))
+        done = [r[2] for r in whole]
+        self.assertEqual(done, sorted(done))  # only ever goes forward
+        self.assertIsNone(whole[0][1])  # no earlier run: no estimate before the first batch
+        self.assertIsInstance(whole[-1][1], float)  # after it: the estimated finish time
+        details = " | ".join(r[1] for r in reports if r[0] == "commit")
+        for phase in ("writing the archive (mochi)", "checking every file against the archive",
+                      "verifying the archive (mochi)", "saving to the index", "cleaning up"):
+            self.assertIn(phase, details)
+        self.assertEqual(set(summary["seconds"]), {"stage", "commit"})
+        db = connect(self, self.cfg.db_path)
+        self.assertEqual(db.execute("SELECT files FROM run_pace").fetchall(), [(252,)])
+
+        # The next run is estimated from this one's pace before it starts.
+        self.CANDIDATES = self.CANDIDATES + [(f"BX{i:04d}", "2026-08-05 10:00:00") for i in range(150)]
+        for i in range(150):
+            self.write(f"BURNIN/unit_BX{i:04d}.txt", b"x")
+        reports.clear()
+        expected = []
+        summary = lb.run(self.cfg, lambda *_: self.CANDIDATES, report=lambda *a: reports.append(a),
+                         confirm=lambda volumes, space: expected.append(
+                             [r for r in reports if r[0] == "total"][-1][1] - lb.time.time()) or True)
+        self.assertEqual(summary["files_moved"], 150)
+        self.assertGreater(expected[0], 0)
+        self.assertGreater(summary["expected_seconds"], 0)
+
+    def test_estimate_goes_by_earlier_runs_then_this_one(self):
+        pace = lb.Pace(1000, history=2.0)
+        self.assertAlmostEqual(pace.finish_at() - lb.time.time(), 2000, delta=5)
+        self.assertIsNone(lb.Pace(1000).finish_at())  # nothing to go by yet
+        pace.start -= 100  # the first batch of 100 files took 100 s: 1 s per file from now on
+        pace.batch_start -= 100
+        pace.batch_done(100)
+        self.assertAlmostEqual(pace.finish_at() - lb.time.time(), 900, delta=5)
+        pace.batch_start -= 1000  # far slower than expected: never a time in the past
+        self.assertGreaterEqual(pace.finish_at(), lb.time.time() - 1)
+
+    def test_earlier_pace_from_older_runs_without_a_recorded_pace(self):
+        db = lb.open_index(self.cfg.db_path)
+        self.addCleanup(db.close)
+        self.assertIsNone(lb.earlier_pace(db))
+        with db:
+            for started, seconds, files in ((1000, 400, 200), (5000, 100, 200), (9000, 86400 * 2, 200)):
+                db.execute("INSERT INTO scan_session (started_at, completed_at, status, query_from_date, query_to_date,"
+                           " total_files_moved) VALUES (?, ?, 'success', '', '', ?)",
+                           (f"epoch:{started}", f"epoch:{started + seconds}", files))
+        self.assertEqual(lb.earlier_pace(db), 2.0)  # the median: a run continued days later does not count
+        with db:
+            db.execute("INSERT INTO run_pace (files, seconds, recorded_at) VALUES (1000, 500, '')")
+        self.assertEqual(lb.earlier_pace(db), 0.5)  # a measured pace wins
+
+    def test_mochi_starts_without_a_console_window_on_windows(self):
+        with unittest.mock.patch.object(lb.subprocess, "run", wraps=lb.subprocess.run) as run:
+            self.run_backup()
+        self.assertTrue(run.call_args_list)
+        for call in run.call_args_list:
+            self.assertEqual(call.kwargs.get("creationflags"), lb.NO_WINDOW.get("creationflags"))
+        if os.name == "nt":
+            self.assertEqual(lb.NO_WINDOW, {"creationflags": lb.subprocess.CREATE_NO_WINDOW})
+
+    def test_next_batch_stages_while_this_one_commits(self):
+        self.settings(batch_files=100)
+        self.CANDIDATES = self.CANDIDATES + self.many(250)
+        committing, overlapped, real = threading.Event(), [], lb.commit
+
+        def slow_commit(cfg, month):
+            committing.set()
+            lb.time.sleep(0.5)  # a slow mochi on a NAS
+            real(cfg, month)
+            committing.clear()
+
+        def report(step, message="", done=0, total=None):
+            if step == "stage" and committing.is_set():
+                overlapped.append(done)
+
+        with unittest.mock.patch.object(lb, "commit", slow_commit):
+            summary = lb.run(self.cfg, lambda *_: self.CANDIDATES, report=report)
+        self.assertEqual(summary["files_moved"], 252)
+        self.assertTrue(overlapped)  # files were staged while a commit ran
+        self.assertEqual(len(self.head("2026-08")[0]), 251)
+        self.assertFalse(self.cfg.staging_dir.exists())
+        self.assertFalse(self.cfg.next_staging_dir.exists())
+        self.assertEqual(list(self.cfg.source_dir.rglob("*_BC1*")), [])
+
+    def test_copy_staging_overlaps_too(self):
+        self.settings(batch_files=100, staging_mode="copy")
+        self.CANDIDATES = self.CANDIDATES + self.many(250)
+        summary = self.run_backup()
+        self.assertEqual(summary["files_moved"], 252)
+        self.assertEqual(len(self.head("2026-08")[0]), 251)
+        self.assertEqual(list(self.cfg.source_dir.rglob("*_BC1*")), [])  # originals deleted once verified
+        self.assertFalse(self.cfg.staging_dir.exists())
+        self.assertFalse(self.cfg.next_staging_dir.exists())
+
+    def test_no_room_for_two_batches_stages_one_at_a_time(self):
+        self.settings(batch_files=100, staging_mode="copy")
+        self.CANDIDATES = self.CANDIDATES + self.many(250)
+        free = lb.free_space
+        def room_for_one(path):  # enough for the batch staged, no more beside it
+            return 0 if ".staging" in str(path) and self.cfg.manifest.exists() else free(path)
+
+        with unittest.mock.patch.object(lb, "free_space", room_for_one):
+            with self.assertLogs("logs_backup", "INFO") as logs:
+                summary = self.run_backup()
+        self.assertEqual(summary["files_moved"], 252)
+        self.assertTrue(any("waits for this commit" in line for line in logs.output))
+
+    def test_failed_commit_while_the_next_batch_stages_loses_nothing(self):
+        self.settings(batch_files=100)
+        self.CANDIDATES = self.CANDIDATES + self.many(250)
+
+        def broken(cfg, month):
+            lb.time.sleep(0.3)  # the next batch is staging meanwhile
+            raise lb.BackupError("mochi create: exit 3 disk full")
+
+        with unittest.mock.patch.object(lb, "commit", broken):
+            with self.assertRaisesRegex(lb.BackupError, "disk full"):
+                lb.run(self.cfg, lambda *_: self.CANDIDATES)
+        self.assertTrue(self.cfg.manifest.exists())  # both batches wait, each in its own folder
+        self.assertTrue(self.cfg.with_staging(self.cfg.next_staging_dir).manifest.exists())
+        summary = self.run_backup()  # finishes both staged batches, then scans for the rest
+        self.assertEqual(summary["status"], "done")
+        self.assertEqual(summary["resumed"] + summary["files_moved"], 252)
+        self.assertEqual(len(self.head("2026-08")[0]), 251)
+        self.assertEqual(list(self.cfg.source_dir.rglob("*_BC1*")), [])
+        self.assertFalse(self.cfg.staging_dir.exists())
+        self.assertFalse(self.cfg.next_staging_dir.exists())
+
     def test_stop_while_staging_then_continue(self):
         self.settings(batch_files=100)
         self.CANDIDATES = self.CANDIDATES + self.many(250)
@@ -491,15 +627,19 @@ class Flow(unittest.TestCase):
 
         summary = lb.run(self.cfg, lambda *_: self.CANDIDATES, report=report, stop=stop)
         self.assertEqual(summary["status"], "stopped")
-        self.assertEqual(summary["files_moved"], 100)  # the first batch was finished
-        self.assertTrue(self.cfg.manifest.exists())  # the second batch waits in staging
+        # The second batch stages while the first commits; that commit is finished first.
+        first = summary["files_moved"]
+        self.assertEqual(first, 100)
+        # The second batch waits in staging: in the second folder, where it was staged during the first commit.
+        self.assertTrue(self.cfg.with_staging(self.cfg.next_staging_dir).manifest.exists())
         db = connect(self, self.cfg.db_path)
         self.assertEqual(db.execute("SELECT status FROM scan_session").fetchall(), [("failed",)])
         summary = self.run_backup()  # continue: resumes the staged part, scans for the rest
         self.assertEqual(summary["status"], "done")
-        self.assertEqual(summary["resumed"] + summary["files_moved"] + 100, 252)
+        self.assertEqual(summary["resumed"] + summary["files_moved"] + first, 252)
         self.assertEqual(len(self.head("2026-08")[0]), 251)
         self.assertFalse(self.cfg.staging_dir.exists())
+        self.assertFalse(self.cfg.next_staging_dir.exists())
         left = [p for p in self.cfg.source_dir.rglob("*_BC1*")]
         self.assertEqual(left, [])
 
@@ -796,7 +936,7 @@ class Flow(unittest.TestCase):
         self.assertEqual(summary["status"], "cancelled")
         self.assertEqual(summary["volumes"], {"2026-07": (1, 1, 7), "2026-08": (1, 1, 10)})  # barcodes, files, bytes
         self.assertEqual((summary["candidates"], summary["matched_barcodes"], summary["matched_files"]), (3, 2, 2))
-        self.assertEqual(sorted(set(steps)), ["query", "scan"])
+        self.assertEqual(sorted(set(steps)), ["query", "scan", "total"])  # total: the expected time, before asking
         self.assertTrue((self.cfg.source_dir / "BURNIN/unit1_BC001_log.txt").exists())
         self.assertEqual(connect(self, self.cfg.db_path).execute("SELECT COUNT(*) FROM scan_session").fetchone()[0], 0)
 

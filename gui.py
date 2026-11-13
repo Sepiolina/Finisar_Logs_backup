@@ -21,6 +21,7 @@ import os
 import sqlite3
 import sys
 import threading
+import time
 from pathlib import Path
 
 from PySide6.QtCore import QDate, QElapsedTimer, QLocale, QObject, Qt, QTimer, QUrl, Signal
@@ -138,6 +139,26 @@ def clock(ms):
     return f"{s // 3600}:{s // 60 % 60:02d}:{s % 60:02d}"
 
 
+def duration(seconds):
+    """About how long, for people: "2 h 15 min", "40 min", "less than a minute"."""
+    minutes = int(round(max(seconds, 0) / 60))
+    if minutes < 1:
+        return tr("less than a minute")
+    if minutes < 60:
+        return tr("{m} min", m=minutes)
+    return tr("{h} h {m} min", h=minutes // 60, m=f"{minutes % 60:02d}")
+
+
+def finish_text(finish):
+    """An estimated finish (time.time() seconds) as "about 1 h 20 min left · done around 15:40"."""
+    left = finish - time.time()
+    when = dt.datetime.fromtimestamp(finish)
+    clock_text = when.strftime("%H:%M") if when.date() == dt.date.today() else when.strftime("%Y-%m-%d %H:%M")
+    if left < 60:
+        return tr("almost done (finishing this batch)")
+    return tr("about {left} left · done around {when}", left=duration(left), when=clock_text)
+
+
 def card(title=None, subtitle=None):
     frame = QFrame(objectName="card")
     box = QVBoxLayout(frame)
@@ -222,7 +243,7 @@ class Job(QObject):
     """Runs fn(job) on a background thread. Progress, confirm requests and the result come back as
     signals. The Job itself stays on the window's thread, so Qt queues every signal emitted by the
     worker to the window's thread: widgets are only ever touched there."""
-    progress = Signal(str, str, object, object)
+    progress = Signal(str, object, object, object)  # message is the finish time (float or None) for "total"
     confirm_needed = Signal(object)
     done = Signal(object)
     failed = Signal(str)
@@ -265,7 +286,7 @@ class Job(QObject):
 # ---------------------------------------------------------------- dialogs
 
 class ConfirmDialog(QDialog):
-    def __init__(self, volumes, space=(), parent=None):
+    def __init__(self, volumes, space=(), parent=None, expected=None):
         super().__init__(parent)
         self.setWindowTitle(tr("Archive these files?"))
         self.setMinimumWidth(520)
@@ -278,6 +299,12 @@ class ConfirmDialog(QDialog):
                          barcodes=f"{barcodes:,}", size=size(nbytes), months=len(volumes)))
         head.setWordWrap(True)
         box.addWidget(head)
+        took = QLabel(tr("Expected time: <b>about {time}</b> (from the pace of earlier runs). The progress "
+                         "shows the time left as it goes.", time=duration(expected)) if expected else
+                      tr("Expected time: shown in the progress once the first batch is done (no earlier run "
+                         "to go by yet)."), objectName="muted")
+        took.setWordWrap(True)
+        box.addWidget(took)
         table = QTableWidget(len(volumes), 4)
         table.setHorizontalHeaderLabels([tr("Month"), tr("Barcodes"), tr("Files"), tr("Size")])
         table.verticalHeader().hide()
@@ -335,7 +362,8 @@ class StepRow:
         grid.addWidget(self.detail, row * 2 + 1, 1, 1, 4)
         grid.setRowMinimumHeight(row * 2 + 1, 18)
         self.timer = QElapsedTimer()
-        self.active = False
+        self.still = QElapsedTimer()  # since the row last changed: "still working" after a while
+        self.active, self.shown = False, None
         self.reset()
 
     def look(self, state):
@@ -353,8 +381,9 @@ class StepRow:
         self.count.setText("")
         self.time.setText("")
         self.detail.setText("")
-        self.active = False
+        self.active, self.shown = False, None
         self.timer.invalidate()
+        self.still.invalidate()
 
     def update(self, message, done, total):
         if not self.timer.isValid():
@@ -369,17 +398,28 @@ class StepRow:
             self.bar.setRange(0, 0)  # busy
             self.count.setText(f"{int(done):,}" if done else "")
         self.detail.setText(tr_progress(message or ""))
+        if (message, done) != self.shown:
+            self.shown = (message, done)
+            self.still.start()
         if total and done and done >= total:
             self.finish("done")
 
     def tick(self):
         if self.active and self.timer.isValid():
             self.time.setText(clock(self.timer.elapsed()))
+        # Nothing new for a while (mochi writing or verifying a big month): say it is still working.
+        if self.active and self.still.isValid() and self.still.elapsed() >= 10_000:
+            text = tr_progress(self.shown[0] or "") if self.shown else ""
+            self.detail.setText(tr("{what} · still working, {time}", what=text, time=clock(self.still.elapsed()))
+                                if text else tr("still working, {time}", time=clock(self.still.elapsed())))
 
     def finish(self, state):
         """state: "done", "failed" or "stopped"."""
         if self.timer.isValid():
             self.time.setText(clock(self.timer.elapsed()))
+        if self.shown:
+            self.detail.setText(tr_progress(self.shown[0] or ""))
+        self.still.invalidate()
         if self.bar.maximum() == 0:
             self.bar.setRange(0, 1)
             self.bar.setValue(1 if state == "done" else 0)
@@ -518,6 +558,22 @@ class BackupPage(QWidget):
         self.stop_button.setToolTip(tr("Stops at the next safe point. Nothing is lost: the next run continues."))
         head.addWidget(self.stop_button)
         pbox.addLayout(head)
+        # The whole run at a glance: files archived of all, and when it should be done.
+        self.overall = QWidget()
+        obox = QVBoxLayout(self.overall)
+        obox.setContentsMargins(0, 0, 0, 4)
+        obox.setSpacing(4)
+        self.overall_bar = QProgressBar()
+        self.overall_bar.setTextVisible(False)
+        self.overall_bar.setFixedHeight(12)
+        self.overall_text = QLabel("")
+        self.overall_text.setWordWrap(True)
+        obox.addWidget(self.overall_text)
+        obox.addWidget(self.overall_bar)
+        self.overall.hide()
+        pbox.addWidget(self.overall)
+        self.finish, self.total = None, None  # from the "total" report: estimated finish, (done, total)
+        self.dry_run = False
         self.empty = QLabel(tr("Nothing running. Choose A or B above: Preview first to see what would be "
                                "archived, then Start backup."), objectName="empty")
         self.empty.setWordWrap(True)
@@ -643,9 +699,28 @@ class BackupPage(QWidget):
         self.refresh()
         self.app.history_page.refresh()
 
+    def show_overall(self):
+        if not self.total or self.dry_run:  # a preview archives nothing: its expected time is in the result
+            return
+        done, total = self.total
+        pct = int(100 * done / total) if total else 100
+        self.overall_bar.setRange(0, max(int(total), 1))
+        self.overall_bar.setValue(min(int(done), int(total)))
+        head = tr("<b>{done} of {total} files archived</b> ({pct}%)", done=f"{int(done):,}", total=f"{int(total):,}",
+                  pct=pct)
+        if self.run_timer.isValid() and self.finish:
+            tail = finish_text(self.finish)
+        elif self.run_timer.isValid():
+            tail = tr("time left: estimated after the first batch")
+        else:
+            tail = ""
+        self.overall_text.setText(f"{head} · {tail}" if tail else head)
+        self.overall.show()
+
     def tick(self):
         for row in self.rows.values():
             row.tick()
+        self.show_overall()  # the time left counts down between reports
         if self.run_timer.isValid():
             self.elapsed_text = clock(self.run_timer.elapsed())
             self.elapsed.setText(tr("Elapsed {time}", time=self.elapsed_text))
@@ -725,6 +800,8 @@ class BackupPage(QWidget):
                 return
         for row in self.rows.values():
             row.reset()
+        self.finish, self.total, self.dry_run = None, None, dry_run
+        self.overall.hide()
         self.result.hide()
         self.empty.hide()
         self.steps.show()
@@ -754,6 +831,10 @@ class BackupPage(QWidget):
             log.info("stop requested: stopping at the next safe point (a commit in progress is finished first)")
 
     def on_progress(self, step, message, done, total):
+        if step == "total":
+            self.finish, self.total = message, (done or 0, total or 0)
+            self.show_overall()
+            return
         if step not in self.rows:
             return
         for key, row in self.rows.items():  # an earlier step still shown as running is over
@@ -763,7 +844,8 @@ class BackupPage(QWidget):
 
     def on_confirm(self, request):
         volumes, space = request
-        self.job.answer(ConfirmDialog(volumes, space, self).exec() == QDialog.Accepted)
+        expected = self.finish - time.time() if self.finish else None
+        self.job.answer(ConfirmDialog(volumes, space, self, expected).exec() == QDialog.Accepted)
 
     def end(self):
         self.clock.stop()
@@ -790,6 +872,10 @@ class BackupPage(QWidget):
         tiles.append((took, tr("time"), "#0f172a"))
         counts = tr("{files} files committed ({barcodes} barcodes) · {errors} errors",
                     files=f"{summary['files_moved']:,}", barcodes=f"{summary['barcodes']:,}", errors=f"{errors:,}")
+        spent = summary.get("seconds") or {}
+        if spent:
+            counts += " · " + tr("staging {stage}, archiving and checking {commit}",
+                                 stage=duration(spent.get("stage", 0)), commit=duration(spent.get("commit", 0)))
         if status == "done":
             self.show_banner(tr("<b>Done.</b> {counts}. Committed is not a backup on its own: keep an export on "
                                 "another drive (Tools).", counts=counts), "#14532d", "#dcfce7",
@@ -815,6 +901,9 @@ class BackupPage(QWidget):
                                 "files would be archived</b> ({months}). Nothing was moved.",
                                 candidates=f"{summary['candidates']:,}", scanned=f"{summary['scanned']:,}",
                                 files=f"{files:,}", months=months)
+                             + (" " + tr("Expected time for a real run: about {time} (from the pace of earlier runs).",
+                                         time=duration(summary["expected_seconds"]))
+                                if summary.get("expected_seconds") else "")
                              + (f"<br><br><b>{tr('Free space')}</b><br>{space_html(summary['space'])}"
                                 if summary.get("space") else ""), "#1e3a8a", "#dbeafe",
                              tr("Preview: nothing was moved"), tiles)
