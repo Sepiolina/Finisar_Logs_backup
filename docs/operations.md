@@ -215,7 +215,7 @@ path last, for example `python backup_ui.py --dry-run D:/configs/line2.json`.
 | `compression` | `null`: `"balanced"` | How hard MOCHI compresses a **new** monthly archive. The seven presets of MOCHI 0.9.16, fastest to smallest: `"turbo"` (zstd level -4), `"very_fast"` (-1), `"fast"` (1), `"balanced"` (3, MOCHI's default), `"maximum"` (19), `"ultra"` (20), `"extreme"` (22). Passed as `mochi create --compression-level`. MOCHI records the level in the archive when it is created, and every append keeps it, so a change applies to months not archived yet. Ultra and Extreme are much slower and use more memory, and on `.mochi` archives usually save little over Maximum. |
 | `sql_server` | none | SQL Server login, see below |
 | `staging_mode` | `null`: automatic | How files get into staging. `"move"`: renamed into staging on the source drive. `"copy"`: copied to staging on a local disk, and each original deleted from the source only after its archive is verified (and only if it did not change after it was copied; a changed file stays for the next run). Automatic: **`"copy"` when `source_dir` is a network drive** (a mapped drive or `//server/share`), `"move"` on a local disk. |
-| `staging_dir` | `source_dir/.staging` (move); `output_dir/.staging` (copy), or this PC's `%LOCALAPPDATA%\FinisarLogsBackup\staging` when the archive folder is on a network drive | With `"move"` it must be on the **same drive** as `source_dir` (files are moved there by rename); a run refuses to start staging otherwise. With `"copy"` put it on a **local disk** with room for one batch (a run checks for the batch's size plus 10% before copying). Created if missing. Never scanned, even inside a subfolder. |
+| `staging_dir` | `source_dir/.staging` (move); `output_dir/.staging` (copy), or this PC's `%LOCALAPPDATA%\FinisarLogsBackup\staging` when the archive folder is on a network drive | With `"move"` it must be on the **same drive** as `source_dir` (files are moved there by rename); a run refuses to start staging otherwise. With `"copy"` put it on a **local disk** with room for one batch (a run checks for the batch's size plus 10% before copying). Created if missing. Never scanned, even inside a subfolder. A second folder next to it, with `-2` added to its name (`.staging-2`), holds the next batch while the current one commits; with room for two batches the copies overlap the commit, otherwise they wait. |
 | `subfolders` | `BURNIN, ESS, JTAG, STM, Xray` | The folders scanned under `source_dir` |
 | `recursive` | `true` | `true`: also scan every folder inside each subfolder, at any depth, keeping those folders in the archive paths (`BURNIN/line2/unit1_BC001_log.txt`). `false`: only files directly in each subfolder. |
 | `file_threads` | `null`: automatic | How many folders are listed, and files copied or renamed into staging and deleted after the commit, at once. Automatic: **16 when `source_dir` is a network drive** (a mapped drive or `//server/share`), where each call mostly waits on the network; 1 on a local disk, where one thread is fastest. Set 1–64 to override. |
@@ -356,7 +356,7 @@ python backup_ui.py --export E:/finisar_export
 | `archives/YYYY/YYYY-MM.mochi` | `output_dir` | Every copy is checked against the original (BLAKE3) before it replaces anything. Archives unchanged since the last export to the same folder are skipped, so exporting again is quick. |
 | `index.db` | `db_path` | Copied with SQLite's backup method, so the copy is consistent |
 | `config.json` | your config | The SQL Server password is removed. It is asked again on the first run. |
-| `staging/` | `staging_dir` | Only after an interrupted run. Those files are in no archive yet. With move staging this is their only other copy; with copy staging the originals are also still in the source. |
+| `staging/`, `staging-2/` | `staging_dir` and the `-2` folder next to it | Only after an interrupted run. Those files are in no archive yet. With move staging this is their only other copy; with copy staging the originals are also still in the source. |
 | `RESTORE.txt` | | The restore steps below |
 | `export-manifest.json` | | Size and BLAKE3 of every exported file |
 
@@ -408,7 +408,9 @@ time: staging 1 h 10 min, commit + verify + index + clean-up 3 h 40 min, 40000 f
 ```
 
 - **Scan** slow: the log folders hold many files the run does not take, or they are on a NAS.
-- **Staged** slow: copying from the NAS (see [performance](performance.md#on-a-network-drive)).
+- **Staged** slow: copying from the NAS (see [performance](performance.md#on-a-network-drive)). The
+  next batch is staged while the current one commits, so a batch's staging and commit times overlap
+  and add up to more than the run took.
 - **mochi verify** growing batch after batch: each batch verifies the whole month, so a month
   archived in several batches is read several times. A larger **Batch size** (Settings) means fewer
   verifies, at the cost of a slower Stop.

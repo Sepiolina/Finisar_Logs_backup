@@ -362,14 +362,21 @@ class Config:
             return self.source_dir / ".staging"
         return local_data_dir() / "staging" if is_network_path(self.output_dir) else self.output_dir / ".staging"
 
+    @property
+    def next_staging_dir(self):
+        """The second staging folder, next to the first: the next batch is staged there while the
+        current one commits. A sibling, not inside: a batch's clean-up walks its whole folder."""
+        return self.staging_dir.with_name(self.staging_dir.name + "-2")
+
     def staging_dirs(self):
-        """Every folder an earlier run may have left a batch in: the configured one, and with no
-        staging_dir set, every default there has been (the mode or the defaults may have changed)."""
-        dirs = [self.staging_dir]
+        """Every folder an earlier run may have left a batch in: the configured one and its second
+        folder, and with no staging_dir set, every default there has been (the mode or the defaults
+        may have changed)."""
+        firsts = [self.staging_dir]
         if not self.staging_dir_set:
-            dirs += [d for d in (self.default_staging("move"), self.output_dir / ".staging",
-                                 local_data_dir() / "staging") if d not in dirs]
-        return dirs
+            firsts += [d for d in (self.default_staging("move"), self.output_dir / ".staging",
+                                   local_data_dir() / "staging") if d not in firsts]
+        return [d for first in firsts for d in (first, first.with_name(first.name + "-2"))]
 
     def with_staging(self, folder):
         other = copy.copy(self)
@@ -1580,36 +1587,92 @@ def _archive(db, cfg, sid, entries, ids, report, stop, info, done_before, total,
         return batch_report
 
     report("total", pace.finish_at(), done_before, total)
+    starts = list(range(0, len(entries), cfg.batch_files))
+    slots = [cfg, cfg.with_staging(cfg.next_staging_dir)]  # batches take turns: one stages while one commits
+
+    def start_stage(k):
+        """Stages batch k on a background thread, into slot k % 2."""
+        i, slot = starts[k], slots[k % 2]
+        job = {"k": k, "slot": slot, "batch": entries[i:i + cfg.batch_files], "ids": ids[i:i + cfg.batch_files],
+               "skipped": [], "label": f"batch {k + 1}/{len(starts)}" if len(starts) > 1 else ""}
+
+        def work():
+            t = time.monotonic()
+            failed = stage(slot, sid, job["batch"], tracked("stage", done_before + i, job["label"]), stop,
+                           job["skipped"])
+            took = time.monotonic() - t
+            pace.step_seconds["stage"] += took
+            log.info("%sstaged %d files in %s", f"{job['label']}: " if job["label"] else "",
+                     len(job["batch"]) - len(job["skipped"]), seconds_text(took))
+            return failed
+
+        job["future"] = stager.submit(work)
+        return job
+
+    def staged(job):
+        """Waits for a batch's staging. Its staged files are in its manifest now, so they leave the
+        plan; files a stop skipped stay in it. (If staging raised, the whole batch stays: files
+        already staged are then found gone, and skipped.)"""
+        failed = job["future"].result()
+        keep = {id(e) for e in job["skipped"]}
+        with db:
+            db.executemany("DELETE FROM pending_file WHERE id = ?",
+                           [(pid,) for pid, e in zip(job["ids"], job["batch"]) if id(e) not in keep])
+        return failed
+
+    def room_for(k):
+        """Copy staging: the next batch may be copied during this commit only if the staging drive
+        has room for it beside the batch already there; otherwise it waits (as before)."""
+        if cfg.mode != "copy":
+            return True
+        i = starts[k]
+        need = sum(e["original_size"] for e in entries[i:i + cfg.batch_files]) * STAGING_SPACE_MARGIN
+        free = free_space(cfg.staging_dir)
+        return free is not None and free >= need
+
     try:
-        for n, i in enumerate(range(0, len(entries), cfg.batch_files)):
+        stager = ThreadPoolExecutor(1, thread_name_prefix="stage")
+        following = None  # the next batch, staging while this one commits
+        try:
             check_stop(stop)
-            batch, batch_ids = entries[i:i + cfg.batch_files], ids[i:i + cfg.batch_files]
-            batches = -(-len(entries) // cfg.batch_files)
-            label = f"batch {n + 1}/{batches}" if len(entries) > cfg.batch_files else ""
-            offset, skipped = done_before + i, []
-            t = time.monotonic()
-            errors += stage(cfg, sid, batch, tracked("stage", offset, label), stop, skipped)
-            pace.step_seconds["stage"] += time.monotonic() - t
-            log.info("%sstaged %d files in %s", f"{label}: " if label else "", len(batch) - len(skipped),
-                     seconds_text(time.monotonic() - t))
-            # Staged files are in the manifest now; files a stop skipped stay in the plan. (If staging
-            # raised, the whole batch stays: files already staged are then found gone, and skipped.)
-            keep = {id(e) for e in skipped}
-            with db:
-                db.executemany("DELETE FROM pending_file WHERE id = ?",
-                               [(pid,) for pid, e in zip(batch_ids, batch) if id(e) not in keep])
-            check_stop(stop)  # what was staged is finished by the next run
-            t = time.monotonic()
-            result = finish_staged(db, cfg, tracked("commit", offset, label), stop=stop)
-            pace.step_seconds["commit"] += time.monotonic() - t
-            errors += result["errors"]
-            archived += result["archived"]
-            pace.batch_done(len(batch))
-            log.info("%scommitted, verified and cleaned up %d files in %s; whole run so far %s, about %s left",
-                     f"{label}: " if label else "", len(result["archived"]), seconds_text(time.monotonic() - t),
-                     seconds_text(pace.seconds()),
-                     seconds_text(max(pace.finish_at() - time.time(), 0)) if pace.finish_at() else "?")
-            report("total", pace.finish_at(), done[0], total)
+            current = start_stage(0) if starts else None
+            for k in range(len(starts)):
+                errors += staged(current)
+                check_stop(stop)  # what was staged is finished by the next run
+                following = None
+                if k + 1 < len(starts) and not (stop is not None and stop.is_set()) and room_for(k + 1):
+                    following = start_stage(k + 1)
+                elif k + 1 < len(starts):
+                    log.info("the next batch waits for this commit: not enough free space for two batches in %s",
+                             cfg.staging_dir)
+                t = time.monotonic()
+                # A commit that has begun is finished, even if Stop is pressed meanwhile (while the next batch
+                # stages): a stop waits for at most this batch's commit, as before.
+                result = finish_staged(db, current["slot"], tracked("commit", done_before + starts[k], current["label"]))
+                pace.step_seconds["commit"] += time.monotonic() - t
+                errors += result["errors"]
+                archived += result["archived"]
+                pace.batch_done(len(current["batch"]))
+                label = current["label"]
+                log.info("%scommitted, verified and cleaned up %d files in %s; whole run so far %s, about %s left",
+                         f"{label}: " if label else "", len(result["archived"]), seconds_text(time.monotonic() - t),
+                         seconds_text(pace.seconds()),
+                         seconds_text(max(pace.finish_at() - time.time(), 0)) if pace.finish_at() else "?")
+                report("total", pace.finish_at(), done[0], total)
+                if k + 1 < len(starts):
+                    check_stop(stop)
+                    current, following = following or start_stage(k + 1), None
+        except BaseException:
+            # A batch still staging in the background is waited for, so its plan rows match its manifest
+            # (the next run finishes that batch from staging). A stop makes it end at its next file.
+            if following is not None:
+                try:
+                    errors += staged(following)
+                except Exception as e:
+                    log.warning("staging the next batch also failed: %s", e)
+            raise
+        finally:
+            stager.shutdown(wait=True)
     except Stopped:
         save_pace(db, sid, pace, archived)
         left = db.execute("SELECT COUNT(*) FROM pending_file WHERE scan_session_id = ?", (sid,)).fetchone()[0]
@@ -1771,7 +1834,8 @@ To restore on another PC
   1. Copy this folder there.
   2. Edit config.json: output_dir = <this folder>/archives, db_path = <this folder>/index.db
      (or copy them where you want and point there), and set source_dir and mochi.
-  3. If staging/ exists: copy its contents into <source_dir>/.staging before the first run.
+  3. If staging/ exists: copy its contents into <source_dir>/.staging before the first run,
+     and staging-2/ (if there) into <source_dir>/.staging-2.
   4. python backup_ui.py --check-sql, then --dry-run, then a real run.
 """
 
@@ -1811,9 +1875,10 @@ def export(cfg, target, report=quiet):
         except (OSError, ValueError, KeyError):
             previous = {}
         archives = sorted(cfg.output_dir.glob("*/*.mochi"))
-        staged = sorted(p for p in cfg.staging_dir.rglob("*") if p.is_file()) if cfg.staging_dir.exists() else []
         jobs = [(p, f"archives/{p.relative_to(cfg.output_dir).as_posix()}", "archives") for p in archives]
-        jobs += [(p, f"staging/{p.relative_to(cfg.staging_dir).as_posix()}", "staging") for p in staged]
+        for folder, name in ((cfg.staging_dir, "staging"), (cfg.next_staging_dir, "staging-2")):
+            staged = sorted(p for p in folder.rglob("*") if p.is_file()) if folder.exists() else []
+            jobs += [(p, f"{name}/{p.relative_to(folder).as_posix()}", "staging") for p in staged]
         files, items = {}, defaultdict(lambda: [0, 0, 0])  # item -> [files, bytes, copied]
         total = len(jobs) + 2
         for i, (src, rel, item) in enumerate(jobs):

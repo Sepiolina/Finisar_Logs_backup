@@ -223,7 +223,8 @@ class Staging(unittest.TestCase):
         self.assertEqual(self.config().mode, "move")  # a local temp folder
         cfg = self.config(staging_mode="copy")
         self.assertEqual(cfg.staging_dir, cfg.output_dir / ".staging")
-        self.assertEqual(cfg.staging_dirs()[:2], [cfg.output_dir / ".staging", cfg.source_dir / ".staging"])
+        self.assertEqual(cfg.staging_dirs()[:4], [cfg.output_dir / ".staging", cfg.output_dir / ".staging-2",
+                                                  cfg.source_dir / ".staging", cfg.source_dir / ".staging-2"])
         self.assertIn(lb.local_data_dir() / "staging", cfg.staging_dirs())  # where it goes with a network archive
         with self.assertRaisesRegex(lb.BackupError, "staging_mode"):
             self.config(staging_mode="rename")
@@ -547,6 +548,74 @@ class Flow(unittest.TestCase):
         if os.name == "nt":
             self.assertEqual(lb.NO_WINDOW, {"creationflags": lb.subprocess.CREATE_NO_WINDOW})
 
+    def test_next_batch_stages_while_this_one_commits(self):
+        self.settings(batch_files=100)
+        self.CANDIDATES = self.CANDIDATES + self.many(250)
+        committing, overlapped, real = threading.Event(), [], lb.commit
+
+        def slow_commit(cfg, month):
+            committing.set()
+            lb.time.sleep(0.5)  # a slow mochi on a NAS
+            real(cfg, month)
+            committing.clear()
+
+        def report(step, message="", done=0, total=None):
+            if step == "stage" and committing.is_set():
+                overlapped.append(done)
+
+        with unittest.mock.patch.object(lb, "commit", slow_commit):
+            summary = lb.run(self.cfg, lambda *_: self.CANDIDATES, report=report)
+        self.assertEqual(summary["files_moved"], 252)
+        self.assertTrue(overlapped)  # files were staged while a commit ran
+        self.assertEqual(len(self.head("2026-08")[0]), 251)
+        self.assertFalse(self.cfg.staging_dir.exists())
+        self.assertFalse(self.cfg.next_staging_dir.exists())
+        self.assertEqual(list(self.cfg.source_dir.rglob("*_BC1*")), [])
+
+    def test_copy_staging_overlaps_too(self):
+        self.settings(batch_files=100, staging_mode="copy")
+        self.CANDIDATES = self.CANDIDATES + self.many(250)
+        summary = self.run_backup()
+        self.assertEqual(summary["files_moved"], 252)
+        self.assertEqual(len(self.head("2026-08")[0]), 251)
+        self.assertEqual(list(self.cfg.source_dir.rglob("*_BC1*")), [])  # originals deleted once verified
+        self.assertFalse(self.cfg.staging_dir.exists())
+        self.assertFalse(self.cfg.next_staging_dir.exists())
+
+    def test_no_room_for_two_batches_stages_one_at_a_time(self):
+        self.settings(batch_files=100, staging_mode="copy")
+        self.CANDIDATES = self.CANDIDATES + self.many(250)
+        free = lb.free_space
+        def room_for_one(path):  # enough for the batch staged, no more beside it
+            return 0 if ".staging" in str(path) and self.cfg.manifest.exists() else free(path)
+
+        with unittest.mock.patch.object(lb, "free_space", room_for_one):
+            with self.assertLogs("logs_backup", "INFO") as logs:
+                summary = self.run_backup()
+        self.assertEqual(summary["files_moved"], 252)
+        self.assertTrue(any("waits for this commit" in line for line in logs.output))
+
+    def test_failed_commit_while_the_next_batch_stages_loses_nothing(self):
+        self.settings(batch_files=100)
+        self.CANDIDATES = self.CANDIDATES + self.many(250)
+
+        def broken(cfg, month):
+            lb.time.sleep(0.3)  # the next batch is staging meanwhile
+            raise lb.BackupError("mochi create: exit 3 disk full")
+
+        with unittest.mock.patch.object(lb, "commit", broken):
+            with self.assertRaisesRegex(lb.BackupError, "disk full"):
+                lb.run(self.cfg, lambda *_: self.CANDIDATES)
+        self.assertTrue(self.cfg.manifest.exists())  # both batches wait, each in its own folder
+        self.assertTrue(self.cfg.with_staging(self.cfg.next_staging_dir).manifest.exists())
+        summary = self.run_backup()  # finishes both staged batches, then scans for the rest
+        self.assertEqual(summary["status"], "done")
+        self.assertEqual(summary["resumed"] + summary["files_moved"], 252)
+        self.assertEqual(len(self.head("2026-08")[0]), 251)
+        self.assertEqual(list(self.cfg.source_dir.rglob("*_BC1*")), [])
+        self.assertFalse(self.cfg.staging_dir.exists())
+        self.assertFalse(self.cfg.next_staging_dir.exists())
+
     def test_stop_while_staging_then_continue(self):
         self.settings(batch_files=100)
         self.CANDIDATES = self.CANDIDATES + self.many(250)
@@ -558,15 +627,19 @@ class Flow(unittest.TestCase):
 
         summary = lb.run(self.cfg, lambda *_: self.CANDIDATES, report=report, stop=stop)
         self.assertEqual(summary["status"], "stopped")
-        self.assertEqual(summary["files_moved"], 100)  # the first batch was finished
-        self.assertTrue(self.cfg.manifest.exists())  # the second batch waits in staging
+        # The second batch stages while the first commits; that commit is finished first.
+        first = summary["files_moved"]
+        self.assertEqual(first, 100)
+        # The second batch waits in staging: in the second folder, where it was staged during the first commit.
+        self.assertTrue(self.cfg.with_staging(self.cfg.next_staging_dir).manifest.exists())
         db = connect(self, self.cfg.db_path)
         self.assertEqual(db.execute("SELECT status FROM scan_session").fetchall(), [("failed",)])
         summary = self.run_backup()  # continue: resumes the staged part, scans for the rest
         self.assertEqual(summary["status"], "done")
-        self.assertEqual(summary["resumed"] + summary["files_moved"] + 100, 252)
+        self.assertEqual(summary["resumed"] + summary["files_moved"] + first, 252)
         self.assertEqual(len(self.head("2026-08")[0]), 251)
         self.assertFalse(self.cfg.staging_dir.exists())
+        self.assertFalse(self.cfg.next_staging_dir.exists())
         left = [p for p in self.cfg.source_dir.rglob("*_BC1*")]
         self.assertEqual(left, [])
 
